@@ -4,3 +4,12 @@ dist/
 .env
 .env.*
 !.env.example
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+.price-worker.lock
+.pytest_cache/
+__pycache__/
+.venv/
