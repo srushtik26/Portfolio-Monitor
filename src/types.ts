@@ -20,9 +20,11 @@ export interface PriceQuote {
   price: number;
   currency: string;
   provider: string;
+  quote_type: "last_trade" | "candle_close" | "fixture" | "provider_quote";
   quoted_at: string;
   received_at: string;
   is_simulated: boolean;
+  freshness_seconds: number;
   status: "fresh" | "stale" | "out_of_order" | "simulated";
   is_fresh: boolean;
 }

@@ -24,6 +24,7 @@ from .prices import (
     PriceProvider,
     ProviderError,
     RateLimitError,
+    YFinanceProvider,
     record_quote,
 )
 
@@ -54,6 +55,11 @@ def poll_once(
     now: datetime | None = None,
     session_factory: Callable[[], Session] = SessionLocal,
 ) -> PollResult:
+    if provider.name == "yfinance" and calendar.name == "fixture":
+        raise ValueError(
+            "Live provider polling requires an authoritative exchange calendar. "
+            "Use app.yfinance_smoke for a one-off quote; it does not activate alerts."
+        )
     current_time = now or datetime.now(timezone.utc)
     provider_is_live = not provider.is_simulated and provider.name != "fixture"
     calendar_is_live = calendar.name != "fixture"
@@ -190,6 +196,11 @@ def run_worker(
 ) -> None:
     if interval_seconds < 1:
         raise ValueError("Polling interval must be at least one second.")
+    if provider.name == "yfinance" and calendar.name == "fixture":
+        raise ValueError(
+            "Live provider polling requires an authoritative exchange calendar. "
+            "Use app.yfinance_smoke for a one-off quote; it does not activate alerts."
+        )
     with single_worker_lock():
         started_at = datetime.now(timezone.utc)
         _update_heartbeat(
@@ -259,7 +270,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run the separate, single-instance portfolio price worker."
     )
-    parser.add_argument("--provider", choices=("fixture",), required=True)
+    parser.add_argument("--provider", choices=("fixture", "yfinance"), default="fixture")
     parser.add_argument("--calendar", choices=("fixture",), required=True)
     parser.add_argument("--interval-seconds", type=int, default=60)
     parser.add_argument("--once", action="store_true")
@@ -269,13 +280,18 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     try:
+        provider: PriceProvider = (
+            FixturePriceProvider()
+            if args.provider == "fixture"
+            else YFinanceProvider()
+        )
         run_worker(
-            FixturePriceProvider(),
+            provider,
             FixtureExchangeCalendar(),
             interval_seconds=args.interval_seconds,
             once=args.once,
         )
-    except RuntimeError as error:
+    except (RuntimeError, ValueError) as error:
         logger.error("%s", error)
         sys.exit(2)
 

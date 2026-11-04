@@ -106,6 +106,8 @@ class PriceQuote(Base):
     price: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     provider: Mapped[str] = mapped_column(String(100), nullable=False)
+    quote_type: Mapped[str] = mapped_column(String(24), nullable=False, default="last_trade")
+    freshness_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=900)
     quoted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     is_simulated: Mapped[bool] = mapped_column(Boolean, nullable=False)

@@ -104,7 +104,7 @@ def test_companies_empty_database(client: TestClient) -> None:
     assert response.json() == []
 
 
-def test_companies_return_separate_targets(client: TestClient) -> None:
+def test_companies_return_imported_cmp_without_using_it_as_a_quote(client: TestClient) -> None:
     with TestSession() as session:
         session.add(
             Company(
@@ -112,6 +112,7 @@ def test_companies_return_separate_targets(client: TestClient) -> None:
                 symbol="EXAMPLE",
                 name="Example Company",
                 sector="Technology",
+                cmp=Decimal("101.25"),
                 base_target=Decimal("100.00"),
                 bull_target=Decimal("125.00"),
             )
@@ -127,7 +128,7 @@ def test_companies_return_separate_targets(client: TestClient) -> None:
             "symbol": "EXAMPLE",
             "exchange": "NSE",
             "sector": "Technology",
-            "cmp": None,
+            "cmp": 101.25,
             "base_target": 100.0,
             "bull_target": 125.0,
             "version": 1,
@@ -651,9 +652,12 @@ def test_price_history_and_company_quote_freshness(client: TestClient) -> None:
 
     assert company["latest_quote"]["price"] == 101.25
     assert company["latest_quote"]["is_fresh"] is True
+    assert company["latest_quote"]["quote_type"] == "last_trade"
+    assert company["latest_quote"]["freshness_seconds"] == 900
     assert history.status_code == 200
     assert history.json()["items"][0]["provider"] == "test-provider"
     assert history.json()["items"][0]["currency"] == "INR"
+    assert history.json()["items"][0]["quote_type"] == "last_trade"
     assert client.get("/api/companies/NSE/UNKNOWN/history").status_code == 404
     assert client.get("/api/companies/NSE/PRICE/history?limit=501").status_code == 422
 
@@ -813,6 +817,7 @@ def _create_notification_event(session: Session, *, now: datetime) -> Notificati
         price=Decimal("125"),
         currency="INR",
         provider="fixture",
+        quote_type="fixture",
         quoted_at=now,
         received_at=now,
         is_simulated=True,

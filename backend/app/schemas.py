@@ -26,9 +26,11 @@ class PriceQuoteRead(BaseModel):
     price: float
     currency: str
     provider: str
+    quote_type: Literal["last_trade", "candle_close", "fixture", "provider_quote"]
     quoted_at: datetime
     received_at: datetime
     is_simulated: bool
+    freshness_seconds: int
     status: Literal["fresh", "stale", "out_of_order", "simulated"]
     is_fresh: bool
 
