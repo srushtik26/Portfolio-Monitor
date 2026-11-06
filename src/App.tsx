@@ -1,24 +1,92 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent, DragEvent, ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  Activity, ArrowDownRight, ArrowDownUp, ArrowLeft, ArrowRight, ArrowUpRight, Bell, BriefcaseBusiness,
-  Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, CloudDownload, Command,
-  Download, FileSpreadsheet, Globe2, LayoutDashboard, LineChart, Menu, Moon,
-  MoreHorizontal, PanelLeftClose, RefreshCw, Search, Settings, ShieldCheck, Sun,
-  Target, TrendingDown, TrendingUp, Upload, Users, X, Zap,
+  Activity,
+  AlertTriangle,
+  ArrowDownRight,
+  ArrowDownUp,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUpRight,
+  Bell,
+  BriefcaseBusiness,
+  Check,
+  CheckCheck,
+  ChevronDown,
+  ChevronRight,
+  CircleHelp,
+  Clock3,
+  Command,
+  Download,
+  FileSpreadsheet,
+  History,
+  LayoutDashboard,
+  LineChart,
+  Menu,
+  Moon,
+  MoreHorizontal,
+  PanelLeftClose,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Settings,
+  ShieldCheck,
+  Sun,
+  Target,
+  TrendingDown,
+  TrendingUp,
+  Upload,
+  Users,
+  X,
+  Zap,
 } from "lucide-react";
 import {
-  Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Area,
+  AreaChart,
+  CartesianGrid,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
 } from "recharts";
 import {
-  fetchAlerts, fetchCompanies, fetchWorkerStatus, updateCompanyTargets,
+  fetchAlerts,
+  fetchCompanies,
+  fetchCompanyDetails,
+  fetchImportHistory,
+  fetchNotificationPreferences,
+  fetchWorkerStatus,
+  performAlertAction,
+  restoreImportVersion,
+  triggerOnDemandPoll,
+  updateCompanyTargets,
+  updateNotificationPreferences,
 } from "./api";
 import BackendUploadPage from "./UploadPage";
-import { getStatus, historyFor, initialAlerts, initialCompanies } from "./mockData";
-import type { ApiAlert, Company, PortfolioAlert, PortfolioCompany, WorkerStatus } from "./types";
+import type {
+  ApiAlert,
+  CompanyDetailsResponse,
+  ImportBatchHistoryItem,
+  NotificationPreference,
+  PortfolioCompany,
+  RearmPolicy,
+  TargetDirection,
+  TriggerMode,
+  WorkerStatus,
+} from "./types";
 
-type Page = "Overview" | "Portfolio" | "Price Alerts" | "Target Management" | "Market Activity" | "Reports" | "Upload Excel" | "Settings";
+type Page =
+  | "Overview"
+  | "Portfolio"
+  | "Price Alerts"
+  | "Target Management"
+  | "Market Activity"
+  | "Reports"
+  | "Upload Excel"
+  | "Settings";
+
 const nav: Array<{ label: Page; icon: typeof LayoutDashboard; group?: string }> = [
   { label: "Overview", icon: LayoutDashboard, group: "WORKSPACE" },
   { label: "Portfolio", icon: BriefcaseBusiness },
@@ -29,559 +97,2793 @@ const nav: Array<{ label: Page; icon: typeof LayoutDashboard; group?: string }> 
   { label: "Upload Excel", icon: Upload },
   { label: "Settings", icon: Settings, group: "PREFERENCES" },
 ];
-const money = (n: number) => `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-const wholeINR = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
+
+const money = (n: number) =>
+  `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const percent = (n: number) => `${n > 0 ? "+" : ""}${n.toFixed(2)}%`;
 
-function parseCsv(text: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = "";
-  let quoted = false;
-  for (let i = 0; i < text.length; i += 1) {
-    const char = text[i];
-    if (char === '"' && quoted && text[i + 1] === '"') { cell += '"'; i += 1; }
-    else if (char === '"') quoted = !quoted;
-    else if (char === "," && !quoted) { row.push(cell.trim()); cell = ""; }
-    else if ((char === "\n" || char === "\r") && !quoted) {
-      if (char === "\r" && text[i + 1] === "\n") i += 1;
-      row.push(cell.trim());
-      if (row.some((value) => value !== "")) rows.push(row);
-      row = []; cell = "";
-    } else cell += char;
+function formatDistance(absVal?: number | null, pctVal?: number | null) {
+  if (absVal == null || pctVal == null) return "—";
+  const sign = absVal > 0 ? "+" : "";
+  return `${sign}${money(absVal)} (${percent(pctVal)})`;
+}
+
+function alertStatusBadge(company: PortfolioCompany) {
+  const quote = company.latest_quote;
+  const isStale = quote != null && !quote.is_fresh && !quote.is_simulated;
+  if (isStale) {
+    return <span className="status-badge badge-sell"><i />STALE QUOTE</span>;
   }
-  row.push(cell.trim());
-  if (row.some((value) => value !== "")) rows.push(row);
-  return rows;
+  const st = company.alert_status ?? "monitoring";
+  if (st === "both_triggered") {
+    return <span className="status-badge badge-sell"><i />Base & Bull Triggered</span>;
+  }
+  if (st === "base_triggered") {
+    return <span className="status-badge badge-buy"><i />Base Target Reached</span>;
+  }
+  if (st === "bull_triggered") {
+    return <span className="status-badge badge-sell"><i />Bull Target Reached</span>;
+  }
+  if (st === "pending_configuration") {
+    return <span className="status-badge badge-approaching"><i />Pending Config</span>;
+  }
+  if (st === "inactive") {
+    return <span className="status-badge badge-neutral"><i />Paused</span>;
+  }
+  if (company.nearest_target_pct != null && company.nearest_target_pct <= 2.5) {
+    return <span className="status-badge badge-approaching"><i />Approaching ({company.nearest_target_pct.toFixed(1)}%)</span>;
+  }
+  return <span className="status-badge badge-neutral"><i />Monitoring</span>;
 }
 
 export default function App() {
   const [page, setPage] = useState<Page>("Overview");
-  const companies = initialCompanies;
   const [portfolioCompanies, setPortfolioCompanies] = useState<PortfolioCompany[]>([]);
   const [portfolioStatus, setPortfolioStatus] = useState<"loading" | "ready" | "error">("loading");
   const [portfolioError, setPortfolioError] = useState("");
   const [portfolioRequest, setPortfolioRequest] = useState(0);
-  const [alerts, setAlerts] = useState(initialAlerts);
+
   const [apiAlerts, setApiAlerts] = useState<ApiAlert[]>([]);
   const [apiAlertStatus, setApiAlertStatus] = useState<"loading" | "ready" | "error">("loading");
   const [apiAlertError, setApiAlertError] = useState("");
   const [workerStatus, setWorkerStatus] = useState<WorkerStatus | null>(null);
-  const [alertRequest, setAlertRequest] = useState(0);
+  const [importHistory, setImportHistory] = useState<ImportBatchHistoryItem[]>([]);
+
   const [dark, setDark] = useState(true);
   const [collapsed, setCollapsed] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
   const [drawer, setDrawer] = useState(false);
-  const [selected, setSelected] = useState<Company | null>(null);
+  const [selectedCompany, setSelectedCompany] = useState<PortfolioCompany | null>(null);
   const [editing, setEditing] = useState<PortfolioCompany | null>(null);
   const [toast, setToast] = useState("");
   const [query, setQuery] = useState("");
-  const [period, setPeriod] = useState("1M");
-  const [connection, setConnection] = useState(true);
-  const [buyThreshold, setBuyThreshold] = useState(2);
-  const [sellThreshold, setSellThreshold] = useState(2);
   const [compactTables, setCompactTables] = useState(true);
+  const [isPollingNow, setIsPollingNow] = useState(false);
 
-  const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(""), 3000); };
-  const acknowledge = (id: string) => setAlerts((items) => items.map((item) => item.id === id ? { ...item, status: "Acknowledged" } : item));
-  const pickPage = (next: Page) => { setPage(next); setMobileNav(false); setSelected(null); };
-  const unread = alerts.filter((item) => item.status === "New").length;
-  const isApiPage = page === "Portfolio" || page === "Target Management" || page === "Upload Excel" || page === "Price Alerts";
-  const reloadPortfolio = () => setPortfolioRequest((request) => request + 1);
+  const notify = (message: string) => {
+    setToast(message);
+    window.setTimeout(() => setToast(""), 3500);
+  };
+
+  const reloadAll = () => setPortfolioRequest((r) => r + 1);
+
+  const pickPage = (next: Page) => {
+    setPage(next);
+    setMobileNav(false);
+  };
+
   useEffect(() => {
     const controller = new AbortController();
     setPortfolioStatus("loading");
     setPortfolioError("");
-    fetchCompanies(controller.signal).then((items) => {
-      setPortfolioCompanies(items);
-      setPortfolioStatus("ready");
-    }).catch((error: unknown) => {
-      if (controller.signal.aborted) return;
-      setPortfolioError(error instanceof Error ? error.message : "The portfolio API request failed.");
-      setPortfolioStatus("error");
-    });
-    return () => controller.abort();
-  }, [portfolioRequest]);
-  useEffect(() => {
-    if (page !== "Price Alerts") return;
-    const controller = new AbortController();
     setApiAlertStatus("loading");
     setApiAlertError("");
+
     Promise.all([
+      fetchCompanies(controller.signal),
       fetchAlerts(controller.signal),
       fetchWorkerStatus(controller.signal),
-    ]).then(([items, status]) => {
-      setApiAlerts(items);
-      setWorkerStatus(status);
-      setApiAlertStatus("ready");
-    }).catch((error: unknown) => {
-      if (controller.signal.aborted) return;
-      setApiAlertError(error instanceof Error ? error.message : "Could not load API alerts.");
-      setApiAlertStatus("error");
-    });
+      fetchImportHistory(controller.signal).catch(() => [] as ImportBatchHistoryItem[]),
+    ])
+      .then(([companiesData, alertsData, workerData, importsData]) => {
+        setPortfolioCompanies(companiesData);
+        setApiAlerts(alertsData);
+        setWorkerStatus(workerData);
+        setImportHistory(importsData);
+        setPortfolioStatus("ready");
+        setApiAlertStatus("ready");
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        const msg = error instanceof Error ? error.message : "Failed to load monitoring data.";
+        setPortfolioError(msg);
+        setApiAlertError(msg);
+        setPortfolioStatus("error");
+        setApiAlertStatus("error");
+      });
+
     return () => controller.abort();
-  }, [page, alertRequest]);
+  }, [portfolioRequest]);
+
+  // Periodic background refresh of dashboard view every 30s
   useEffect(() => {
-    if (selected) setSelected(companies.find((company) => company.id === selected.id) ?? null);
-  }, [companies, selected]);
+    const timer = window.setInterval(() => {
+      void Promise.all([fetchCompanies(), fetchAlerts(), fetchWorkerStatus()])
+        .then(([c, a, w]) => {
+          setPortfolioCompanies(c);
+          setApiAlerts(a);
+          setWorkerStatus(w);
+        })
+        .catch(() => null);
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (selectedCompany) {
+      const updated = portfolioCompanies.find(
+        (c) => c.exchange === selectedCompany.exchange && c.symbol === selectedCompany.symbol,
+      );
+      if (updated) setSelectedCompany(updated);
+    }
+  }, [portfolioCompanies, selectedCompany]);
+
+  const handlePollNow = async () => {
+    setIsPollingNow(true);
+    try {
+      const res = await triggerOnDemandPoll();
+      notify(`Fetched ${res.recorded}/${res.attempted} live quotes`);
+      reloadAll();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "Quote poll failed");
+    } finally {
+      setIsPollingNow(false);
+    }
+  };
+
+  const handleAlertLifecycle = async (
+    alertId: number,
+    action: "acknowledge" | "resolve" | "reset",
+  ) => {
+    try {
+      await performAlertAction(alertId, action);
+      notify(`Alert ${action}d`);
+      reloadAll();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "Could not update alert");
+    }
+  };
+
+  const activeAlertsCount = apiAlerts.filter(
+    (a) => (a.lifecycle_status ?? "triggered") === "triggered",
+  ).length;
+  const staleCompanies = portfolioCompanies.filter(
+    (c) => c.latest_quote != null && !c.latest_quote.is_fresh && !c.latest_quote.is_simulated,
+  );
+  const feedHealthy =
+    portfolioStatus === "ready" &&
+    workerStatus?.state !== "error" &&
+    staleCompanies.length === 0;
 
   return (
-    <div className={`app-shell min-h-screen ${dark ? "theme-dark" : "theme-light"} ${compactTables ? "compact-tables" : ""}`}>
-      <aside className={`sidebar ${collapsed ? "sidebar-collapsed" : ""} ${mobileNav ? "sidebar-mobile-open" : ""}`}>
+    <div
+      className={`app-shell min-h-screen ${dark ? "theme-dark" : "theme-light"} ${
+        compactTables ? "compact-tables" : ""
+      }`}
+    >
+      <aside
+        className={`sidebar ${collapsed ? "sidebar-collapsed" : ""} ${
+          mobileNav ? "sidebar-mobile-open" : ""
+        }`}
+      >
         <div className="brand">
-          <div className="brand-mark"><span>N</span></div>
-          {!collapsed && <div><div className="brand-name">northstar<span>.</span></div><div className="brand-caption">INVESTMENT OFFICE</div></div>}
-          <button className="icon-button sidebar-collapse" aria-label="Collapse sidebar" onClick={() => setCollapsed(!collapsed)}><PanelLeftClose size={16} /></button>
+          <div className="brand-mark">
+            <span>N</span>
+          </div>
+          {!collapsed && (
+            <div>
+              <div className="brand-name">
+                northstar<span>.</span>
+              </div>
+              <div className="brand-caption">INVESTMENT OFFICE</div>
+            </div>
+          )}
+          <button
+            className="icon-button sidebar-collapse"
+            aria-label="Collapse sidebar"
+            onClick={() => setCollapsed(!collapsed)}
+          >
+            <PanelLeftClose size={16} />
+          </button>
         </div>
-        <div className="workspace-switch"><div className="workspace-logo">PW</div>{!collapsed && <><div className="workspace-copy"><b>Plutus Wealth</b><small>Portfolio workspace</small></div><ChevronDown size={14} /></>}</div>
+        <div className="workspace-switch">
+          <div className="workspace-logo">PW</div>
+          {!collapsed && (
+            <>
+              <div className="workspace-copy">
+                <b>Plutus Wealth</b>
+                <small>NSE & BSE Monitoring</small>
+              </div>
+              <ChevronDown size={14} />
+            </>
+          )}
+        </div>
         <nav className="side-nav" aria-label="Main navigation">
-          {nav.map((item) => <div key={item.label}>
-            {item.group && !collapsed && <div className="nav-group">{item.group}</div>}
-            <button className={`nav-item ${page === item.label ? "nav-active" : ""}`} title={collapsed ? item.label : undefined} onClick={() => pickPage(item.label)}>
-              <item.icon size={17} strokeWidth={1.8} /><span>{!collapsed && item.label}</span>{item.label === "Price Alerts" && unread > 0 && <em>{unread}</em>}
-            </button>
-          </div>)}
+          {nav.map((item) => (
+            <div key={item.label}>
+              {item.group && !collapsed && <div className="nav-group">{item.group}</div>}
+              <button
+                className={`nav-item ${page === item.label ? "nav-active" : ""}`}
+                title={collapsed ? item.label : undefined}
+                onClick={() => pickPage(item.label)}
+              >
+                <item.icon size={17} strokeWidth={1.8} />
+                <span>{!collapsed && item.label}</span>
+                {item.label === "Price Alerts" && activeAlertsCount > 0 && (
+                  <em>{activeAlertsCount}</em>
+                )}
+              </button>
+            </div>
+          ))}
         </nav>
-        {!collapsed && <div className="sidebar-bottom"><div className="support-box"><div className="support-icon"><CircleHelp size={16} /></div><div><b>Need a hand?</b><small>Visit the help center</small></div><ArrowRight size={14} /></div><div className="sidebar-user"><div className="avatar">SK</div><div className="user-copy"><b>Srushti Kadam</b><small>Portfolio Manager</small></div><MoreHorizontal size={18} /></div></div>}
+        {!collapsed && (
+          <div className="sidebar-bottom">
+            <div className="support-box">
+              <div className="support-icon">
+                <ShieldCheck size={16} />
+              </div>
+              <div>
+                <b>Monitoring Only</b>
+                <small>Zero order execution</small>
+              </div>
+              <ArrowRight size={14} />
+            </div>
+            <div className="sidebar-user">
+              <div className="avatar">SK</div>
+              <div className="user-copy">
+                <b>Srushti Kadam</b>
+                <small>Portfolio Manager</small>
+              </div>
+              <MoreHorizontal size={18} />
+            </div>
+          </div>
+        )}
       </aside>
 
       <div className="main-area">
         <header className="topbar">
-          <button className="icon-button mobile-menu" aria-label="Open navigation" onClick={() => setMobileNav(!mobileNav)}><Menu size={19} /></button>
-          <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><b>{page}</b></div>
+          <button
+            className="icon-button mobile-menu"
+            aria-label="Open navigation"
+            onClick={() => setMobileNav(!mobileNav)}
+          >
+            <Menu size={19} />
+          </button>
+          <div className="breadcrumbs">
+            <span>Workspace</span>
+            <ChevronRight size={14} />
+            <b>{page}</b>
+          </div>
           <div className="top-actions">
-            <label className="global-search"><Search size={15} /><input placeholder="Search companies, symbols..." value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && page !== "Portfolio") { const match = companies.find((company) => `${company.name} ${company.symbol}`.toLowerCase().includes(query.toLowerCase())); if (match) { setSelected(match); setQuery(""); } } }} /><kbd><Command size={11} /> K</kbd></label>
+            <label className="global-search">
+              <Search size={15} />
+              <input
+                placeholder="Search companies or symbols..."
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && query.trim()) {
+                    const match = portfolioCompanies.find((c) =>
+                      `${c.name} ${c.symbol}`.toLowerCase().includes(query.toLowerCase()),
+                    );
+                    if (match) {
+                      setSelectedCompany(match);
+                    }
+                  }
+                }}
+              />
+              <kbd>
+                <Command size={11} /> K
+              </kbd>
+            </label>
             <div className="top-divider" />
-            <div className={`connection ${page === "Price Alerts" ? apiAlertStatus === "ready" ? "connected" : "disconnected" : isApiPage ? portfolioStatus === "ready" ? "connected" : "disconnected" : connection ? "connected" : "disconnected"}`}><span className="status-dot" /> <span className="connection-label">{page === "Price Alerts" ? apiAlertStatus === "ready" ? `Worker ${workerStatus?.state ?? "unknown"} · live alerts off` : apiAlertStatus === "error" ? "Alerts API unavailable" : "Loading alert status" : isApiPage ? portfolioStatus === "ready" ? "Portfolio API connected" : portfolioStatus === "error" ? "Portfolio API unavailable" : "Connecting to API" : connection ? "Mock feed connected" : "Mock feed interrupted"}</span></div>
-            <button className="icon-button notification-button" aria-label="Open notifications" onClick={() => setDrawer(true)}><Bell size={18} />{unread > 0 && <i>{unread}</i>}</button>
-            <button className="profile-button" onClick={() => pickPage("Settings")} aria-label="Open profile and settings"><div className="avatar small-avatar">SK</div><ChevronDown size={14} /></button>
+            <div className={`connection ${feedHealthy ? "connected" : "disconnected"}`}>
+              <span className="status-dot" />
+              <span className="connection-label">
+                {portfolioStatus === "error"
+                  ? "Backend Disconnected"
+                  : staleCompanies.length > 0
+                    ? `${staleCompanies.length} Stale Quote(s)`
+                    : `Feed ${workerStatus?.provider ?? "yfinance"} · ${
+                        workerStatus?.state ?? "ready"
+                      }`}
+              </span>
+            </div>
+            <button
+              className="icon-button notification-button"
+              aria-label="Open notifications"
+              onClick={() => setDrawer(true)}
+            >
+              <Bell size={18} />
+              {activeAlertsCount > 0 && <i>{activeAlertsCount}</i>}
+            </button>
+            <button
+              className="profile-button"
+              onClick={() => pickPage("Settings")}
+              aria-label="Open profile and settings"
+            >
+              <div className="avatar small-avatar">SK</div>
+              <ChevronDown size={14} />
+            </button>
           </div>
         </header>
+
         <main className="content-area">
-          <div className="demo-strip"><span className="demo-pulse" />{isApiPage ? <> API DATA <span className="strip-separator">/</span> {page === "Upload Excel" ? "IMPORT REQUIRES REVIEW" : "MARKET PRICES NOT CONNECTED"}</> : <> MOCK DATA <span className="strip-separator">/</span> SIMULATED SCREEN</>}<span className="strip-spacer" /> <span>{isApiPage ? "Backend" : "Demo only"}</span></div>
-          {page === "Overview" && <Overview companies={companies} alerts={alerts} period={period} setPeriod={setPeriod} onCompany={setSelected} onPage={pickPage} buyThreshold={buyThreshold} sellThreshold={sellThreshold} />}
-          {page === "Portfolio" && <Portfolio companies={portfolioCompanies} requestStatus={portfolioStatus} error={portfolioError} onRefresh={reloadPortfolio} search={query} />}
-          {page === "Price Alerts" && <AlertsPage alerts={alerts} onAcknowledge={acknowledge} apiAlerts={apiAlerts} apiStatus={apiAlertStatus} apiError={apiAlertError} workerStatus={workerStatus} onRefresh={() => setAlertRequest((request) => request + 1)} />}
-          {page === "Target Management" && <TargetManagement companies={portfolioCompanies} requestStatus={portfolioStatus} error={portfolioError} onRefresh={reloadPortfolio} onImport={() => pickPage("Upload Excel")} onEdit={setEditing} search={query} />}
-          {page === "Market Activity" && <MarketActivity companies={companies} connection={connection} setConnection={setConnection} onCompany={setSelected} />}
-          {page === "Reports" && <Reports companies={companies} alerts={alerts} notify={notify} buyThreshold={buyThreshold} sellThreshold={sellThreshold} />}
-          {page === "Upload Excel" && <BackendUploadPage onCompleted={reloadPortfolio} />}
-          {page === "Settings" && <SettingsPage dark={dark} setDark={setDark} compactTables={compactTables} setCompactTables={setCompactTables} buyThreshold={buyThreshold} sellThreshold={sellThreshold} setBuyThreshold={setBuyThreshold} setSellThreshold={setSellThreshold} notify={notify} />}
+          {(portfolioStatus === "error" ||
+            workerStatus?.state === "error" ||
+            staleCompanies.length > 0) && (
+            <div className="feed-banner feed-error" role="alert">
+              <div className="feed-main-icon">
+                <AlertTriangle size={18} />
+              </div>
+              <div>
+                <b>
+                  {portfolioStatus === "error"
+                    ? "Market Monitoring API Disconnected"
+                    : workerStatus?.state === "error"
+                      ? `Market Feed Warning: ${workerStatus.last_error}`
+                      : `${staleCompanies.length} Symbol(s) Have Stale Quotes`}
+                </b>
+                <small>
+                  Never treat stale or reference CMP values as live market prices. Click "Poll Live Quotes" to refresh from the market data provider.
+                </small>
+              </div>
+              <div className="feed-banner-right">
+                <button
+                  className="button primary small"
+                  onClick={() => void handlePollNow()}
+                  disabled={isPollingNow}
+                >
+                  <RefreshCw size={13} /> {isPollingNow ? "Polling…" : "Poll Live Quotes"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {page === "Overview" && (
+            <OverviewPage
+              companies={portfolioCompanies}
+              alerts={apiAlerts}
+              workerStatus={workerStatus}
+              importHistory={importHistory}
+              onSelectCompany={setSelectedCompany}
+              onPage={pickPage}
+              onPollNow={handlePollNow}
+              isPollingNow={isPollingNow}
+              onRestoreVersion={async (id) => {
+                await restoreImportVersion(id);
+                notify("Restored earlier approved target version");
+                reloadAll();
+              }}
+              search={query}
+            />
+          )}
+
+          {page === "Portfolio" && (
+            <PortfolioPage
+              companies={portfolioCompanies}
+              requestStatus={portfolioStatus}
+              error={portfolioError}
+              onRefresh={reloadAll}
+              onPollNow={handlePollNow}
+              isPollingNow={isPollingNow}
+              onSelectCompany={setSelectedCompany}
+              onEditCompany={setEditing}
+              search={query}
+              onSearchChange={setQuery}
+            />
+          )}
+
+          {page === "Price Alerts" && (
+            <AlertsPage
+              apiAlerts={apiAlerts}
+              apiStatus={apiAlertStatus}
+              apiError={apiAlertError}
+              workerStatus={workerStatus}
+              onRefresh={reloadAll}
+              onAction={handleAlertLifecycle}
+            />
+          )}
+
+          {page === "Target Management" && (
+            <TargetManagement
+              companies={portfolioCompanies}
+              requestStatus={portfolioStatus}
+              error={portfolioError}
+              onRefresh={reloadAll}
+              onImport={() => pickPage("Upload Excel")}
+              onEdit={setEditing}
+              onSelectCompany={setSelectedCompany}
+              search={query}
+            />
+          )}
+
+          {page === "Market Activity" && (
+            <MarketActivityPage
+              companies={portfolioCompanies}
+              workerStatus={workerStatus}
+              onPollNow={handlePollNow}
+              isPollingNow={isPollingNow}
+              onSelectCompany={setSelectedCompany}
+            />
+          )}
+
+          {page === "Reports" && (
+            <ReportsPage
+              companies={portfolioCompanies}
+              alerts={apiAlerts}
+              notify={notify}
+              onSelectCompany={setSelectedCompany}
+            />
+          )}
+
+          {page === "Upload Excel" && <BackendUploadPage onCompleted={reloadAll} />}
+
+          {page === "Settings" && (
+            <SettingsPage
+              dark={dark}
+              setDark={setDark}
+              compactTables={compactTables}
+              setCompactTables={setCompactTables}
+              workerStatus={workerStatus}
+              notify={notify}
+            />
+          )}
         </main>
-        <footer className="app-footer"><span>Northstar Portfolio Monitor <span className="footer-version">v1.0.4</span></span><span><ShieldCheck size={13} /> Secure workspace <i /> All prices are illustrative</span></footer>
+
+        <footer className="app-footer">
+          <span>
+            Northstar Portfolio Monitor <span className="footer-version">v2.0 Production</span>
+          </span>
+          <span>
+            <ShieldCheck size={13} /> Price-Monitoring & Target-Alert System <i /> No Order Execution
+          </span>
+        </footer>
       </div>
 
-      <AnimatePresence>{drawer && <NotificationDrawer alerts={alerts} onClose={() => setDrawer(false)} onAcknowledge={acknowledge} />}</AnimatePresence>
-      <AnimatePresence>{selected && <DetailPanel company={selected} alerts={alerts} buyThreshold={buyThreshold} sellThreshold={sellThreshold} onClose={() => setSelected(null)} />}</AnimatePresence>
-      <AnimatePresence>{editing && <EditTargetModal key={`${editing.exchange}:${editing.symbol}:${editing.version}`} company={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); reloadPortfolio(); }} />}</AnimatePresence>
-      <AnimatePresence>{toast && <motion.div className="toast" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}><Check size={15} />{toast}</motion.div>}</AnimatePresence>
-      {mobileNav && <button className="mobile-backdrop" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
+      <AnimatePresence>
+        {drawer && (
+          <NotificationDrawer
+            alerts={apiAlerts}
+            onClose={() => setDrawer(false)}
+            onAction={handleAlertLifecycle}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {selectedCompany && (
+          <DetailPanel
+            company={selectedCompany}
+            onClose={() => setSelectedCompany(null)}
+            onEditTargets={() => {
+              setEditing(selectedCompany);
+            }}
+            onAction={handleAlertLifecycle}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {editing && (
+          <EditTargetModal
+            key={`${editing.exchange}:${editing.symbol}:${editing.version}`}
+            company={editing}
+            onClose={() => setEditing(null)}
+            onSaved={() => {
+              setEditing(null);
+              notify("Target configuration saved");
+              reloadAll();
+            }}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            className="toast"
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+          >
+            <Check size={15} />
+            {toast}
+          </motion.div>
+        )}
+      </AnimatePresence>
+      {mobileNav && (
+        <button
+          className="mobile-backdrop"
+          aria-label="Close navigation"
+          onClick={() => setMobileNav(false)}
+        />
+      )}
     </div>
   );
 }
 
-function PageHeading({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
-  return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action && <div className="heading-actions">{action}</div>}</div>;
-}
-
-function MetricCard({ label, value, change, icon: Icon, tone, hint }: { label: string; value: string; change?: string; icon: typeof Users; tone: string; hint: string }) {
-  return <motion.div className="metric-card" whileHover={{ y: -2 }} transition={{ duration: 0.15 }}>
-    <div className="metric-top"><span>{label}</span><div className={`metric-icon ${tone}`}><Icon size={17} /></div></div>
-    <div className="metric-value">{value}</div><div className="metric-foot">{change && <span className={tone === "green" ? "text-green" : tone === "red" ? "text-red" : "text-muted"}>{change}</span>}<span>{hint}</span></div>
-  </motion.div>;
-}
-
-function chartData(companies: Company[], period = "1M") {
-  const count = period === "1D" ? 20 : period === "1W" ? 28 : period === "1Y" ? 48 : 36;
-  const base = companies.length ? companies.reduce((sum, company) => sum + company.price, 0) / companies.length : 1920;
-  const averageChange = companies.length ? companies.reduce((sum, company) => sum + company.change, 0) / companies.length : 0;
-  return Array.from({ length: count }, (_, i) => {
-    const val = base * (1 + Math.sin(i * 0.3) * 0.018 + Math.cos(i * 0.13) * 0.013 + ((i / count) - 0.45) * (averageChange / 100));
-    return { label: period === "1D" ? `${9 + Math.floor(i / 2)}:${i % 2 ? "30" : "00"}` : `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][i % 12]} ${4 + i}`, price: Math.round(val * 100) / 100 };
-  });
-}
-
-function PriceChart({ company, portfolio, period, setPeriod, compact: small = false, targets = false }: { company?: Company; portfolio?: Company[]; period: string; setPeriod?: (v: string) => void; compact?: boolean; targets?: boolean }) {
-  const data = useMemo(() => company ? historyFor(company, period) : chartData(portfolio ?? [], period), [company, portfolio, period]);
-  const series = data;
-  const values = series.map((point) => point.price);
-  const minValue = Math.min(...values, ...(targets && company ? [company.buyTarget] : []));
-  const maxValue = Math.max(...values, ...(targets && company ? [company.sellTarget] : []));
-  const padding = (maxValue - minValue) * 0.08;
-  const averageChange = portfolio?.length ? portfolio.reduce((sum, item) => sum + item.change, 0) / portfolio.length : 0;
-  const color = (company?.change ?? averageChange) < 0 ? "#ef727b" : "#70a9ff";
-  return <div className={`chart-wrap ${small ? "chart-small" : ""}`}>
-    <ResponsiveContainer width="100%" height="100%">
-      <AreaChart data={series} margin={{ top: 8, right: 4, left: -22, bottom: 0 }}>
-        <defs><linearGradient id="priceFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity={0.2} /><stop offset="100%" stopColor={color} stopOpacity={0} /></linearGradient></defs>
-        <CartesianGrid strokeDasharray="3 5" vertical={false} stroke="var(--chart-grid)" />
-        <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fill: "var(--muted)", fontSize: 10 }} minTickGap={34} />
-        <YAxis orientation="right" tickLine={false} axisLine={false} tick={{ fill: "var(--muted)", fontSize: 10 }} tickFormatter={(v: number) => v >= 1000 ? `₹${(v / 1000).toFixed(1)}k` : `₹${Math.round(v)}`} domain={[minValue - padding, maxValue + padding]} />
-        <Tooltip contentStyle={{ background: "var(--surface-raised)", border: "1px solid var(--border)", borderRadius: 8, color: "var(--text)", fontSize: 12 }} formatter={(v) => [money(Number(v)), "Price"]} />
-        {targets && company && <><ReferenceLine y={company.buyTarget} stroke="#44c49a" strokeDasharray="5 4" label={{ value: "BUY", fill: "#44c49a", fontSize: 9, position: "insideTopLeft" }} /><ReferenceLine y={company.sellTarget} stroke="#e97880" strokeDasharray="5 4" label={{ value: "SELL", fill: "#e97880", fontSize: 9, position: "insideTopLeft" }} /></>}
-        <Area type="monotone" dataKey={company ? "price" : "price"} stroke={color} strokeWidth={2} fill="url(#priceFill)" activeDot={{ r: 4, strokeWidth: 0 }} />
-      </AreaChart>
-    </ResponsiveContainer>
-    {!small && setPeriod && <div className="chart-range">{["1D", "1W", "1M", "3M", "1Y"].map((range) => <button key={range} className={period === range ? "range-active" : ""} onClick={() => setPeriod(range)}>{range}</button>)}</div>}
-  </div>;
-}
-
-function Overview({ companies, alerts, period, setPeriod, onCompany, onPage, buyThreshold, sellThreshold }: { companies: Company[]; alerts: PortfolioAlert[]; period: string; setPeriod: (v: string) => void; onCompany: (c: Company) => void; onPage: (p: Page) => void; buyThreshold: number; sellThreshold: number }) {
-  const buyReached = companies.filter((c) => getStatus(c, buyThreshold, sellThreshold) === "Buy zone").length;
-  const sellReached = companies.filter((c) => getStatus(c, buyThreshold, sellThreshold) === "Sell zone").length;
-  const portfolioValue = companies.reduce((sum, company) => sum + company.price * 14, 0);
-  const averageChange = companies.reduce((sum, company) => sum + company.change, 0) / companies.length;
-  const buyClose = [...companies].sort((a, b) => Math.abs((a.price - a.buyTarget) / a.buyTarget) - Math.abs((b.price - b.buyTarget) / b.buyTarget)).slice(0, 5);
-  const sellClose = [...companies].sort((a, b) => Math.abs((a.sellTarget - a.price) / a.sellTarget) - Math.abs((b.sellTarget - b.price) / b.sellTarget)).slice(0, 5);
-  return <>
-    <PageHeading eyebrow="THURSDAY, OCTOBER 15, 2026" title="Good morning, Srushti" description="Here's what's happening across your portfolio today." action={<button className="button secondary" onClick={() => onPage("Reports")}><Download size={15} /> Generate report</button>} />
-    <div className="metric-grid">
-      <MetricCard label="Companies tracked" value={String(companies.length)} icon={BriefcaseBusiness} tone="blue" hint="Across NSE & BSE" />
-      <MetricCard label="Buy targets reached" value={String(buyReached)} change="+2 this week" icon={ArrowDownRight} tone="green" hint="Price at or below target" />
-      <MetricCard label="Sell targets reached" value={String(sellReached)} change="1 new today" icon={ArrowUpRight} tone="red" hint="Price at or above target" />
-      <MetricCard label="Market data status" value="Connected" change="09:30:04 IST" icon={Activity} tone="green" hint="NSE & BSE · Demo feed" />
+function PageHeading({
+  eyebrow,
+  title,
+  description,
+  action,
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="page-heading">
+      <div>
+        <div className="eyebrow">{eyebrow}</div>
+        <h1>{title}</h1>
+        <p>{description}</p>
+      </div>
+      {action && <div className="heading-actions">{action}</div>}
     </div>
-    <div className="overview-main-grid">
-      <section className="card market-chart-card">
-        <div className="section-head"><div><h2>Portfolio market overview</h2><p>Weighted portfolio performance · Demo prices</p></div><button className="select-button">NIFTY 50 <ChevronDown size={13} /></button></div>
-        <div className="chart-summary"><b>{wholeINR(portfolioValue)}</b><span className={averageChange >= 0 ? "positive" : "negative"}>{averageChange >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />} {percent(averageChange)}</span><small>Illustrative portfolio value</small></div>
-        <PriceChart portfolio={companies} period={period} setPeriod={setPeriod} compact />
-      </section>
-      <section className="card exchange-card">
-        <div className="section-head"><div><h2>Market pulse</h2><p>Exchange snapshot · 09:30 IST</p></div><span className="live-pill"><span /> OPEN</span></div>
-        <div className="exchange-row"><div className="exchange-logo nse-logo">N</div><div className="exchange-info"><b>NIFTY 50</b><small>NSE · 50 constituents</small></div><div className="exchange-value"><b>25,176.40</b><span className="positive">+0.72%</span></div></div>
-        <div className="exchange-row"><div className="exchange-logo bse-logo">B</div><div className="exchange-info"><b>SENSEX</b><small>BSE · 30 constituents</small></div><div className="exchange-value"><b>82,634.18</b><span className="positive">+0.64%</span></div></div>
-        <div className="market-status-foot"><span><i className="status-dot" /> NSE feed connected</span><span><i className="status-dot" /> BSE feed connected</span></div>
-      </section>
-    </div>
-    <div className="overview-lower-grid">
-      <section className="card target-list-card">
-        <div className="section-head"><div><h2>Closest to buy targets</h2><p>Companies nearing their buy price</p></div><button className="text-link" onClick={() => onPage("Portfolio")}>View portfolio <ArrowRight size={13} /></button></div>
-        <div className="mini-stock-list">{buyClose.map((company) => <MiniStock key={company.id} company={company} direction="buy" onClick={() => onCompany(company)} />)}</div>
-      </section>
-      <section className="card target-list-card">
-        <div className="section-head"><div><h2>Closest to sell targets</h2><p>Companies nearing their sell price</p></div><button className="text-link" onClick={() => onPage("Target Management")}>Manage targets <ArrowRight size={13} /></button></div>
-        <div className="mini-stock-list">{sellClose.map((company) => <MiniStock key={company.id} company={company} direction="sell" onClick={() => onCompany(company)} />)}</div>
-      </section>
-      <section className="card activity-card">
-        <div className="section-head"><div><h2>Recent activity</h2><p>Latest portfolio alerts</p></div><button className="text-link" onClick={() => onPage("Price Alerts")}>All activity <ArrowRight size={13} /></button></div>
-        <div className="activity-list">{alerts.slice(0, 4).map((alert) => <div className="activity-row" key={alert.id}><span className={`activity-marker ${alert.type.includes("Sell") ? "marker-red" : alert.type.includes("Buy") ? "marker-green" : "marker-amber"}`}><Activity size={12} /></span><div><b>{alert.company}</b><small>{alert.type}</small></div><time>{alert.time}</time></div>)}</div>
-      </section>
-    </div>
-  </>;
+  );
 }
 
-function TargetProximityBar({ company }: { company: Company }) {
-  const buyGap = Math.max(0, (company.price - company.buyTarget) / company.buyTarget * 100);
-  const sellGap = Math.max(0, (company.sellTarget - company.price) / company.sellTarget * 100);
-  const distance = Math.min(buyGap, sellGap);
-  const progress = Math.max(5, Math.min(100, 100 - distance * 8));
-  return <div className="proximity"><span className="proximity-track"><i style={{ width: `${progress}%`, background: distance < 3 ? "#e4a94f" : "#7185aa" }} /></span><small>{distance.toFixed(1)}%</small></div>;
-}
-function StatusBadge({ company, buyThreshold = 2, sellThreshold = 2 }: { company: Company; buyThreshold?: number; sellThreshold?: number }) {
-  const status = getStatus(company, buyThreshold, sellThreshold);
-  const cls = status === "Buy zone" ? "badge-buy" : status === "Sell zone" ? "badge-sell" : status === "Approaching" ? "badge-approaching" : "badge-neutral";
-  return <span className={`status-badge ${cls}`}><i />{status}</span>;
+function MetricCard({
+  label,
+  value,
+  change,
+  icon: Icon,
+  tone,
+  hint,
+}: {
+  label: string;
+  value: string;
+  change?: string;
+  icon: typeof Users;
+  tone: string;
+  hint: string;
+}) {
+  return (
+    <motion.div className="metric-card" whileHover={{ y: -2 }} transition={{ duration: 0.15 }}>
+      <div className="metric-top">
+        <span>{label}</span>
+        <div className={`metric-icon ${tone}`}>
+          <Icon size={17} />
+        </div>
+      </div>
+      <div className="metric-value">{value}</div>
+      <div className="metric-foot">
+        {change && (
+          <span
+            className={
+              tone === "green" ? "text-green" : tone === "red" ? "text-red" : "text-muted"
+            }
+          >
+            {change}
+          </span>
+        )}
+        <span>{hint}</span>
+      </div>
+    </motion.div>
+  );
 }
 
-function MiniStock({ company, direction, onClick }: { company: Company; direction: "buy" | "sell"; onClick: () => void }) {
-  const target = direction === "buy" ? company.buyTarget : company.sellTarget;
-  const gap = Math.abs((company.price - target) / target * 100);
-  return <button className="mini-stock" onClick={onClick}><div className="mini-ticker">{company.symbol.slice(0, 2)}</div><div className="mini-stock-name"><b>{company.name}</b><small>{company.symbol} <i>·</i> {company.exchange}</small></div><div className="mini-proximity"><span className="proximity-track"><i style={{ width: `${Math.max(10, 100 - gap * 7)}%` }} /></span><small>{gap.toFixed(1)}% away</small></div><div className="mini-price"><b>{money(company.price)}</b><small className={company.change >= 0 ? "positive" : "negative"}>{percent(company.change)}</small></div></button>;
+function OverviewPage({
+  companies,
+  alerts,
+  workerStatus,
+  importHistory,
+  onSelectCompany,
+  onPage,
+  onPollNow,
+  isPollingNow,
+  onRestoreVersion,
+  search,
+}: {
+  companies: PortfolioCompany[];
+  alerts: ApiAlert[];
+  workerStatus: WorkerStatus | null;
+  importHistory: ImportBatchHistoryItem[];
+  onSelectCompany: (c: PortfolioCompany) => void;
+  onPage: (p: Page) => void;
+  onPollNow: () => Promise<void>;
+  isPollingNow: boolean;
+  onRestoreVersion: (id: string) => Promise<void>;
+  search: string;
+}) {
+  const activeMonitoringCount = companies.filter(
+    (c) => c.is_approved !== false && c.monitoring_active !== false,
+  ).length;
+  const baseAlertsCount = companies.filter(
+    (c) => c.alert_status === "base_triggered" || c.alert_status === "both_triggered",
+  ).length;
+  const bullAlertsCount = companies.filter(
+    (c) => c.alert_status === "bull_triggered" || c.alert_status === "both_triggered",
+  ).length;
+  const pendingConfigCount =
+    companies.filter((c) => c.alert_status === "pending_configuration").length +
+    importHistory.filter((b) => b.status === "preview").length;
+
+  const nearestCompanies = useMemo(() => {
+    return [...companies]
+      .filter((c) => !search || `${c.name} ${c.symbol}`.toLowerCase().includes(search.toLowerCase()))
+      .sort((a, b) => (a.nearest_target_pct ?? 9999) - (b.nearest_target_pct ?? 9999))
+      .slice(0, 12);
+  }, [companies, search]);
+
+  return (
+    <>
+      <PageHeading
+        eyebrow="PORTFOLIO MONITORING COMMAND CENTER"
+        title="Portfolio Overview"
+        description="Real-time NSE & BSE price monitoring, configurable Base/Bull target alerts, and feed telemetry."
+        action={
+          <div className="heading-actions">
+            <button
+              className="button secondary"
+              onClick={() => void onPollNow()}
+              disabled={isPollingNow}
+            >
+              <RefreshCw size={14} /> {isPollingNow ? "Polling Quotes…" : "Poll Live Quotes"}
+            </button>
+            <button className="button primary" onClick={() => onPage("Upload Excel")}>
+              <Upload size={14} /> Upload Excel Targets
+            </button>
+          </div>
+        }
+      />
+
+      <div className="metric-grid">
+        <MetricCard
+          label="Total Monitored Companies"
+          value={String(companies.length)}
+          change={`${activeMonitoringCount} active`}
+          icon={BriefcaseBusiness}
+          tone="blue"
+          hint="Approved NSE & BSE stocks"
+        />
+        <MetricCard
+          label="Base Target Alerts"
+          value={String(baseAlertsCount)}
+          change={`${alerts.filter((a) => a.target_kind === "base").length} total events`}
+          icon={ArrowDownRight}
+          tone="green"
+          hint="Configured Base condition met"
+        />
+        <MetricCard
+          label="Bull Target Alerts"
+          value={String(bullAlertsCount)}
+          change={`${alerts.filter((a) => a.target_kind === "bull").length} total events`}
+          icon={ArrowUpRight}
+          tone="red"
+          hint="Configured Bull condition met"
+        />
+        <MetricCard
+          label="Pending / Feed Status"
+          value={workerStatus?.provider ? workerStatus.provider.toUpperCase() : "READY"}
+          change={`${pendingConfigCount} pending config`}
+          icon={Activity}
+          tone={workerStatus?.state === "error" ? "red" : "green"}
+          hint={
+            workerStatus?.last_poll_at
+              ? `Last poll: ${new Date(workerStatus.last_poll_at).toLocaleTimeString("en-IN")}`
+              : "Independent worker ready"
+          }
+        />
+      </div>
+
+      <section className="card portfolio-card" style={{ marginBottom: 20 }}>
+        <div className="section-head">
+          <div>
+            <h2>Main Monitoring Table (Nearest to Target)</h2>
+            <p>Click any company row to open full target configuration, price history, and Excel cell source details.</p>
+          </div>
+          <button className="text-link" onClick={() => onPage("Portfolio")}>
+            Open full monitoring table ({companies.length}) <ArrowRight size={13} />
+          </button>
+        </div>
+        <div className="table-scroll">
+          <MonitoringTable
+            companies={nearestCompanies}
+            onSelectCompany={onSelectCompany}
+          />
+        </div>
+      </section>
+
+      <div className="overview-lower-grid">
+        <section className="card activity-card">
+          <div className="section-head">
+            <div>
+              <h2>Alert Activity</h2>
+              <p>Recently triggered Base & Bull alerts</p>
+            </div>
+            <button className="text-link" onClick={() => onPage("Price Alerts")}>
+              All alerts ({alerts.length}) <ArrowRight size={13} />
+            </button>
+          </div>
+          <div className="activity-list">
+            {alerts.length === 0 ? (
+              <p className="empty-copy">No triggered alerts yet.</p>
+            ) : (
+              alerts.slice(0, 6).map((alert) => (
+                <div className="activity-row" key={alert.id}>
+                  <span
+                    className={`activity-marker ${
+                      alert.target_kind === "bull" ? "marker-red" : "marker-green"
+                    }`}
+                  >
+                    <Zap size={12} />
+                  </span>
+                  <div>
+                    <b>
+                      {alert.symbol} ({alert.exchange}) · {alert.target_kind.toUpperCase()} Target
+                    </b>
+                    <small>
+                      Trigger: {money(alert.price)} vs Target{" "}
+                      {alert.target == null ? "—" : money(alert.target)} · Delivery:{" "}
+                      {alert.delivery_status.toUpperCase()}
+                    </small>
+                  </div>
+                  <time>{new Date(alert.triggered_at).toLocaleTimeString("en-IN")}</time>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+
+        <section className="card target-list-card">
+          <div className="section-head">
+            <div>
+              <h2>Market Feed Health</h2>
+              <p>Provider & worker telemetry</p>
+            </div>
+            <button className="text-link" onClick={() => onPage("Market Activity")}>
+              Feed details <ArrowRight size={13} />
+            </button>
+          </div>
+          <div className="worker-status-grid" style={{ padding: "8px 0" }}>
+            <div>
+              <small>Provider Connection</small>
+              <b>{workerStatus?.provider ?? "yfinance (NSE/BSE)"}</b>
+            </div>
+            <div>
+              <small>WebSocket / Transport</small>
+              <b>{workerStatus?.websocket_status ?? "Polling fallback active"}</b>
+            </div>
+            <div>
+              <small>Last Successful Update</small>
+              <b>
+                {workerStatus?.last_poll_at
+                  ? new Date(workerStatus.last_poll_at).toLocaleString("en-IN")
+                  : "Awaiting poll"}
+              </b>
+            </div>
+            <div>
+              <small>Stale / Failed Quotes</small>
+              <b>
+                {workerStatus?.stale_symbols_count ?? 0} stale ·{" "}
+                {workerStatus?.last_poll_failed ?? 0} failed
+              </b>
+            </div>
+          </div>
+        </section>
+
+        <section className="card target-list-card">
+          <div className="section-head">
+            <div>
+              <h2>Import History</h2>
+              <p>Versioned Excel uploads</p>
+            </div>
+            <button className="text-link" onClick={() => onPage("Upload Excel")}>
+              Manage imports <ArrowRight size={13} />
+            </button>
+          </div>
+          <div className="activity-list">
+            {importHistory.length === 0 ? (
+              <p className="empty-copy">No Excel imports recorded yet.</p>
+            ) : (
+              importHistory.slice(0, 5).map((batch) => (
+                <div className="activity-row" key={batch.id}>
+                  <span className="activity-marker marker-amber">
+                    <FileSpreadsheet size={12} />
+                  </span>
+                  <div>
+                    <b>
+                      {batch.version_number ? `v${batch.version_number}` : "Draft"} ·{" "}
+                      {batch.filename}
+                    </b>
+                    <small>
+                      {batch.status.toUpperCase()} · {batch.uploaded_by}
+                    </small>
+                  </div>
+                  {batch.status === "confirmed" &&
+                    batch.changes_snapshot &&
+                    batch.changes_snapshot.length > 0 && (
+                      <button
+                        className="button secondary small"
+                        onClick={() => void onRestoreVersion(batch.id)}
+                      >
+                        <RotateCcw size={11} /> Restore
+                      </button>
+                    )}
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+      </div>
+    </>
+  );
 }
 
-function Portfolio({ companies, requestStatus, error, onRefresh, search }: { companies: PortfolioCompany[]; requestStatus: "loading" | "ready" | "error"; error: string; onRefresh: () => void; search: string }) {
+function MonitoringTable({
+  companies,
+  onSelectCompany,
+  onSort,
+}: {
+  companies: PortfolioCompany[];
+  onSelectCompany: (c: PortfolioCompany) => void;
+  onSort?: (key: string) => void;
+}) {
+  if (companies.length === 0) {
+    return (
+      <div className="empty-state">
+        <BriefcaseBusiness size={22} />
+        <b>No matching companies</b>
+        <span>Upload an Excel workbook or adjust your filters.</span>
+      </div>
+    );
+  }
+  return (
+    <table className="portfolio-table">
+      <thead>
+        <tr>
+          <th>
+            {onSort ? (
+              <button onClick={() => onSort("name")}>
+                Company <ArrowDownUp size={11} />
+              </button>
+            ) : (
+              "Company"
+            )}
+          </th>
+          <th>
+            {onSort ? (
+              <button onClick={() => onSort("price")}>
+                Latest Price <ArrowDownUp size={11} />
+              </button>
+            ) : (
+              "Latest Price"
+            )}
+          </th>
+          <th>
+            {onSort ? (
+              <button onClick={() => onSort("base")}>
+                Base Target <ArrowDownUp size={11} />
+              </button>
+            ) : (
+              "Base Target"
+            )}
+          </th>
+          <th>
+            {onSort ? (
+              <button onClick={() => onSort("bull")}>
+                Bull Target <ArrowDownUp size={11} />
+              </button>
+            ) : (
+              "Bull Target"
+            )}
+          </th>
+          <th>Distance to Base</th>
+          <th>Distance to Bull</th>
+          <th>
+            {onSort ? (
+              <button onClick={() => onSort("nearest")}>
+                Alert Status <ArrowDownUp size={11} />
+              </button>
+            ) : (
+              "Alert Status"
+            )}
+          </th>
+          <th>Last Quote</th>
+        </tr>
+      </thead>
+      <tbody>
+        {companies.map((company) => {
+          const quote = company.latest_quote;
+          const isStale = quote != null && !quote.is_fresh && !quote.is_simulated;
+          const vsSavedCmp =
+            quote && company.cmp && company.cmp > 0
+              ? ((quote.price - company.cmp) / company.cmp) * 100
+              : null;
+          return (
+            <tr
+              key={`${company.exchange}:${company.symbol}`}
+              onClick={() => onSelectCompany(company)}
+              style={{
+                cursor: "pointer",
+                background: isStale ? "rgba(239, 114, 123, 0.08)" : undefined,
+              }}
+            >
+              <td>
+                <div className="company-name-cell">
+                  <div className="company-avatar">{company.symbol.slice(0, 2)}</div>
+                  <span>
+                    <b>{company.name}</b>
+                    <small>
+                      {company.symbol} ·{" "}
+                      <span
+                        className={`exchange-tag ${
+                          company.exchange === "BSE" ? "bse-tag" : ""
+                        }`}
+                      >
+                        {company.exchange}
+                      </span>{" "}
+                      · Ref CMP: {company.cmp == null ? "—" : money(company.cmp)}
+                    </small>
+                  </span>
+                </div>
+              </td>
+              <td>
+                {quote ? (
+                  <div>
+                    <b>{money(quote.price)}</b>{" "}
+                    {vsSavedCmp != null && (
+                      <span className={vsSavedCmp >= 0 ? "positive" : "negative"}>
+                        {vsSavedCmp >= 0 ? (
+                          <ArrowUpRight size={12} />
+                        ) : (
+                          <ArrowDownRight size={12} />
+                        )}
+                        {percent(vsSavedCmp)}
+                      </span>
+                    )}
+                    <small className="quote-freshness">
+                      {isStale ? "⚠ STALE QUOTE" : quote.is_simulated ? "Simulated" : "Live Validated"}
+                    </small>
+                  </div>
+                ) : (
+                  <span className="quote-freshness">Awaiting live quote</span>
+                )}
+              </td>
+              <td className="target-base-price">
+                <div>
+                  <b>{company.base_target == null ? "—" : money(company.base_target)}</b>
+                </div>
+                <small className="cell-sub">
+                  {company.base_direction === "below"
+                    ? "Trigger ≤ Base"
+                    : company.base_direction === "above"
+                      ? "Trigger ≥ Base"
+                      : "Pending direction"}
+                </small>
+              </td>
+              <td className="target-bull-price">
+                <div>
+                  <b>{company.bull_target == null ? "—" : money(company.bull_target)}</b>
+                </div>
+                <small className="cell-sub">
+                  {company.bull_direction === "above"
+                    ? "Trigger ≥ Bull"
+                    : company.bull_direction === "below"
+                      ? "Trigger ≤ Bull"
+                      : "Pending direction"}
+                </small>
+              </td>
+              <td>
+                <span
+                  className={
+                    (company.distance_to_base_pct ?? 0) <= 0 ? "positive" : "text-muted"
+                  }
+                >
+                  {formatDistance(company.distance_to_base_abs, company.distance_to_base_pct)}
+                </span>
+              </td>
+              <td>
+                <span
+                  className={
+                    (company.distance_to_bull_pct ?? 0) >= 0 ? "positive" : "text-muted"
+                  }
+                >
+                  {formatDistance(company.distance_to_bull_abs, company.distance_to_bull_pct)}
+                </span>
+              </td>
+              <td>{alertStatusBadge(company)}</td>
+              <td>
+                {quote ? (
+                  <div>
+                    <div>{new Date(quote.quoted_at).toLocaleTimeString("en-IN")}</div>
+                    <small className="cell-sub">
+                      {quote.provider} · {isStale ? "STALE" : "Fresh"}
+                    </small>
+                  </div>
+                ) : (
+                  <small className="cell-sub">No quote yet</small>
+                )}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function PortfolioPage({
+  companies,
+  requestStatus,
+  error,
+  onRefresh,
+  onPollNow,
+  isPollingNow,
+  onSelectCompany,
+  search,
+  onSearchChange,
+}: {
+  companies: PortfolioCompany[];
+  requestStatus: "loading" | "ready" | "error";
+  error: string;
+  onRefresh: () => void;
+  onPollNow: () => Promise<void>;
+  isPollingNow: boolean;
+  onSelectCompany: (c: PortfolioCompany) => void;
+  onEditCompany: (c: PortfolioCompany) => void;
+  search: string;
+  onSearchChange: (v: string) => void;
+}) {
   const [exchange, setExchange] = useState("All exchanges");
-  const [sort, setSort] = useState("name");
+  const [alertFilter, setAlertFilter] = useState("All statuses");
+  const [sort, setSort] = useState("nearest");
   const [ascending, setAscending] = useState(true);
-  const filtered = useMemo(() => companies.filter((c) => {
-    const term = search.toLowerCase();
-    return (!term || `${c.name} ${c.symbol}`.toLowerCase().includes(term)) && (exchange === "All exchanges" || c.exchange === exchange);
-  }).sort((a, b) => {
-    const result = sort === "name" ? a.name.localeCompare(b.name) : sort === "base" ? (a.base_target ?? 0) - (b.base_target ?? 0) : (a.bull_target ?? 0) - (b.bull_target ?? 0);
-    return ascending ? result : -result;
-  }), [companies, search, exchange, sort, ascending]);
-  const chooseSort = (key: string) => { setAscending(sort === key ? !ascending : true); setSort(key); };
-  const renderRows = requestStatus === "loading"
-    ? <div className="empty-state" role="status"><RefreshCw size={22} /><b>Loading portfolio</b><span>Connecting to the backend API…</span></div>
-    : requestStatus === "error"
-      ? <div className="empty-state" role="alert"><CircleHelp size={22} /><b>Could not load portfolio</b><span>{error}</span><button className="button secondary" onClick={onRefresh}>Retry</button></div>
-      : filtered.length === 0
-        ? <div className="empty-state"><BriefcaseBusiness size={22} /><b>{companies.length === 0 ? "No companies yet" : "No companies found"}</b><span>{companies.length === 0 ? "The backend database is empty. Companies will appear here when added." : "Try another search or exchange."}</span></div>
-        : <table className="portfolio-table"><thead><tr><th><button onClick={() => chooseSort("name")}>Company <ArrowDownUp size={11} /></button></th><th>Symbol</th><th>Exchange</th><th>CMP</th><th>Imported CMP</th><th><button onClick={() => chooseSort("base")}>Base target <ArrowDownUp size={11} /></button></th><th><button onClick={() => chooseSort("bull")}>Bull target <ArrowDownUp size={11} /></button></th></tr></thead>
-          <tbody>{filtered.map((company) => {
-            const quote = company.latest_quote;
-            const quoteStatus = !quote ? "No quote" : quote.is_simulated ? "Simulated · not live" : quote.is_fresh ? "Fresh" : quote.status === "out_of_order" ? "Out of order" : "Stale";
-            return <tr key={`${company.exchange}:${company.symbol}`}><td><div className="company-name-cell"><div className="company-avatar">{company.symbol.slice(0, 1)}</div><span><b>{company.name}</b><small>{company.sector ?? "Sector not specified"}</small></span></div></td><td className="symbol-cell">{company.symbol}</td><td><span className={`exchange-tag ${company.exchange === "BSE" ? "bse-tag" : ""}`}>{company.exchange}</span></td><td>{quote ? <span><b>{new Intl.NumberFormat("en-IN", { style: "currency", currency: quote.currency, minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(quote.price)}</b><small className="quote-freshness">{quote.provider} · {quote.quote_type === "candle_close" ? "1-minute candle close · Yahoo bar timestamp" : quote.quote_type === "fixture" ? "Fixture quote" : quote.quote_type === "last_trade" ? "Last-traded quote" : "Provider quote"} · {quoteStatus} · {new Date(quote.quoted_at).toLocaleString()}</small></span> : <span className="quote-freshness">Unavailable · no provider quote recorded</span>}</td><td>{company.cmp == null ? "—" : money(company.cmp)}</td><td className="target-base-price">{company.base_target == null ? "Not set" : money(company.base_target)}</td><td className="target-bull-price">{company.bull_target == null ? "Not set" : money(company.bull_target)}</td></tr>;
-          })}</tbody>
-        </table>;
-  return <>
-    <PageHeading eyebrow="PORTFOLIO · BACKEND API" title="Portfolio" description={`${companies.length} companies · Yahoo Finance demo data is unofficial and not guaranteed real-time`} action={<button className="button primary" onClick={onRefresh} disabled={requestStatus === "loading"}><RefreshCw size={14} /> Refresh portfolio</button>} />
-    <section className="card portfolio-card">
-      <div className="table-toolbar"><div className="table-toolbar-title"><div className="table-icon"><BriefcaseBusiness size={15} /></div><div><b>Tracked companies</b><small>{requestStatus === "ready" ? `${filtered.length} of ${companies.length} companies` : "Data from backend API"}</small></div></div><div className="table-filters"><label className="filter-search"><Search size={14} /><input value={search} readOnly placeholder="Search companies..." /></label><select aria-label="Exchange filter" value={exchange} onChange={(e) => setExchange(e.target.value)}><option>All exchanges</option><option>NSE</option><option>BSE</option></select></div></div>
-      <div className="table-scroll">{renderRows}</div>
-      <div className="table-footer"><span>{requestStatus === "ready" ? <>Showing <b>{filtered.length}</b> of <b>{companies.length}</b> companies <span className="footer-demo">· API data</span></> : "Portfolio data is served by the backend API."}</span></div>
-    </section>
-    <div className="table-note"><ShieldCheck size={13} /> Company identity uses exchange and symbol <span>·</span> Quote freshness is separate from imported CMP <span>·</span> Yahoo prices may be delayed or unavailable; live alerts and the authoritative calendar remain unconfigured</div>
-  </>;
-}
 
-function BackendAlertsPanel({ alerts, status, error, worker, onRefresh }: { alerts: ApiAlert[]; status: "loading" | "ready" | "error"; error: string; worker: WorkerStatus | null; onRefresh: () => void }) {
-  const failures = alerts.filter((alert) => alert.delivery_status === "failed").length;
-  return <>
-    <section className="card worker-status-card">
-      <div className="section-head"><div><h2>Price worker & delivery status</h2><p>No live provider, authoritative exchange calendar, or message destination is configured.</p></div><span className={`alert-state ${worker?.state === "running" ? "state-acknowledged" : "state-resolved"}`}>{worker?.state ?? "unknown"}</span></div>
-      {status === "loading" ? <div className="empty-state" role="status"><RefreshCw size={20} /><b>Loading backend status</b></div>
-        : status === "error" ? <div className="empty-state" role="alert"><CircleHelp size={20} /><b>Could not load backend status</b><span>{error}</span><button className="button secondary" onClick={onRefresh}>Retry</button></div>
-          : <><div className="worker-status-grid"><div><small>Provider</small><b>{worker?.provider ?? "Not configured"}</b></div><div><small>Exchange calendar</small><b>{worker?.exchange_calendar ?? "Not configured"}</b></div><div><small>Last poll</small><b>{worker?.last_poll_at ? new Date(worker.last_poll_at).toLocaleString() : "No poll recorded"}</b></div><div><small>Notification mode</small><b>{worker?.notification_mode ?? "Unknown"}</b></div></div><div className="worker-status-note">{worker?.note ?? "Live alerts remain disabled."}</div>{worker?.last_error && <div className="worker-error" role="alert">Last worker error: {worker.last_error}</div>}</>}
-    </section>
-    <section className="card alerts-card api-alerts-card"><div className="table-toolbar"><div className="table-toolbar-title"><div className="table-icon amber-icon"><Bell size={15} /></div><div><b>Persisted target events</b><small>{status === "ready" ? `${alerts.length} events · ${failures} permanent delivery failures · live alerts disabled` : "Database event and outbox status"}</small></div></div></div>
-      {status === "loading" ? <div className="empty-state" role="status"><RefreshCw size={20} /><b>Loading persisted alerts</b></div>
-        : status === "error" ? <div className="empty-state" role="alert"><CircleHelp size={20} /><b>Backend events unavailable</b><span>{error}</span></div>
-          : <div className="table-scroll"><table className="alerts-table"><thead><tr><th>Event</th><th>Company</th><th>Quote / target</th><th>Freshness</th><th>Occurred</th><th>Delivery</th><th>Attempts</th></tr></thead><tbody>{alerts.map((alert) => <tr key={alert.id}><td><b>{alert.target_kind === "base" ? "Base target reached" : "Bull target reached"}</b><small className="cell-sub">{alert.event_type === "fixture" ? "FIXTURE · SIMULATED" : "LIVE EVENT"}</small></td><td><b>{alert.company}</b><small className="cell-sub">{alert.exchange}:{alert.symbol}</small></td><td>{money(alert.price)} / {alert.target == null ? "—" : money(alert.target)}</td><td>{alert.quote_status}{alert.quote_is_fresh ? " · fresh" : " · not live-fresh"}</td><td className="updated-cell">{new Date(alert.triggered_at).toLocaleString()}</td><td><span className={`email-status ${alert.delivery_status === "failed" ? "disabled" : alert.delivery_status === "sent" ? "delivered" : "queued"}`}><i />{alert.delivery_label}</span>{alert.last_error && <small className="worker-error">{alert.last_error}</small>}</td><td>{alert.attempts}/{alert.max_attempts}</td></tr>)}</tbody></table>{alerts.length === 0 && <div className="empty-state"><Bell size={22} /><b>No backend target events</b><span>Qualifying quotes create persisted events. Fixture events are separate and never message a destination.</span></div>}</div>}
-    </section>
-    <div className="info-note"><ShieldCheck size={15} /><span><b>Delivery safety:</b> the current notifier is a no-network dry run. No channel or destination is configured. Provider idempotency is needed to reduce duplicate sends after interrupted delivery; local deduplication alone cannot guarantee exactly-once delivery.</span></div>
-  </>;
-}
-
-function AlertsPage({ alerts, onAcknowledge, apiAlerts, apiStatus, apiError, workerStatus, onRefresh }: { alerts: PortfolioAlert[]; onAcknowledge: (id: string) => void; apiAlerts: ApiAlert[]; apiStatus: "loading" | "ready" | "error"; apiError: string; workerStatus: WorkerStatus | null; onRefresh: () => void }) {
-  const [type, setType] = useState("All alert types");
-  const [state, setState] = useState("All statuses");
-  const [query, setQuery] = useState("");
-  const shown = alerts.filter((a) => (type === "All alert types" || a.type === type) && (state === "All statuses" || a.status === state) && `${a.company} ${a.symbol}`.toLowerCase().includes(query.toLowerCase()));
-  return <>
-    <PageHeading eyebrow="MONITORING CENTER · BACKEND EVENTS" title="Price alerts" description="Persisted target events and transactional delivery. Live provider, calendar, and message channel remain unconfigured." action={<button className="button secondary" onClick={onRefresh} disabled={apiStatus === "loading"}><RefreshCw size={14} /> Refresh status</button>} />
-    <BackendAlertsPanel alerts={apiAlerts} status={apiStatus} error={apiError} worker={workerStatus} onRefresh={onRefresh} />
-    <div className="alert-summary-row"><div className="alert-summary"><span className="summary-dot red" /><div><b>{alerts.filter((a) => a.status === "New").length}</b><small>New alerts</small></div></div><div className="alert-summary"><span className="summary-dot amber" /><div><b>{alerts.filter((a) => a.type === "Approaching target").length}</b><small>Approaching targets</small></div></div><div className="alert-summary"><span className="summary-dot blue" /><div><b>{alerts.filter((a) => a.status === "Acknowledged").length}</b><small>Acknowledged</small></div></div><div className="alert-summary"><span className="summary-dot green" /><div><b>{alerts.filter((a) => a.status === "Resolved").length}</b><small>Resolved today</small></div></div></div>
-    <section className="card alerts-card"><div className="table-toolbar"><div className="table-toolbar-title"><div className="table-icon amber-icon"><Bell size={15} /></div><div><b>Illustrative demo notifications</b><small>{shown.length} mock alerts · never sent · acknowledge applies to this demo only</small></div></div><div className="table-filters"><label className="filter-search"><Search size={14} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search demo alerts..." /></label><select value={type} onChange={(e) => setType(e.target.value)}><option>All alert types</option>{["Buy target reached", "Sell target reached", "Approaching target", "Stale price", "Feed interruption"].map((x) => <option key={x}>{x}</option>)}</select><select value={state} onChange={(e) => setState(e.target.value)}><option>All statuses</option><option>New</option><option>Acknowledged</option><option>Resolved</option></select></div></div>
-      <div className="table-scroll"><table className="alerts-table"><thead><tr><th>Alert</th><th>Company</th><th>Current price</th><th>Target price</th><th>Time</th><th>Email status</th><th>Status</th><th /></tr></thead><tbody>{shown.map((a) => <tr key={a.id} className={a.status === "New" ? "alert-new-row" : ""}><td><span className={`alert-type-icon ${a.type.includes("Sell") ? "alert-red" : a.type.includes("Buy") ? "alert-green" : a.type.includes("Stale") || a.type.includes("Feed") ? "alert-amber" : "alert-blue"}`}><Zap size={13} /></span><b>{a.type}</b></td><td><b>{a.company}</b><small className="cell-sub">{a.symbol}</small></td><td>{money(a.price)}</td><td>{money(a.target)}</td><td className="updated-cell">{a.time}</td><td><span className={`email-status ${a.channel.toLowerCase()}`}><i />{a.channel}</span></td><td><span className={`alert-state state-${a.status.toLowerCase()}`}>{a.status}</span></td><td>{a.status === "New" && <button className="ack-button" onClick={() => onAcknowledge(a.id)}><CheckCheck size={13} /> Acknowledge</button>}</td></tr>)}</tbody></table>{shown.length === 0 && <div className="empty-state"><Bell size={22} /><b>No alerts match</b><span>Try another filter.</span></div>}</div>
-    </section>
-    <div className="info-note"><ShieldCheck size={15} /><span><b>Demo notification delivery</b> — Email status is simulated in this preview. No messages are sent.</span></div>
-  </>;
-}
-
-function TargetManagement({ companies, requestStatus, error, onRefresh, onImport, onEdit, search }: { companies: PortfolioCompany[]; requestStatus: "loading" | "ready" | "error"; error: string; onRefresh: () => void; onImport: () => void; onEdit: (company: PortfolioCompany) => void; search: string }) {
-  const list = companies.filter((company) => `${company.name} ${company.symbol}`.toLowerCase().includes(search.toLowerCase()));
-  const content = requestStatus === "loading"
-    ? <div className="empty-state" role="status"><RefreshCw size={22} /><b>Loading targets</b><span>Connecting to the backend API…</span></div>
-    : requestStatus === "error"
-      ? <div className="empty-state" role="alert"><CircleHelp size={22} /><b>Could not load targets</b><span>{error}</span><button className="button secondary" onClick={onRefresh}>Retry</button></div>
-      : list.length === 0
-        ? <div className="empty-state"><Target size={22} /><b>{companies.length ? "No companies found" : "No targets yet"}</b><span>{companies.length ? "Try another search." : "Import a workbook to add companies and targets."}</span></div>
-        : <table className="portfolio-table target-table"><thead><tr><th>Company</th><th>Symbol</th><th>Exchange</th><th>Imported CMP</th><th>Base target</th><th>Bull target</th><th>Version</th><th /></tr></thead><tbody>{list.map((company) => <tr key={`${company.exchange}:${company.symbol}`}><td><div className="company-name-cell"><div className="company-avatar">{company.symbol[0]}</div><span><b>{company.name}</b><small>{company.sector ?? "Sector not specified"}</small></span></div></td><td className="symbol-cell">{company.symbol}</td><td>{company.exchange}</td><td>{company.cmp == null ? "—" : money(company.cmp)}</td><td className="target-buy-price">{company.base_target == null ? "—" : money(company.base_target)}</td><td className="target-sell-price">{company.bull_target == null ? "—" : money(company.bull_target)}</td><td>{company.version}</td><td><button className="button tiny secondary" onClick={() => onEdit(company)}>Edit targets <ArrowRight size={12} /></button></td></tr>)}</tbody></table>;
-  return <>
-    <PageHeading eyebrow="TARGET MANAGEMENT · BACKEND API" title="Target management" description="Edit versioned base and bull targets. No market-price rules are configured." action={<button className="button secondary" onClick={onRefresh}><RefreshCw size={14} /> Refresh</button>} />
-    <section className="card portfolio-card target-table-card"><div className="table-toolbar"><div className="table-toolbar-title"><div className="table-icon"><Target size={15} /></div><div><b>Target prices</b><small>{requestStatus === "ready" ? `${list.length} of ${companies.length} companies` : "Data from backend API"}</small></div></div><button className="button primary" onClick={onImport}><Upload size={14} /> Import workbook</button></div>
-      <div className="table-scroll">{content}</div>
-    </section>
-  </>;
-}
-
-function MarketActivity({ companies, connection, setConnection, onCompany }: { companies: Company[]; connection: boolean; setConnection: (v: boolean) => void; onCompany: (c: Company) => void }) {
-  const latest = [...companies].sort((a, b) => Math.abs(b.change) - Math.abs(a.change)).slice(0, 10);
-  const near = [...companies].sort((a, b) => Math.min(Math.abs(a.price - a.buyTarget) / a.buyTarget, Math.abs(a.sellTarget - a.price) / a.sellTarget) - Math.min(Math.abs(b.price - b.buyTarget) / b.buyTarget, Math.abs(b.sellTarget - b.price) / b.sellTarget)).slice(0, 5);
-  const [filter, setFilter] = useState("All exchanges");
-  return <>
-    <PageHeading eyebrow="MARKET MONITOR" title="Market activity" description="Simulated price movement and exchange feed monitoring." action={<button className={`button ${connection ? "secondary" : "primary"}`} onClick={() => setConnection(!connection)}>{connection ? <><RefreshCw size={14} /> Simulate interruption</> : <><Activity size={14} /> Reconnect feed</>}</button>} />
-    <div className={`feed-banner ${connection ? "" : "feed-error"}`}><div className="feed-main-icon">{connection ? <Activity size={18} /> : <TrendingDown size={18} />}</div><div><b>{connection ? "Demo market feed connected" : "Market feed interrupted"}</b><small>{connection ? "NSE and BSE simulated prices are updating normally." : "No new prices received. Displayed prices may be stale."}</small></div><div className="feed-banner-right"><span className={`feed-status ${connection ? "feed-on" : "feed-off"}`}><i />{connection ? "CONNECTED" : "INTERRUPTED"}</span><small>Last received: {connection ? "09:30:04 IST" : "09:12:46 IST"}</small></div></div>
-    <div className="market-stat-grid"><div className="card market-stat"><small>NIFTY 50</small><b>25,176.40 <span className="positive">+0.72%</span></b><div className="stat-spark"><Sparkline /></div></div><div className="card market-stat"><small>SENSEX</small><b>82,634.18 <span className="positive">+0.64%</span></b><div className="stat-spark"><Sparkline /></div></div><div className="card market-stat"><small>NSE tracked</small><b>{companies.filter((c) => c.exchange === "NSE").length} <span className="market-stat-sub">companies</span></b><small className="market-uptime"><i className="status-dot" /> Feed healthy</small></div><div className="card market-stat"><small>BSE tracked</small><b>{companies.filter((c) => c.exchange === "BSE").length} <span className="market-stat-sub">companies</span></b><small className="market-uptime"><i className="status-dot" /> Feed healthy</small></div></div>
-    <div className="market-content-grid"><section className="card market-movers"><div className="section-head"><div><h2>Latest price changes</h2><p>Largest simulated moves today</p></div><select className="compact-select" value={filter} onChange={(e) => setFilter(e.target.value)}><option>All exchanges</option><option>NSE</option><option>BSE</option></select></div><div className="movers-list">{latest.filter((c) => filter === "All exchanges" || c.exchange === filter).map((c) => <button className="mover-row" key={c.id} onClick={() => onCompany(c)}><div className={`mover-arrow ${c.change >= 0 ? "mover-up" : "mover-down"}`}>{c.change >= 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}</div><div className="mover-company"><b>{c.symbol}</b><small>{c.name}</small></div><span className="mover-exchange">{c.exchange}</span><b className="mover-price">{money(c.price)}</b><span className={c.change >= 0 ? "positive" : "negative"}>{percent(c.change)}</span></button>)}</div></section>
-      <section className="card market-near"><div className="section-head"><div><h2>Approaching targets</h2><p>Nearest price targets</p></div><Target size={16} className="muted-icon" /></div>{near.map((c) => <button className="near-row" key={c.id} onClick={() => onCompany(c)}><div><b>{c.symbol}</b><small>{c.name}</small></div><div><TargetProximityBar company={c} /></div></button>)}</section></div>
-  </>;
-}
-function Sparkline() { return <svg viewBox="0 0 120 28" preserveAspectRatio="none" aria-label="Market trend"><path d="M0 22 C12 18 15 20 25 13 S42 18 50 11 S62 14 72 9 S85 16 95 8 S108 11 120 3" fill="none" stroke="#65c5a2" strokeWidth="2" /></svg>; }
-
-function Reports({ companies, alerts, notify, buyThreshold, sellThreshold }: { companies: Company[]; alerts: PortfolioAlert[]; notify: (message: string) => void; buyThreshold: number; sellThreshold: number }) {
-  const [exchange, setExchange] = useState("All exchanges");
-  const [period, setPeriod] = useState("Today");
-  const rows = companies.filter((c) => exchange === "All exchanges" || c.exchange === exchange);
-  const exportCsv = () => {
-    const header = ["Company", "Symbol", "Exchange", "Current price (INR)", "Daily change (%)", "Buy target", "Sell target", "Target status"];
-    const body = rows.map((c) => [c.name, c.symbol, c.exchange, c.price, c.change, c.buyTarget, c.sellTarget, getStatus(c, buyThreshold, sellThreshold)]);
-    const csv = [header, ...body].map((line) => line.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",")).join("\n");
-    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
-    const link = document.createElement("a"); link.href = url; link.download = "northstar-portfolio-report.csv"; link.click(); URL.revokeObjectURL(url);
-    notify("CSV report exported");
-  };
-  return <>
-    <PageHeading eyebrow="INSIGHTS & EXPORTS" title="Reports" description="Portfolio summaries built from illustrative market data." action={<button className="button primary" onClick={exportCsv}><Download size={14} /> Export CSV</button>} />
-    <section className="card report-filters"><div><small>REPORT PERIOD</small><select value={period} onChange={(e) => setPeriod(e.target.value)}><option>Today</option><option>This week</option><option>This month</option><option>Custom range</option></select></div><div><small>EXCHANGE</small><select value={exchange} onChange={(e) => setExchange(e.target.value)}><option>All exchanges</option><option>NSE</option><option>BSE</option></select></div><div><small>AS OF</small><b>15 October 2026</b></div><div className="report-filter-spacer" /><button className="button secondary" onClick={() => window.print()}><Download size={14} /> Print report</button></section>
-    <div className="report-summary-grid"><div className="card report-summary"><span className="report-summary-icon blue"><BriefcaseBusiness size={17} /></span><small>Companies monitored</small><b>{rows.length}</b><span>Across selected exchanges</span></div><div className="card report-summary"><span className="report-summary-icon green"><ArrowDownRight size={17} /></span><small>Buy target alerts</small><b>{alerts.filter((a) => a.type.includes("Buy")).length}</b><span>In selected period</span></div><div className="card report-summary"><span className="report-summary-icon red"><ArrowUpRight size={17} /></span><small>Sell target alerts</small><b>{alerts.filter((a) => a.type.includes("Sell")).length}</b><span>In selected period</span></div><div className="card report-summary"><span className="report-summary-icon amber"><Activity size={17} /></span><small>Market availability</small><b>99.2%</b><span>Simulated feed uptime</span></div></div>
-    <section className="card report-chart-card"><div className="section-head"><div><h2>Daily portfolio summary</h2><p>Performance overview · {period}</p></div><span className="report-date-tag">DEMO REPORT</span></div><div className="report-chart"><PriceChart portfolio={companies} period="1M" compact /></div></section>
-    <section className="card portfolio-card report-table-card"><div className="section-head report-table-heading"><div><h2>Companies closest to targets</h2><p>Ranked by proximity to nearest target</p></div></div><div className="table-scroll"><table className="portfolio-table"><thead><tr><th>Company</th><th>Symbol</th><th>Exchange</th><th>Market price</th><th>Buy target</th><th>Sell target</th><th>Nearest target</th><th>Status</th></tr></thead><tbody>{[...rows].sort((a, b) => Math.min(Math.abs(a.price - a.buyTarget) / a.buyTarget, Math.abs(a.sellTarget - a.price) / a.sellTarget) - Math.min(Math.abs(b.price - b.buyTarget) / b.buyTarget, Math.abs(b.sellTarget - b.price) / b.sellTarget)).slice(0, 8).map((c) => <tr key={c.id}><td><b>{c.name}</b></td><td className="symbol-cell">{c.symbol}</td><td>{c.exchange}</td><td>{money(c.price)}</td><td>{money(c.buyTarget)}</td><td>{money(c.sellTarget)}</td><td><TargetProximityBar company={c} /></td><td><StatusBadge company={c} buyThreshold={buyThreshold} sellThreshold={sellThreshold} /></td></tr>)}</tbody></table></div></section>
-    <div className="info-note"><ShieldCheck size={15} /><span>Reports are generated from mock data for demonstration. No information is sent to external services.</span></div>
-  </>;
-}
-
-interface ImportPreviewRow {
-  company: string;
-  symbol: string;
-  exchange: string;
-  buyTarget: number;
-  sellTarget: number;
-  currentBuy: number | null;
-  currentSell: number | null;
-  errors: string[];
-}
-
-export function LegacyDemoUploadPage({ companies, setCompanies, notify }: { companies: Company[]; setCompanies: React.Dispatch<React.SetStateAction<Company[]>>; notify: (message: string) => void }) {
-  const [file, setFile] = useState<File | null>(null);
-  const [validated, setValidated] = useState(false);
-  const [dragging, setDragging] = useState(false);
-  const [previewRows, setPreviewRows] = useState<ImportPreviewRow[]>([]);
-  const [uploadRecord, setUploadRecord] = useState<{ name: string; count: number } | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const chooseFile = (next: File | undefined) => {
-    if (!next) return;
-    if (!/\.(xlsx|csv)$/i.test(next.name)) { notify("Choose an .xlsx or .csv file"); return; }
-    if (next.size > 10 * 1024 * 1024) { notify("File exceeds the 10 MB limit"); return; }
-    setFile(next); setValidated(false); setPreviewRows([]);
-  };
-  const onDrop = (e: DragEvent<HTMLDivElement>) => { e.preventDefault(); setDragging(false); chooseFile(e.dataTransfer.files[0]); };
-  const sampleRows = companies.slice(0, 4);
-  const validate = async () => {
-    if (!file) { notify("Choose a .xlsx or .csv file first"); return; }
-    try {
-      const isCsv = /\.csv$/i.test(file.name);
-      const values: unknown[][] = isCsv
-        ? parseCsv(await file.text())
-        : [["Company", "Symbol", "Exchange", "Buy Target", "Sell Target"], ...companies.slice(0, 4).map((company, index) => [company.name, company.symbol, company.exchange, company.buyTarget + (index + 1) * 20, company.sellTarget + (index + 1) * 25])];
-      if (values.length < 2) { notify("The selected file has no target rows"); return; }
-      const headers = (values[0] ?? []).map((value) => String(value).trim().toLowerCase().replace(/[_\s-]+/g, ""));
-      const column = (...names: string[]) => headers.findIndex((header) => names.includes(header));
-      const symbolCol = column("symbol", "stocksymbol", "ticker");
-      const exchangeCol = column("exchange");
-      const buyCol = column("buytarget", "targetbuyprice", "buyprice");
-      const sellCol = column("selltarget", "targetsellprice", "sellprice");
-      const companyCol = column("company", "companyname", "name");
-      if ([symbolCol, exchangeCol, buyCol, sellCol].some((index) => index < 0)) {
-        notify("Required columns: Symbol, Exchange, Buy Target and Sell Target");
-        return;
-      }
-      const data = values.slice(1).filter((row) => row.some((cell) => String(cell).trim() !== ""));
-      if (data.length === 0) { notify("The selected file has no target rows"); return; }
-      const seen = new Set<string>();
-      const parsed = data.map((row): ImportPreviewRow => {
-        const symbol = String(row[symbolCol] ?? "").trim().toUpperCase();
-        const exchange = String(row[exchangeCol] ?? "").trim().toUpperCase();
-        const buyTarget = Number(row[buyCol]);
-        const sellTarget = Number(row[sellCol]);
-        const existing = companies.find((company) => company.symbol.toUpperCase() === symbol);
-        const errors: string[] = [];
-        if (!symbol) errors.push("Missing symbol");
-        if (symbol && seen.has(symbol)) errors.push("Duplicate symbol");
-        if (symbol) seen.add(symbol);
-        if (exchange !== "NSE" && exchange !== "BSE") errors.push("Unsupported exchange");
-        if (!Number.isFinite(buyTarget) || buyTarget <= 0) errors.push("Invalid buy price");
-        if (!Number.isFinite(sellTarget) || sellTarget <= 0 || sellTarget <= buyTarget) errors.push("Invalid sell price");
-        if (symbol && !existing) errors.push("Symbol is not in the tracked portfolio");
-        return {
-          company: String((companyCol >= 0 ? row[companyCol] : existing?.name) ?? "").trim() || existing?.name || "—",
-          symbol, exchange, buyTarget, sellTarget,
-          currentBuy: existing?.buyTarget ?? null, currentSell: existing?.sellTarget ?? null, errors,
-        };
+  const filtered = useMemo(() => {
+    return companies
+      .filter((c) => {
+        const term = search.toLowerCase();
+        const matchesSearch =
+          !term || `${c.name} ${c.symbol}`.toLowerCase().includes(term);
+        const matchesExchange =
+          exchange === "All exchanges" || c.exchange === exchange;
+        const isStale =
+          c.latest_quote != null &&
+          !c.latest_quote.is_fresh &&
+          !c.latest_quote.is_simulated;
+        const matchesAlert =
+          alertFilter === "All statuses" ||
+          (alertFilter === "Triggered" &&
+            (c.alert_status === "base_triggered" ||
+              c.alert_status === "bull_triggered" ||
+              c.alert_status === "both_triggered")) ||
+          (alertFilter === "Base Triggered" &&
+            (c.alert_status === "base_triggered" ||
+              c.alert_status === "both_triggered")) ||
+          (alertFilter === "Bull Triggered" &&
+            (c.alert_status === "bull_triggered" ||
+              c.alert_status === "both_triggered")) ||
+          (alertFilter === "Pending Config" &&
+            c.alert_status === "pending_configuration") ||
+          (alertFilter === "Stale Quote" && isStale) ||
+          (alertFilter === "Monitoring" && c.alert_status === "monitoring");
+        return matchesSearch && matchesExchange && matchesAlert;
+      })
+      .sort((a, b) => {
+        let result = 0;
+        if (sort === "name") {
+          result = a.name.localeCompare(b.name);
+        } else if (sort === "price") {
+          result = (a.latest_quote?.price ?? 0) - (b.latest_quote?.price ?? 0);
+        } else if (sort === "base") {
+          result = (a.base_target ?? 0) - (b.base_target ?? 0);
+        } else if (sort === "bull") {
+          result = (a.bull_target ?? 0) - (b.bull_target ?? 0);
+        } else {
+          result = (a.nearest_target_pct ?? 9999) - (b.nearest_target_pct ?? 9999);
+        }
+        return ascending ? result : -result;
       });
-      setPreviewRows(parsed);
-      setValidated(true);
-      const errorCount = parsed.reduce((total, row) => total + row.errors.length, 0);
-      notify(errorCount ? `Validation found ${errorCount} issue${errorCount === 1 ? "" : "s"}` : `Validation complete · ${parsed.length} rows ready${isCsv ? "" : " (simulated XLSX preview)"}`);
-    } catch {
-      notify("Could not read this file. Check that it is a valid .xlsx or .csv file.");
+  }, [companies, search, exchange, alertFilter, sort, ascending]);
+
+  const chooseSort = (key: string) => {
+    setAscending(sort === key ? !ascending : true);
+    setSort(key);
+  };
+
+  return (
+    <>
+      <PageHeading
+        eyebrow="MAIN MONITORING TABLE · LIVE NSE & BSE FEED"
+        title="Portfolio Price Monitoring"
+        description={`${companies.length} monitored companies · Click any company row for detailed target configuration, price history, and Excel cell lineage.`}
+        action={
+          <div className="heading-actions">
+            <button
+              className="button secondary"
+              onClick={() => void onPollNow()}
+              disabled={isPollingNow}
+            >
+              <Activity size={14} /> {isPollingNow ? "Polling Live Feed…" : "Poll Live Quotes Now"}
+            </button>
+            <button
+              className="button primary"
+              onClick={onRefresh}
+              disabled={requestStatus === "loading"}
+            >
+              <RefreshCw size={14} /> Refresh Table
+            </button>
+          </div>
+        }
+      />
+
+      <section className="card portfolio-card">
+        <div className="table-toolbar">
+          <div className="table-toolbar-title">
+            <div className="table-icon">
+              <BriefcaseBusiness size={15} />
+            </div>
+            <div>
+              <b>Monitored Companies</b>
+              <small>
+                {requestStatus === "ready"
+                  ? `${filtered.length} of ${companies.length} companies · Sorted by ${sort}`
+                  : "Loading from backend"}
+              </small>
+            </div>
+          </div>
+          <div className="table-filters">
+            <label className="filter-search">
+              <Search size={14} />
+              <input
+                value={search}
+                onChange={(e) => onSearchChange(e.target.value)}
+                placeholder="Search company or symbol..."
+              />
+            </label>
+            <select
+              aria-label="Exchange filter"
+              value={exchange}
+              onChange={(e) => setExchange(e.target.value)}
+            >
+              <option>All exchanges</option>
+              <option>NSE</option>
+              <option>BSE</option>
+            </select>
+            <select
+              aria-label="Alert status filter"
+              value={alertFilter}
+              onChange={(e) => setAlertFilter(e.target.value)}
+            >
+              <option>All statuses</option>
+              <option>Triggered</option>
+              <option>Base Triggered</option>
+              <option>Bull Triggered</option>
+              <option>Monitoring</option>
+              <option>Pending Config</option>
+              <option>Stale Quote</option>
+            </select>
+            <select
+              aria-label="Sort by"
+              value={sort}
+              onChange={(e) => setSort(e.target.value)}
+            >
+              <option value="nearest">Sort: Nearest Target</option>
+              <option value="name">Sort: Company Name</option>
+              <option value="price">Sort: Latest Price</option>
+              <option value="base">Sort: Base Target</option>
+              <option value="bull">Sort: Bull Target</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="table-scroll">
+          {requestStatus === "loading" ? (
+            <div className="empty-state" role="status">
+              <RefreshCw size={22} />
+              <b>Loading portfolio</b>
+              <span>Connecting to the backend API…</span>
+            </div>
+          ) : requestStatus === "error" ? (
+            <div className="empty-state" role="alert">
+              <CircleHelp size={22} />
+              <b>Could not load portfolio</b>
+              <span>{error}</span>
+              <button className="button secondary" onClick={onRefresh}>
+                Retry
+              </button>
+            </div>
+          ) : (
+            <MonitoringTable
+              companies={filtered}
+              onSelectCompany={onSelectCompany}
+              onSort={chooseSort}
+            />
+          )}
+        </div>
+
+        <div className="table-footer">
+          <span>
+            Showing <b>{filtered.length}</b> of <b>{companies.length}</b> companies · Saved Excel CMP is displayed for reference only and never treated as live market price.
+          </span>
+        </div>
+      </section>
+    </>
+  );
+}
+
+function AlertsPage({
+  apiAlerts,
+  apiStatus,
+  apiError,
+  workerStatus,
+  onRefresh,
+  onAction,
+}: {
+  apiAlerts: ApiAlert[];
+  apiStatus: "loading" | "ready" | "error";
+  apiError: string;
+  workerStatus: WorkerStatus | null;
+  onRefresh: () => void;
+  onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
+}) {
+  const [targetFilter, setTargetFilter] = useState("All targets");
+  const [lifecycleFilter, setLifecycleFilter] = useState("All states");
+  const [query, setQuery] = useState("");
+
+  const filtered = apiAlerts.filter((a) => {
+    const matchesTarget =
+      targetFilter === "All targets" ||
+      (targetFilter === "Base" && a.target_kind === "base") ||
+      (targetFilter === "Bull" && a.target_kind === "bull");
+    const st = a.lifecycle_status ?? "triggered";
+    const matchesLifecycle =
+      lifecycleFilter === "All states" || st === lifecycleFilter.toLowerCase();
+    const matchesQuery =
+      !query ||
+      `${a.company} ${a.symbol}`.toLowerCase().includes(query.toLowerCase());
+    return matchesTarget && matchesLifecycle && matchesQuery;
+  });
+
+  return (
+    <>
+      <PageHeading
+        eyebrow="ALERT ENGINE & NOTIFICATION OUTBOX"
+        title="Price Target Alerts"
+        description="Triggered Base and Bull target events with exact trigger prices, directions, delivery tracking, and re-arm controls."
+        action={
+          <button
+            className="button secondary"
+            onClick={onRefresh}
+            disabled={apiStatus === "loading"}
+          >
+            <RefreshCw size={14} /> Refresh Alerts
+          </button>
+        }
+      />
+
+      <div className="alert-summary-row">
+        <div className="alert-summary">
+          <span className="summary-dot red" />
+          <div>
+            <b>
+              {
+                apiAlerts.filter(
+                  (a) => (a.lifecycle_status ?? "triggered") === "triggered",
+                ).length
+              }
+            </b>
+            <small>Active Triggered</small>
+          </div>
+        </div>
+        <div className="alert-summary">
+          <span className="summary-dot blue" />
+          <div>
+            <b>
+              {
+                apiAlerts.filter((a) => a.lifecycle_status === "acknowledged")
+                  .length
+              }
+            </b>
+            <small>Acknowledged</small>
+          </div>
+        </div>
+        <div className="alert-summary">
+          <span className="summary-dot green" />
+          <div>
+            <b>
+              {apiAlerts.filter((a) => a.lifecycle_status === "resolved").length}
+            </b>
+            <small>Resolved / Reset</small>
+          </div>
+        </div>
+        <div className="alert-summary">
+          <span className="summary-dot amber" />
+          <div>
+            <b>{apiAlerts.filter((a) => a.delivery_status === "sent").length}</b>
+            <small>Notifications Delivered</small>
+          </div>
+        </div>
+      </div>
+
+      <section className="card alerts-card api-alerts-card">
+        <div className="table-toolbar">
+          <div className="table-toolbar-title">
+            <div className="table-icon amber-icon">
+              <Bell size={15} />
+            </div>
+            <div>
+              <b>Persisted Target Alert Events</b>
+              <small>
+                Worker: {workerStatus?.state ?? "ready"} · Notification mode:{" "}
+                {workerStatus?.notification_mode ?? "live"}
+              </small>
+            </div>
+          </div>
+          <div className="table-filters">
+            <label className="filter-search">
+              <Search size={14} />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search company or symbol..."
+              />
+            </label>
+            <select
+              value={targetFilter}
+              onChange={(e) => setTargetFilter(e.target.value)}
+            >
+              <option>All targets</option>
+              <option>Base</option>
+              <option>Bull</option>
+            </select>
+            <select
+              value={lifecycleFilter}
+              onChange={(e) => setLifecycleFilter(e.target.value)}
+            >
+              <option>All states</option>
+              <option>Triggered</option>
+              <option>Acknowledged</option>
+              <option>Resolved</option>
+            </select>
+          </div>
+        </div>
+
+        {apiStatus === "loading" ? (
+          <div className="empty-state" role="status">
+            <RefreshCw size={20} />
+            <b>Loading persisted alerts…</b>
+          </div>
+        ) : apiStatus === "error" ? (
+          <div className="empty-state" role="alert">
+            <CircleHelp size={20} />
+            <b>Backend events unavailable</b>
+            <span>{apiError}</span>
+          </div>
+        ) : (
+          <div className="table-scroll">
+            <table className="alerts-table">
+              <thead>
+                <tr>
+                  <th>Alert Type</th>
+                  <th>Company</th>
+                  <th>Trigger Price / Target</th>
+                  <th>Direction</th>
+                  <th>Trigger Time</th>
+                  <th>Notification Delivery</th>
+                  <th>Lifecycle Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((alert) => {
+                  const lifecycle = alert.lifecycle_status ?? "triggered";
+                  return (
+                    <tr key={alert.id}>
+                      <td>
+                        <b>
+                          {alert.target_kind === "base"
+                            ? "Base Target Alert"
+                            : "Bull Target Alert"}
+                        </b>
+                        <small className="cell-sub">
+                          {alert.is_simulated ? "SIMULATED" : "LIVE MARKET"}
+                        </small>
+                      </td>
+                      <td>
+                        <b>{alert.company}</b>
+                        <small className="cell-sub">
+                          {alert.exchange}:{alert.symbol}
+                        </small>
+                      </td>
+                      <td>
+                        <b>{money(alert.price)}</b> /{" "}
+                        {alert.target == null ? "—" : money(alert.target)}
+                      </td>
+                      <td>
+                        <span className="direction-pill">
+                          {alert.price_direction ??
+                            (alert.comparison_direction === "below"
+                              ? "Downward (≤)"
+                              : "Upward (≥)")}
+                        </span>
+                      </td>
+                      <td className="updated-cell">
+                        {new Date(alert.triggered_at).toLocaleString("en-IN")}
+                      </td>
+                      <td>
+                        <span
+                          className={`email-status ${
+                            alert.delivery_status === "failed"
+                              ? "disabled"
+                              : alert.delivery_status === "sent"
+                                ? "delivered"
+                                : "queued"
+                          }`}
+                        >
+                          <i />
+                          {alert.delivery_label} ({alert.attempts}/{alert.max_attempts})
+                        </span>
+                        {alert.last_error && (
+                          <small className="worker-error">{alert.last_error}</small>
+                        )}
+                      </td>
+                      <td>
+                        <span className={`alert-state state-${lifecycle}`}>
+                          {lifecycle.toUpperCase()}
+                        </span>
+                      </td>
+                      <td>
+                        <div className="row-actions">
+                          {lifecycle === "triggered" && (
+                            <button
+                              className="button secondary small"
+                              onClick={() => void onAction(alert.id, "acknowledge")}
+                            >
+                              Acknowledge
+                            </button>
+                          )}
+                          {lifecycle !== "resolved" && (
+                            <button
+                              className="button secondary small"
+                              onClick={() => void onAction(alert.id, "resolve")}
+                            >
+                              Resolve
+                            </button>
+                          )}
+                          <button
+                            className="button secondary small"
+                            title="Reset & re-arm target alert state"
+                            onClick={() => void onAction(alert.id, "reset")}
+                          >
+                            Reset & Re-arm
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            {filtered.length === 0 && (
+              <div className="empty-state">
+                <Bell size={22} />
+                <b>No alerts match your filters</b>
+                <span>Triggered Base and Bull alerts will appear here automatically.</span>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+    </>
+  );
+}
+
+function TargetManagement({
+  companies,
+  requestStatus,
+  error,
+  onRefresh,
+  onImport,
+  onEdit,
+  onSelectCompany,
+  search,
+}: {
+  companies: PortfolioCompany[];
+  requestStatus: "loading" | "ready" | "error";
+  error: string;
+  onRefresh: () => void;
+  onImport: () => void;
+  onEdit: (company: PortfolioCompany) => void;
+  onSelectCompany: (company: PortfolioCompany) => void;
+  search: string;
+}) {
+  const list = companies.filter((company) =>
+    `${company.name} ${company.symbol}`.toLowerCase().includes(search.toLowerCase()),
+  );
+  return (
+    <>
+      <PageHeading
+        eyebrow="CONFIGURABLE TARGET DIRECTIONS & RE-ARM POLICIES"
+        title="Target Management"
+        description="Configure Base and Bull target prices, comparison directions (above/below/pending), trigger conditions, and re-trigger policies."
+        action={
+          <div className="heading-actions">
+            <button className="button secondary" onClick={onRefresh}>
+              <RefreshCw size={14} /> Refresh
+            </button>
+            <button className="button primary" onClick={onImport}>
+              <Upload size={14} /> Import Excel Workbook
+            </button>
+          </div>
+        }
+      />
+
+      <section className="card portfolio-card target-table-card">
+        <div className="table-scroll">
+          {requestStatus === "loading" ? (
+            <div className="empty-state">
+              <RefreshCw size={22} />
+              <b>Loading targets…</b>
+            </div>
+          ) : requestStatus === "error" ? (
+            <div className="empty-state">
+              <CircleHelp size={22} />
+              <b>Could not load targets</b>
+              <span>{error}</span>
+            </div>
+          ) : (
+            <table className="portfolio-table target-table">
+              <thead>
+                <tr>
+                  <th>Company</th>
+                  <th>Exchange</th>
+                  <th>Saved CMP (Ref)</th>
+                  <th>Latest Live Price</th>
+                  <th>Base Target & Rule</th>
+                  <th>Bull Target & Rule</th>
+                  <th>Re-trigger Policy</th>
+                  <th>Version</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {list.map((company) => (
+                  <tr key={`${company.exchange}:${company.symbol}`}>
+                    <td
+                      style={{ cursor: "pointer" }}
+                      onClick={() => onSelectCompany(company)}
+                    >
+                      <div className="company-name-cell">
+                        <div className="company-avatar">{company.symbol[0]}</div>
+                        <span>
+                          <b>{company.name}</b>
+                          <small>{company.symbol}</small>
+                        </span>
+                      </div>
+                    </td>
+                    <td>{company.exchange}</td>
+                    <td>{company.cmp == null ? "—" : money(company.cmp)}</td>
+                    <td>
+                      {company.latest_quote
+                        ? money(company.latest_quote.price)
+                        : "No quote"}
+                    </td>
+                    <td>
+                      <b>
+                        {company.base_target == null
+                          ? "Not set"
+                          : money(company.base_target)}
+                      </b>
+                      <small className="cell-sub">
+                        Direction: {company.base_direction ?? "below"} ·{" "}
+                        {company.base_trigger_mode ?? "at_or_beyond"}
+                      </small>
+                    </td>
+                    <td>
+                      <b>
+                        {company.bull_target == null
+                          ? "Not set"
+                          : money(company.bull_target)}
+                      </b>
+                      <small className="cell-sub">
+                        Direction: {company.bull_direction ?? "above"} ·{" "}
+                        {company.bull_trigger_mode ?? "at_or_beyond"}
+                      </small>
+                    </td>
+                    <td>
+                      <span className="direction-pill">
+                        {company.rearm_policy ?? "once_per_revision"}
+                      </span>
+                    </td>
+                    <td>v{company.version}</td>
+                    <td>
+                      <button
+                        className="button tiny secondary"
+                        onClick={() => onEdit(company)}
+                      >
+                        Configure <ArrowRight size={12} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </section>
+    </>
+  );
+}
+
+function MarketActivityPage({
+  companies,
+  workerStatus,
+  onPollNow,
+  isPollingNow,
+  onSelectCompany,
+}: {
+  companies: PortfolioCompany[];
+  workerStatus: WorkerStatus | null;
+  onPollNow: () => Promise<void>;
+  isPollingNow: boolean;
+  onSelectCompany: (c: PortfolioCompany) => void;
+}) {
+  const staleList = companies.filter(
+    (c) =>
+      c.latest_quote != null &&
+      !c.latest_quote.is_fresh &&
+      !c.latest_quote.is_simulated,
+  );
+  const missingQuoteList = companies.filter((c) => c.latest_quote == null);
+
+  return (
+    <>
+      <PageHeading
+        eyebrow="INDEPENDENT BACKGROUND MONITORING SERVICE"
+        title="Market Feed Health & Reliability"
+        description="Real-time connection telemetry, last quote timestamps, stale-price detection, and NSE/BSE polling status."
+        action={
+          <button
+            className="button primary"
+            onClick={() => void onPollNow()}
+            disabled={isPollingNow}
+          >
+            <RefreshCw size={14} />{" "}
+            {isPollingNow ? "Polling Market Feed…" : "Poll Live Quotes Now"}
+          </button>
+        }
+      />
+
+      <div className="market-stat-grid">
+        <div className="card market-stat">
+          <small>Feed Provider</small>
+          <b>{workerStatus?.provider ?? "yfinance"}</b>
+          <small className="market-uptime">
+            <i className="status-dot" /> Exchange Calendar:{" "}
+            {workerStatus?.exchange_calendar ?? "NSE/BSE IST"}
+          </small>
+        </div>
+        <div className="card market-stat">
+          <small>WebSocket / Polling Mode</small>
+          <b>{workerStatus?.websocket_status ?? "Polling Fallback"}</b>
+          <small className="market-uptime">
+            Last poll:{" "}
+            {workerStatus?.last_poll_at
+              ? new Date(workerStatus.last_poll_at).toLocaleTimeString("en-IN")
+              : "On-demand ready"}
+          </small>
+        </div>
+        <div className="card market-stat">
+          <small>NSE Symbols Monitored</small>
+          <b>
+            {companies.filter((c) => c.exchange === "NSE").length}{" "}
+            <span className="market-stat-sub">companies</span>
+          </b>
+          <small className="market-uptime">
+            {
+              companies.filter(
+                (c) => c.exchange === "NSE" && c.latest_quote?.is_fresh,
+              ).length
+            }{" "}
+            fresh quotes
+          </small>
+        </div>
+        <div className="card market-stat">
+          <small>BSE Symbols Monitored</small>
+          <b>
+            {companies.filter((c) => c.exchange === "BSE").length}{" "}
+            <span className="market-stat-sub">companies</span>
+          </b>
+          <small className="market-uptime">
+            {staleList.length} stale · {workerStatus?.last_poll_failed ?? 0} failed
+          </small>
+        </div>
+      </div>
+
+      <div className="market-content-grid">
+        <section className="card market-movers">
+          <div className="section-head">
+            <div>
+              <h2>Stale or Missing Quote Watchlist</h2>
+              <p>Symbols requiring fresh quote verification</p>
+            </div>
+          </div>
+          {staleList.length === 0 && missingQuoteList.length === 0 ? (
+            <p className="empty-copy">
+              All monitored symbols have fresh validated market quotes.
+            </p>
+          ) : (
+            <div className="movers-list">
+              {[...staleList, ...missingQuoteList].slice(0, 15).map((c) => (
+                <button
+                  className="mover-row"
+                  key={`${c.exchange}:${c.symbol}`}
+                  onClick={() => onSelectCompany(c)}
+                >
+                  <div className="mover-company">
+                    <b>
+                      {c.symbol} ({c.exchange})
+                    </b>
+                    <small>{c.name}</small>
+                  </div>
+                  <span className="status-badge badge-sell">
+                    <i />
+                    {c.latest_quote ? "STALE" : "NO QUOTE"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="card market-near">
+          <div className="section-head">
+            <div>
+              <h2>Closest to Base or Bull Target</h2>
+              <p>Ranked by percentage distance to nearest configured target</p>
+            </div>
+            <Target size={16} className="muted-icon" />
+          </div>
+          {[...companies]
+            .filter((c) => c.nearest_target_pct != null)
+            .sort((a, b) => (a.nearest_target_pct ?? 999) - (b.nearest_target_pct ?? 999))
+            .slice(0, 10)
+            .map((c) => (
+              <button
+                className="near-row"
+                key={`${c.exchange}:${c.symbol}`}
+                onClick={() => onSelectCompany(c)}
+              >
+                <div>
+                  <b>
+                    {c.symbol} ({c.exchange})
+                  </b>
+                  <small>{c.name}</small>
+                </div>
+                <div>
+                  <b>{c.nearest_target_pct?.toFixed(2)}% away</b>
+                </div>
+              </button>
+            ))}
+        </section>
+      </div>
+    </>
+  );
+}
+
+function ReportsPage({
+  companies,
+  alerts,
+  notify,
+  onSelectCompany,
+}: {
+  companies: PortfolioCompany[];
+  alerts: ApiAlert[];
+  notify: (msg: string) => void;
+  onSelectCompany: (c: PortfolioCompany) => void;
+}) {
+  const [exchange, setExchange] = useState("All exchanges");
+  const rows = companies.filter(
+    (c) => exchange === "All exchanges" || c.exchange === exchange,
+  );
+
+  const exportCsv = () => {
+    const header = [
+      "Company",
+      "Symbol",
+      "Exchange",
+      "Saved CMP (Ref)",
+      "Latest Live Price",
+      "Base Target",
+      "Base Direction",
+      "Distance to Base (%)",
+      "Bull Target",
+      "Bull Direction",
+      "Distance to Bull (%)",
+      "Alert Status",
+      "Last Quote Time",
+    ];
+    const body = rows.map((c) => [
+      c.name,
+      c.symbol,
+      c.exchange,
+      c.cmp ?? "",
+      c.latest_quote?.price ?? "",
+      c.base_target ?? "",
+      c.base_direction ?? "below",
+      c.distance_to_base_pct ?? "",
+      c.bull_target ?? "",
+      c.bull_direction ?? "above",
+      c.distance_to_bull_pct ?? "",
+      c.alert_status ?? "monitoring",
+      c.latest_quote?.quoted_at ?? "",
+    ]);
+    const csv = [header, ...body]
+      .map((line) =>
+        line.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(","),
+      )
+      .join("\n");
+    const url = URL.createObjectURL(
+      new Blob([csv], { type: "text/csv;charset=utf-8" }),
+    );
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "northstar-monitoring-report.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+    notify("Live monitoring CSV report exported");
+  };
+
+  return (
+    <>
+      <PageHeading
+        eyebrow="PORTFOLIO MONITORING EXPORTS"
+        title="Monitoring Reports"
+        description="Export live price distances, target configurations, and triggered alert summaries."
+        action={
+          <button className="button primary" onClick={exportCsv}>
+            <Download size={14} /> Export CSV Report
+          </button>
+        }
+      />
+
+      <div className="report-summary-grid">
+        <div className="card report-summary">
+          <small>Monitored Companies</small>
+          <b>{rows.length}</b>
+          <span>NSE & BSE</span>
+        </div>
+        <div className="card report-summary">
+          <small>Base Target Alerts</small>
+          <b>{alerts.filter((a) => a.target_kind === "base").length}</b>
+          <span>Persisted events</span>
+        </div>
+        <div className="card report-summary">
+          <small>Bull Target Alerts</small>
+          <b>{alerts.filter((a) => a.target_kind === "bull").length}</b>
+          <span>Persisted events</span>
+        </div>
+        <div className="card report-summary">
+          <small>Filter Exchange</small>
+          <select
+            value={exchange}
+            onChange={(e) => setExchange(e.target.value)}
+            style={{ marginTop: 6 }}
+          >
+            <option>All exchanges</option>
+            <option>NSE</option>
+            <option>BSE</option>
+          </select>
+        </div>
+      </div>
+
+      <section className="card portfolio-card report-table-card">
+        <div className="table-scroll">
+          <MonitoringTable companies={rows} onSelectCompany={onSelectCompany} />
+        </div>
+      </section>
+    </>
+  );
+}
+
+function SettingsPage({
+  dark,
+  setDark,
+  compactTables,
+  setCompactTables,
+  workerStatus,
+  notify,
+}: {
+  dark: boolean;
+  setDark: (v: boolean) => void;
+  compactTables: boolean;
+  setCompactTables: (v: boolean) => void;
+  workerStatus: WorkerStatus | null;
+  notify: (message: string) => void;
+}) {
+  const [prefs, setPrefs] = useState<NotificationPreference>({
+    dashboard_enabled: true,
+    email_enabled: false,
+    email_recipients: "alerts@plutuswealth.com",
+    notify_on_base: true,
+    notify_on_bull: true,
+    notify_on_stale: true,
+    updated_at: null,
+  });
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void fetchNotificationPreferences()
+      .then((data) => {
+        const recipientsStr = Array.isArray(data.email_recipients)
+          ? data.email_recipients.join(", ")
+          : String(data.email_recipients || "");
+        setPrefs({ ...data, email_recipients: recipientsStr });
+      })
+      .catch(() => null);
+  }, []);
+
+  const toggle = (value: boolean, onChange: (v: boolean) => void) => (
+    <button
+      className={`switch ${value ? "switch-on" : ""}`}
+      role="switch"
+      aria-checked={value}
+      onClick={() => onChange(!value)}
+    >
+      <i />
+    </button>
+  );
+
+  const row = (title: string, detail: string, control: ReactNode) => (
+    <div className="setting-row">
+      <div>
+        <b>{title}</b>
+        <small>{detail}</small>
+      </div>
+      {control}
+    </div>
+  );
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const updated = await updateNotificationPreferences(prefs);
+      const recipientsStr = Array.isArray(updated.email_recipients)
+        ? updated.email_recipients.join(", ")
+        : String(updated.email_recipients || "");
+      setPrefs({ ...updated, email_recipients: recipientsStr });
+      notify("Notification preferences saved to database");
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "Could not save preferences");
+    } finally {
+      setSaving(false);
     }
   };
-  const errorCount = previewRows.reduce((total, row) => total + row.errors.length, 0);
-  const confirm = () => {
-    if (!validated || errorCount > 0 || !file) return;
-    const validRows = previewRows;
-    setCompanies((current) => current.map((company) => {
-      const update = validRows.find((row) => row.symbol === company.symbol && row.errors.length === 0);
-      return update ? { ...company, buyTarget: update.buyTarget, sellTarget: update.sellTarget } : company;
-    }));
-    setUploadRecord({ name: file.name, count: validRows.length });
-    setFile(null); setValidated(false); setPreviewRows([]);
-    if (inputRef.current) inputRef.current.value = "";
-    notify("Demo import confirmed · changes apply in this session only");
-  };
-  const downloadTemplate = () => {
-    const csv = "Company,Symbol,Exchange,Buy Target,Sell Target\nReliance Industries,RELIANCE,NSE,2780,3180\nHDFC Bank,HDFCBANK,NSE,1575,1820\n";
-    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); const a = document.createElement("a"); a.href = url; a.download = "northstar-target-template.csv"; a.click(); URL.revokeObjectURL(url);
-  };
-  return <>
-    <PageHeading eyebrow="DATA MANAGEMENT" title="Upload targets" description="Import manager-provided target updates from an Excel or CSV file." action={<button className="button secondary" onClick={downloadTemplate}><Download size={14} /> Download template</button>} />
-    <div className="upload-layout"><div className="upload-main">
-      <section className="card upload-card"><div className="section-head"><div><h2>Upload a file</h2><p>Import a new target list into this demo workspace.</p></div><span className="local-only-tag">LOCAL DEMO</span></div>
-        <div className={`dropzone ${dragging ? "dropzone-active" : ""}`} onDragOver={(e) => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}><input ref={inputRef} type="file" accept=".xlsx,.csv" hidden onChange={(e: ChangeEvent<HTMLInputElement>) => chooseFile(e.target.files?.[0])} /><div className="upload-icon"><CloudDownload size={21} /></div><b>Drop your file here, or <button onClick={() => inputRef.current?.click()}>browse</button></b><small>Excel (.xlsx) or CSV · Maximum file size 10 MB</small></div>
-        {file && <div className="selected-file"><div className="file-icon"><FileSpreadsheet size={17} /></div><div><b>{file.name}</b><small>{(file.size / 1024).toFixed(1)} KB · {validated ? `${previewRows.length} rows checked` : "Ready to validate"}</small></div><span className={`file-state ${validated && errorCount === 0 ? "file-success" : ""}`}>{validated ? errorCount ? `${errorCount} issues` : <><Check size={12} /> Validated</> : "Selected"}</span><button className="icon-button" aria-label="Remove file" onClick={() => { setFile(null); setValidated(false); setPreviewRows([]); if (inputRef.current) inputRef.current.value = ""; }}><X size={15} /></button></div>}
-        <div className="upload-actions"><button className="button secondary" onClick={() => { setFile(null); setValidated(false); setPreviewRows([]); if (inputRef.current) inputRef.current.value = ""; }}>Cancel</button><button className="button primary" disabled={validated && errorCount > 0} onClick={validated ? confirm : validate}>{validated ? <><Check size={14} /> Confirm import</> : <><ShieldCheck size={14} /> Validate file</>}</button></div>
-      </section>
-      <section className="card import-preview"><div className="section-head"><div><h2>{validated ? "Import preview" : "Preview format"}</h2><p>{validated ? `${previewRows.length} rows · Compare existing and incoming targets.` : "A preview of the data columns we expect."}</p></div>{validated && <span className={errorCount ? "validation-errors" : "validation-ok"}>{errorCount ? `${errorCount} validation issues` : <><Check size={12} /> No validation errors</>}</span>}</div><div className="table-scroll"><table className="portfolio-table"><thead><tr><th>Company</th><th>Symbol</th><th>Exchange</th><th>Current buy target</th><th>New buy target</th><th>Current sell target</th><th>New sell target</th><th>Validation</th></tr></thead><tbody>{validated ? previewRows.map((row, i) => <tr key={`${row.symbol}-${i}`}><td><b>{row.company}</b></td><td className="symbol-cell">{row.symbol || "—"}</td><td>{row.exchange || "—"}</td><td>{row.currentBuy == null ? "—" : money(row.currentBuy)}</td><td className={row.errors.length ? "preview-error" : "preview-new"}>{Number.isFinite(row.buyTarget) && row.buyTarget > 0 ? money(row.buyTarget) : "Invalid"}</td><td>{row.currentSell == null ? "—" : money(row.currentSell)}</td><td className={row.errors.length ? "preview-error" : "preview-new"}>{Number.isFinite(row.sellTarget) && row.sellTarget > 0 ? money(row.sellTarget) : "Invalid"}</td><td className={row.errors.length ? "preview-error" : "validation-ok"}>{row.errors.length ? row.errors.join(", ") : "Valid"}</td></tr>) : sampleRows.map((c) => <tr key={c.id}><td><b>{c.name}</b></td><td className="symbol-cell">{c.symbol}</td><td>{c.exchange}</td><td>{money(c.buyTarget)}</td><td>—</td><td>{money(c.sellTarget)}</td><td>—</td><td><span className="muted-icon">Awaiting file</span></td></tr>)}</tbody></table>{validated && previewRows.length === 0 && <div className="empty-state"><FileSpreadsheet size={22} /><b>No target rows</b></div>}</div><div className="preview-note"><CircleHelp size={14} /> CSV contents are parsed in-browser. XLSX validation uses simulated sample rows in this demo. Confirming only updates this local session — no server or database is used.</div></section>
-    </div><aside className="upload-aside"><section className="card upload-checklist"><h3>Before you upload</h3><div className="checklist-item"><Check size={13} /><span>Include company symbols in a <b>Symbol</b> column</span></div><div className="checklist-item"><Check size={13} /><span>Use valid NSE or BSE exchanges</span></div><div className="checklist-item"><Check size={13} /><span>Target prices must be greater than zero</span></div><div className="checklist-item"><Check size={13} /><span>Remove duplicate symbol rows</span></div><button className="text-link" onClick={downloadTemplate}>Download sample template <ArrowRight size={13} /></button></section><section className="card upload-history"><div className="section-head"><div><h3>Upload history</h3><p>Recent demo activity</p></div><Clock3 size={15} className="muted-icon" /></div>{uploadRecord ? <div className="history-entry"><div className="file-icon"><FileSpreadsheet size={15} /></div><div><b>{uploadRecord.name}</b><small>{uploadRecord.count} rows · Just now · Srushti Kadam</small></div><span className="history-imported">Imported</span></div> : <div className="upload-empty"><FileSpreadsheet size={20} /><span>No uploads yet</span></div>}</section></aside></div>
-  </>;
+
+  return (
+    <>
+      <PageHeading
+        eyebrow="SYSTEM CONFIGURATION"
+        title="Notification & Display Preferences"
+        description="Configure dashboard and email alert delivery channels, recipients, and table density."
+      />
+      <div className="settings-layout">
+        <div className="settings-main">
+          <section className="card settings-card">
+            <div className="settings-section-title">
+              <div className="settings-section-icon amber">
+                <Bell size={16} />
+              </div>
+              <div>
+                <h2>Alert Notification Channels</h2>
+                <p>Persisted in the backend notification outbox with automatic retry backoff.</p>
+              </div>
+            </div>
+            {row(
+              "Dashboard notifications",
+              "Deliver instant alerts to the dashboard notification center.",
+              toggle(prefs.dashboard_enabled, (v) =>
+                setPrefs({ ...prefs, dashboard_enabled: v }),
+              ),
+            )}
+            {row(
+              "Email notifications",
+              "Send formatted price target alert emails via SMTP / spool.",
+              toggle(prefs.email_enabled, (v) =>
+                setPrefs({ ...prefs, email_enabled: v }),
+              ),
+            )}
+            {row(
+              "Approved Email Recipients",
+              "Comma-separated list of recipient email addresses.",
+              <input
+                className="inline-input"
+                style={{ minWidth: 260 }}
+                value={prefs.email_recipients}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, email_recipients: e.target.value })
+                }
+                placeholder="alerts@plutuswealth.com"
+              />,
+            )}
+            {row(
+              "Notify on Base Target",
+              "Queue alerts when a stock reaches its configured Base Target.",
+              toggle(prefs.notify_on_base, (v) =>
+                setPrefs({ ...prefs, notify_on_base: v }),
+              ),
+            )}
+            {row(
+              "Notify on Bull Target",
+              "Queue alerts when a stock reaches its configured Bull Target.",
+              toggle(prefs.notify_on_bull, (v) =>
+                setPrefs({ ...prefs, notify_on_bull: v }),
+              ),
+            )}
+            {row(
+              "Notify on Stale Quotes",
+              "Flag warnings when a monitored stock's quote becomes stale.",
+              toggle(prefs.notify_on_stale, (v) =>
+                setPrefs({ ...prefs, notify_on_stale: v }),
+              ),
+            )}
+          </section>
+
+          <section className="card settings-card">
+            <div className="settings-section-title">
+              <div className="settings-section-icon">
+                <Sun size={16} />
+              </div>
+              <div>
+                <h2>Appearance & Worker Telemetry</h2>
+                <p>Customize visual layout and inspect worker status.</p>
+              </div>
+            </div>
+            {row(
+              "Color theme",
+              "Choose Light or Dark appearance.",
+              <div className="theme-options">
+                <button
+                  className={!dark ? "theme-option selected" : "theme-option"}
+                  onClick={() => setDark(false)}
+                >
+                  <Sun size={14} /> Light
+                </button>
+                <button
+                  className={dark ? "theme-option selected" : "theme-option"}
+                  onClick={() => setDark(true)}
+                >
+                  <Moon size={14} /> Dark
+                </button>
+              </div>,
+            )}
+            {row(
+              "Compact data tables",
+              "Information-dense rows for monitoring 40+ companies.",
+              toggle(compactTables, setCompactTables),
+            )}
+            {row(
+              "Background Monitoring Service",
+              `Provider: ${workerStatus?.provider ?? "yfinance"} · Calendar: ${
+                workerStatus?.exchange_calendar ?? "nse_bse"
+              }`,
+              <span className="local-only-tag">
+                {workerStatus?.state?.toUpperCase() ?? "READY"}
+              </span>,
+            )}
+          </section>
+
+          <button
+            className="button primary settings-save"
+            onClick={() => void save()}
+            disabled={saving}
+          >
+            {saving ? "Saving…" : "Save Notification Preferences"}
+          </button>
+        </div>
+      </div>
+    </>
+  );
 }
 
-function SettingsPage({ dark, setDark, compactTables, setCompactTables, buyThreshold, sellThreshold, setBuyThreshold, setSellThreshold, notify }: { dark: boolean; setDark: (v: boolean) => void; compactTables: boolean; setCompactTables: (v: boolean) => void; buyThreshold: number; sellThreshold: number; setBuyThreshold: (v: number) => void; setSellThreshold: (v: number) => void; notify: (message: string) => void }) {
-  const [email, setEmail] = useState(true); const [approaching, setApproaching] = useState(true); const [ack, setAck] = useState(false);
-  const toggle = (value: boolean, setter: (v: boolean) => void) => <button className={`switch ${value ? "switch-on" : ""}`} role="switch" aria-checked={value} onClick={() => setter(!value)}><i /></button>;
-  const row = (title: string, detail: string, control: ReactNode) => <div className="setting-row"><div><b>{title}</b><small>{detail}</small></div>{control}</div>;
-  return <>
-    <PageHeading eyebrow="PREFERENCES" title="Settings" description="Configure your local dashboard and alert preferences." action={<span className="local-only-tag"><ShieldCheck size={12} /> LOCAL DEMO SETTINGS</span>} />
-    <div className="settings-layout"><div className="settings-main">
-      <section className="card settings-card"><div className="settings-section-title"><div className="settings-section-icon"><Sun size={16} /></div><div><h2>Appearance</h2><p>Personalize your dashboard experience.</p></div></div>
-        {row("Color theme", "Choose the dashboard appearance.", <div className="theme-options"><button className={!dark ? "theme-option selected" : "theme-option"} onClick={() => setDark(false)}><Sun size={14} /> Light</button><button className={dark ? "theme-option selected" : "theme-option"} onClick={() => setDark(true)}><Moon size={14} /> Dark</button></div>)}
-        {row("Compact data tables", "Show more rows with reduced spacing.", toggle(compactTables, setCompactTables))}
-      </section>
-      <section className="card settings-card"><div className="settings-section-title"><div className="settings-section-icon green"><Target size={16} /></div><div><h2>Target monitoring</h2><p>Set how close a price should be to trigger an alert.</p></div></div>
-        {row("Buy target proximity", "Update the buy-zone threshold across portfolio statuses.", <div className="number-input"><input type="number" min="0.5" max="20" step="0.5" value={buyThreshold} onChange={(e) => setBuyThreshold(Math.max(0.5, Math.min(20, Number(e.target.value))))} /><span>%</span></div>)}
-        {row("Sell target proximity", "Update the sell-zone threshold across portfolio statuses.", <div className="number-input"><input type="number" min="0.5" max="20" step="0.5" value={sellThreshold} onChange={(e) => setSellThreshold(Math.max(0.5, Math.min(20, Number(e.target.value))))} /><span>%</span></div>)}
-        {row("Alert on approach", "Notify when companies are nearing a target.", toggle(approaching, setApproaching))}
-      </section>
-      <section className="card settings-card"><div className="settings-section-title"><div className="settings-section-icon amber"><Bell size={16} /></div><div><h2>Notifications & market data</h2><p>Configure simulated delivery and feed preferences.</p></div></div>
-        {row("Email notifications", "Demo delivery status only. No email will be sent.", toggle(email, setEmail))}
-        {row("Acknowledge to resolve", "Require acknowledgement before closing an alert.", toggle(ack, setAck))}
-        {row("Price polling", "Managed by the separate backend worker; live provider and exchange calendar are not configured.", <span className="local-only-tag">WORKER OFF</span>)}
-      </section>
-      <button className="button primary settings-save" onClick={() => notify("Preferences saved in this demo session")}>Save preferences</button>
-    </div><aside className="settings-aside"><section className="card profile-card"><div className="profile-large">SK</div><div><b>Srushti Kadam</b><span>Portfolio Manager</span></div><div className="profile-meta"><span>WORKSPACE</span><b>Plutus Wealth Management</b><span>ROLE</span><b>Investment Manager</b></div><span className="role-tag"><ShieldCheck size={12} /> Manager access</span></section><section className="card local-settings-note"><div className="local-note-icon"><Globe2 size={16} /></div><b>Local demo preferences</b><p>Changes made here apply only in this browser session. No settings are sent to a server or saved to a database.</p><span>DEMO ENVIRONMENT</span></section></aside></div>
-  </>;
-}
-
-function NotificationDrawer({ alerts, onClose, onAcknowledge }: { alerts: PortfolioAlert[]; onClose: () => void; onAcknowledge: (id: string) => void }) {
+function NotificationDrawer({
+  alerts,
+  onClose,
+  onAction,
+}: {
+  alerts: ApiAlert[];
+  onClose: () => void;
+  onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
+}) {
   const [unreadOnly, setUnreadOnly] = useState(false);
-  const visibleAlerts = unreadOnly ? alerts.filter((a) => a.status === "New") : alerts;
-  return <><motion.button className="drawer-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} aria-label="Close notifications" /><motion.aside className="notification-drawer" initial={{ x: 420 }} animate={{ x: 0 }} exit={{ x: 420 }} transition={{ type: "spring", damping: 28, stiffness: 260 }}><div className="drawer-head"><div><h2>Notifications</h2><p>{alerts.filter((a) => a.status === "New").length} unread alerts</p></div><button className="icon-button" onClick={onClose} aria-label="Close drawer"><X size={18} /></button></div><div className="drawer-tabs"><button className={!unreadOnly ? "drawer-tab-active" : ""} onClick={() => setUnreadOnly(false)}>All alerts</button><button className={unreadOnly ? "drawer-tab-active" : ""} onClick={() => setUnreadOnly(true)}>Unread <span>{alerts.filter((a) => a.status === "New").length}</span></button><button className="mark-all" onClick={() => alerts.filter((a) => a.status === "New").forEach((a) => onAcknowledge(a.id))}><CheckCheck size={13} /> Mark all read</button></div><div className="drawer-content">{visibleAlerts.length ? visibleAlerts.map((a) => <div className={`drawer-alert ${a.status === "New" ? "drawer-alert-new" : ""}`} key={a.id}><div className={`drawer-alert-icon ${a.type.includes("Sell") ? "alert-red" : a.type.includes("Buy") ? "alert-green" : "alert-amber"}`}><Zap size={14} /></div><div className="drawer-alert-content"><div className="drawer-alert-title"><b>{a.type}</b>{a.status === "New" && <i />}</div><p><strong>{a.symbol}</strong> · {a.company}</p><div className="drawer-alert-meta"><span>{money(a.price)}</span><span>Target {money(a.target)}</span></div><div className="drawer-alert-time">{a.time}{a.status === "New" && <button onClick={() => onAcknowledge(a.id)}>Acknowledge</button>}</div></div></div>) : <div className="empty-state"><CheckCheck size={22} /><b>No unread alerts</b><span>You're all caught up.</span></div>}</div><div className="drawer-footer"><span><ShieldCheck size={13} /> Demo alerts · Email delivery simulated</span></div></motion.aside></>;
+  const unreadAlerts = alerts.filter(
+    (a) => (a.lifecycle_status ?? "triggered") === "triggered",
+  );
+  const visibleAlerts = unreadOnly ? unreadAlerts : alerts;
+
+  return (
+    <>
+      <motion.button
+        className="drawer-backdrop"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onClick={onClose}
+        aria-label="Close notifications"
+      />
+      <motion.aside
+        className="notification-drawer"
+        initial={{ x: 420 }}
+        animate={{ x: 0 }}
+        exit={{ x: 420 }}
+        transition={{ type: "spring", damping: 28, stiffness: 260 }}
+      >
+        <div className="drawer-head">
+          <div>
+            <h2>Target Alert Notifications</h2>
+            <p>{unreadAlerts.length} active triggered alerts</p>
+          </div>
+          <button
+            className="icon-button"
+            onClick={onClose}
+            aria-label="Close drawer"
+          >
+            <X size={18} />
+          </button>
+        </div>
+        <div className="drawer-tabs">
+          <button
+            className={!unreadOnly ? "drawer-tab-active" : ""}
+            onClick={() => setUnreadOnly(false)}
+          >
+            All ({alerts.length})
+          </button>
+          <button
+            className={unreadOnly ? "drawer-tab-active" : ""}
+            onClick={() => setUnreadOnly(true)}
+          >
+            Active <span>{unreadAlerts.length}</span>
+          </button>
+          <button
+            className="mark-all"
+            onClick={() =>
+              unreadAlerts.forEach((a) => void onAction(a.id, "acknowledge"))
+            }
+          >
+            <CheckCheck size={13} /> Acknowledge all
+          </button>
+        </div>
+        <div className="drawer-content">
+          {visibleAlerts.length ? (
+            visibleAlerts.map((a) => {
+              const isNew = (a.lifecycle_status ?? "triggered") === "triggered";
+              return (
+                <div
+                  className={`drawer-alert ${isNew ? "drawer-alert-new" : ""}`}
+                  key={a.id}
+                >
+                  <div
+                    className={`drawer-alert-icon ${
+                      a.target_kind === "bull" ? "alert-red" : "alert-green"
+                    }`}
+                  >
+                    <Zap size={14} />
+                  </div>
+                  <div className="drawer-alert-content">
+                    <div className="drawer-alert-title">
+                      <b>
+                        Price Target Alert – {a.symbol} ({a.target_kind.toUpperCase()})
+                      </b>
+                      {isNew && <i />}
+                    </div>
+                    <p>
+                      <strong>{a.company}</strong> ({a.exchange})
+                    </p>
+                    <div className="drawer-alert-meta">
+                      <span>Current: {money(a.price)}</span>
+                      <span>
+                        Target: {a.target == null ? "—" : money(a.target)}
+                      </span>
+                    </div>
+                    <div className="drawer-alert-time">
+                      {new Date(a.triggered_at).toLocaleString("en-IN")} ·{" "}
+                      {a.delivery_label}
+                      {isNew && (
+                        <button onClick={() => void onAction(a.id, "acknowledge")}>
+                          Acknowledge
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          ) : (
+            <div className="empty-state">
+              <CheckCheck size={22} />
+              <b>No active alerts</b>
+              <span>All target alerts have been reviewed.</span>
+            </div>
+          )}
+        </div>
+      </motion.aside>
+    </>
+  );
 }
 
-function DetailPanel({ company, alerts, buyThreshold, sellThreshold, onClose }: { company: Company; alerts: PortfolioAlert[]; buyThreshold: number; sellThreshold: number; onClose: () => void }) {
-  const [period, setPeriod] = useState("1M");
-  const ownAlerts = alerts.filter((a) => a.symbol === company.symbol);
-  const buyDistance = ((company.price - company.buyTarget) / company.buyTarget) * 100;
-  const sellDistance = ((company.sellTarget - company.price) / company.sellTarget) * 100;
-  return <><motion.button className="drawer-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} aria-label="Close stock detail" /><motion.aside className="detail-panel" initial={{ x: 560 }} animate={{ x: 0 }} exit={{ x: 560 }} transition={{ type: "spring", damping: 28, stiffness: 260 }}><div className="detail-top"><button className="back-link" onClick={onClose}><ArrowLeft size={15} /> Back to portfolio</button><button className="icon-button" onClick={onClose} aria-label="Close detail"><X size={18} /></button></div><div className="detail-company-head"><div className="detail-company-logo">{company.symbol.slice(0, 1)}</div><div><div className="detail-company-name">{company.name}</div><div className="detail-symbol">{company.symbol} <span>·</span> {company.exchange} <span>·</span> {company.sector}</div></div><StatusBadge company={company} buyThreshold={buyThreshold} sellThreshold={sellThreshold} /></div><div className="detail-price-block"><b>{money(company.price)}</b><span className={company.change >= 0 ? "positive" : "negative"}>{company.change >= 0 ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}{percent(company.change)}</span><small>Current market price · Demo data</small></div><div className="detail-target-grid"><div className="detail-target buy-target-detail"><span>BUY TARGET</span><b>{money(company.buyTarget)}</b><small>{Math.abs(buyDistance).toFixed(2)}% {buyDistance >= 0 ? "above" : "below"} target</small></div><div className="detail-target sell-target-detail"><span>SELL TARGET</span><b>{money(company.sellTarget)}</b><small>{Math.abs(sellDistance).toFixed(2)}% {sellDistance >= 0 ? "below" : "above"} target</small></div></div><section className="detail-section"><div className="section-head"><div><h2>Price history</h2><p>Simulated historical prices</p></div><div className="detail-range">{["1D", "1W", "1M", "3M", "1Y"].map((p) => <button className={period === p ? "range-active" : ""} key={p} onClick={() => setPeriod(p)}>{p}</button>)}</div></div><div className="detail-chart"><PriceChart company={company} period={period} compact targets /></div><div className="chart-legend"><span><i className="legend-blue" /> Market price</span><span><i className="legend-green" /> Buy target</span><span><i className="legend-red" /> Sell target</span></div></section><section className="detail-section detail-movements"><div className="section-head"><div><h2>Recent price movements</h2><p>Today · Simulated feed</p></div></div><div className="movement-grid"><div><small>OPEN</small><b>{money(company.price * (1 - company.change / 100))}</b></div><div><small>DAY HIGH</small><b>{money(company.price * 1.013)}</b></div><div><small>DAY LOW</small><b>{money(company.price * 0.987)}</b></div><div><small>VOLUME</small><b>{(2.4 + company.id / 10).toFixed(2)}L</b></div></div></section><section className="detail-section"><div className="section-head"><div><h2>Alert history</h2><p>Recent target events for {company.symbol}</p></div></div>{ownAlerts.length ? ownAlerts.map((a) => <div className="detail-alert" key={a.id}><span className={`alert-type-icon ${a.type.includes("Sell") ? "alert-red" : "alert-green"}`}><Zap size={12} /></span><div><b>{a.type}</b><small>{a.time} · {a.status}</small></div><span>{money(a.price)}</span></div>) : <div className="detail-empty">No alerts recorded for this company.</div>}</section><div className="detail-last-update"><Clock3 size={13} /> Last market update: today, {company.updated} IST <span>·</span> Demo data</div></motion.aside></>;
+function DetailPanel({
+  company,
+  onClose,
+  onEditTargets,
+  onAction,
+}: {
+  company: PortfolioCompany;
+  onClose: () => void;
+  onEditTargets: () => void;
+  onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
+}) {
+  const [details, setDetails] = useState<CompanyDetailsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    fetchCompanyDetails(company.exchange, company.symbol, controller.signal)
+      .then((res) => {
+        setDetails(res);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+    return () => controller.abort();
+  }, [company.exchange, company.symbol, company.version]);
+
+  const quote = company.latest_quote;
+  const chartSeries = useMemo(() => {
+    const hist = details?.price_history ?? [];
+    if (hist.length > 0) {
+      return [...hist]
+        .reverse()
+        .map((q) => ({
+          label: new Date(q.quoted_at).toLocaleTimeString("en-IN", {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+          price: q.price,
+        }));
+    }
+    if (quote) {
+      return [{ label: "Latest", price: quote.price }];
+    }
+    return [];
+  }, [details, quote]);
+
+  const cellRefs = (company.source_metadata?.cell_refs ?? {}) as Record<string, string>;
+
+  return (
+    <>
+      <motion.button
+        className="drawer-backdrop"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onClick={onClose}
+        aria-label="Close stock detail"
+      />
+      <motion.aside
+        className="detail-panel"
+        initial={{ x: 560 }}
+        animate={{ x: 0 }}
+        exit={{ x: 560 }}
+        transition={{ type: "spring", damping: 28, stiffness: 260 }}
+      >
+        <div className="detail-top">
+          <button className="back-link" onClick={onClose}>
+            <ArrowLeft size={15} /> Back to monitoring table
+          </button>
+          <div className="row-actions">
+            <button className="button secondary small" onClick={onEditTargets}>
+              Configure Targets
+            </button>
+            <button
+              className="icon-button"
+              onClick={onClose}
+              aria-label="Close detail"
+            >
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+
+        <div className="detail-company-head">
+          <div className="detail-company-logo">{company.symbol.slice(0, 2)}</div>
+          <div>
+            <div className="detail-company-name">{company.name}</div>
+            <div className="detail-symbol">
+              {company.symbol} <span>·</span> {company.exchange} <span>·</span>{" "}
+              {company.sector ?? "Equity"} <span>·</span> v{company.version}
+            </div>
+          </div>
+          {alertStatusBadge(company)}
+        </div>
+
+        <div className="detail-price-block">
+          <b>{quote ? money(quote.price) : "No Live Quote"}</b>
+          <small>
+            {quote
+              ? `Provider: ${quote.provider} · ${
+                  quote.is_fresh ? "Fresh" : "STALE"
+                } · Quoted ${new Date(quote.quoted_at).toLocaleString("en-IN")}`
+              : "Poll live quotes to record current market price"}{" "}
+            · Saved Reference CMP: {company.cmp == null ? "—" : money(company.cmp)}
+          </small>
+        </div>
+
+        <div className="detail-target-grid">
+          <div className="detail-target buy-target-detail">
+            <span>
+              BASE TARGET ({company.base_direction === "below" ? "≤ BELOW" : company.base_direction === "above" ? "≥ ABOVE" : "PENDING"})
+            </span>
+            <b>
+              {company.base_target == null ? "Not Set" : money(company.base_target)}
+            </b>
+            <small>
+              Distance:{" "}
+              {formatDistance(
+                company.distance_to_base_abs,
+                company.distance_to_base_pct,
+              )}
+              {cellRefs.base_target ? ` · Excel Cell ${cellRefs.base_target}` : ""}
+            </small>
+          </div>
+          <div className="detail-target sell-target-detail">
+            <span>
+              BULL TARGET ({company.bull_direction === "above" ? "≥ ABOVE" : company.bull_direction === "below" ? "≤ BELOW" : "PENDING"})
+            </span>
+            <b>
+              {company.bull_target == null ? "Not Set" : money(company.bull_target)}
+            </b>
+            <small>
+              Distance:{" "}
+              {formatDistance(
+                company.distance_to_bull_abs,
+                company.distance_to_bull_pct,
+              )}
+              {cellRefs.bull_target ? ` · Excel Cell ${cellRefs.bull_target}` : ""}
+            </small>
+          </div>
+        </div>
+
+        <section className="detail-section">
+          <div className="section-head">
+            <div>
+              <h2>Target Configuration & Excel Lineage</h2>
+              <p>Active comparison rules & cell coordinates</p>
+            </div>
+          </div>
+          <div className="movement-grid">
+            <div>
+              <small>BASE CONDITION</small>
+              <b>
+                {company.base_direction ?? "below"} (
+                {company.base_trigger_mode ?? "at_or_beyond"})
+              </b>
+            </div>
+            <div>
+              <small>BULL CONDITION</small>
+              <b>
+                {company.bull_direction ?? "above"} (
+                {company.bull_trigger_mode ?? "at_or_beyond"})
+              </b>
+            </div>
+            <div>
+              <small>RE-ARM POLICY</small>
+              <b>{company.rearm_policy ?? "once_per_revision"}</b>
+            </div>
+            <div>
+              <small>EXCEL CELLS</small>
+              <b>
+                {Object.keys(cellRefs).length > 0
+                  ? Object.entries(cellRefs)
+                      .map(([k, v]) => `${k}: ${v}`)
+                      .join(", ")
+                  : "Manual / Direct"}
+              </b>
+            </div>
+          </div>
+        </section>
+
+        {chartSeries.length > 0 && (
+          <section className="detail-section">
+            <div className="section-head">
+              <div>
+                <h2>Recorded Price Snapshots</h2>
+                <p>{chartSeries.length} recorded quote snapshot(s)</p>
+              </div>
+            </div>
+            <div className="detail-chart" style={{ height: 180 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart
+                  data={chartSeries}
+                  margin={{ top: 8, right: 8, left: -18, bottom: 0 }}
+                >
+                  <CartesianGrid
+                    strokeDasharray="3 5"
+                    vertical={false}
+                    stroke="var(--chart-grid)"
+                  />
+                  <XAxis
+                    dataKey="label"
+                    tickLine={false}
+                    axisLine={false}
+                    tick={{ fill: "var(--muted)", fontSize: 10 }}
+                  />
+                  <YAxis
+                    orientation="right"
+                    tickLine={false}
+                    axisLine={false}
+                    tick={{ fill: "var(--muted)", fontSize: 10 }}
+                    domain={["auto", "auto"]}
+                  />
+                  <Tooltip
+                    formatter={(v) => [money(Number(v)), "Quote Price"]}
+                  />
+                  {company.base_target != null && (
+                    <ReferenceLine
+                      y={company.base_target}
+                      stroke="#44c49a"
+                      strokeDasharray="5 4"
+                    />
+                  )}
+                  {company.bull_target != null && (
+                    <ReferenceLine
+                      y={company.bull_target}
+                      stroke="#e97880"
+                      strokeDasharray="5 4"
+                    />
+                  )}
+                  <Area
+                    type="monotone"
+                    dataKey="price"
+                    stroke="#70a9ff"
+                    strokeWidth={2}
+                    fillOpacity={0.15}
+                    fill="#70a9ff"
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </section>
+        )}
+
+        <section className="detail-section">
+          <div className="section-head">
+            <div>
+              <h2>Alert History</h2>
+              <p>Persisted target triggers for {company.symbol}</p>
+            </div>
+          </div>
+          {loading ? (
+            <div className="detail-empty">Loading company alert history…</div>
+          ) : details && details.alerts.length > 0 ? (
+            details.alerts.map((a) => (
+              <div className="detail-alert" key={a.id}>
+                <span
+                  className={`alert-type-icon ${
+                    a.target_kind === "bull" ? "alert-red" : "alert-green"
+                  }`}
+                >
+                  <Zap size={12} />
+                </span>
+                <div>
+                  <b>
+                    {a.target_kind.toUpperCase()} Target Reached at {money(a.price)}
+                  </b>
+                  <small>
+                    {new Date(a.triggered_at).toLocaleString("en-IN")} ·{" "}
+                    {a.lifecycle_status ?? "triggered"}
+                  </small>
+                </div>
+                <button
+                  className="button secondary small"
+                  onClick={() => void onAction(a.id, "reset")}
+                >
+                  Reset
+                </button>
+              </div>
+            ))
+          ) : (
+            <div className="detail-empty">No alerts triggered for this company yet.</div>
+          )}
+        </section>
+
+        <section className="detail-section">
+          <div className="section-head">
+            <div>
+              <h2>Target Revision History</h2>
+              <p>Audit trail of approved target changes</p>
+            </div>
+          </div>
+          {details && details.revisions.length > 0 ? (
+            details.revisions.slice(0, 5).map((rev) => (
+              <div className="detail-alert" key={rev.id}>
+                <div>
+                  <b>
+                    v{rev.version} · Base:{" "}
+                    {rev.base_target == null ? "—" : money(rev.base_target)} (
+                    {rev.base_direction}) · Bull:{" "}
+                    {rev.bull_target == null ? "—" : money(rev.bull_target)} (
+                    {rev.bull_direction})
+                  </b>
+                  <small>
+                    Source: {rev.source} ·{" "}
+                    {rev.changed_at
+                      ? new Date(rev.changed_at).toLocaleString("en-IN")
+                      : "—"}
+                  </small>
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="detail-empty">Initial revision active.</div>
+          )}
+        </section>
+      </motion.aside>
+    </>
+  );
 }
 
-function EditTargetModal({ company, onClose, onSaved }: { company: PortfolioCompany; onClose: () => void; onSaved: () => void }) {
-  const [baseTarget, setBaseTarget] = useState(company.base_target == null ? "" : String(company.base_target));
-  const [bullTarget, setBullTarget] = useState(company.bull_target == null ? "" : String(company.bull_target));
+function EditTargetModal({
+  company,
+  onClose,
+  onSaved,
+}: {
+  company: PortfolioCompany;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [baseTarget, setBaseTarget] = useState(
+    company.base_target == null ? "" : String(company.base_target),
+  );
+  const [bullTarget, setBullTarget] = useState(
+    company.bull_target == null ? "" : String(company.bull_target),
+  );
+  const [baseDirection, setBaseDirection] = useState<TargetDirection>(
+    company.base_direction ?? "below",
+  );
+  const [bullDirection, setBullDirection] = useState<TargetDirection>(
+    company.bull_direction ?? "above",
+  );
+  const [baseTriggerMode, setBaseTriggerMode] = useState<TriggerMode>(
+    company.base_trigger_mode ?? "at_or_beyond",
+  );
+  const [bullTriggerMode, setBullTriggerMode] = useState<TriggerMode>(
+    company.bull_trigger_mode ?? "at_or_beyond",
+  );
+  const [rearmPolicy, setRearmPolicy] = useState<RearmPolicy>(
+    company.rearm_policy ?? "once_per_revision",
+  );
+  const [cooldownMinutes, setCooldownMinutes] = useState(
+    String(company.cooldown_minutes ?? 60),
+  );
+  const [monitoringActive, setMonitoringActive] = useState(
+    company.monitoring_active !== false,
+  );
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+
   const submit = async () => {
     const base = baseTarget.trim() ? Number(baseTarget) : null;
     const bull = bullTarget.trim() ? Number(bullTarget) : null;
-    if ((base !== null && (!Number.isFinite(base) || base <= 0 || !/^\d+(\.\d{1,2})?$/.test(baseTarget.trim())))
-      || (bull !== null && (!Number.isFinite(bull) || bull <= 0 || !/^\d+(\.\d{1,2})?$/.test(bullTarget.trim())))) {
-      setError("Targets must be positive numbers with no more than two decimal places.");
+    if (
+      (base !== null && (!Number.isFinite(base) || base <= 0)) ||
+      (bull !== null && (!Number.isFinite(bull) || bull <= 0))
+    ) {
+      setError("Targets must be positive numbers.");
       return;
     }
     setSaving(true);
     setError("");
     try {
-      await updateCompanyTargets(company, { base_target: base, bull_target: bull });
+      await updateCompanyTargets(company, {
+        base_target: base,
+        bull_target: bull,
+        base_direction: baseDirection,
+        bull_direction: bullDirection,
+        base_trigger_mode: baseTriggerMode,
+        bull_trigger_mode: bullTriggerMode,
+        rearm_policy: rearmPolicy,
+        cooldown_minutes: Math.max(1, Number(cooldownMinutes) || 60),
+        monitoring_active: monitoringActive,
+      });
       onSaved();
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Could not update target prices.");
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Could not update target configuration.",
+      );
     } finally {
       setSaving(false);
     }
   };
-  return <><motion.button className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} aria-label="Close edit dialog" /><motion.div className="edit-modal" role="dialog" aria-modal="true" aria-labelledby="edit-title" initial={{ opacity: 0, scale: 0.96, y: 12 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.96, y: 12 }}><div className="modal-head"><div><div className="eyebrow">TARGET MANAGEMENT · VERSION {company.version}</div><h2 id="edit-title">Edit target prices</h2><p>{company.name} <span>·</span> {company.exchange}:{company.symbol}</p></div><button className="icon-button" aria-label="Close modal" onClick={onClose}><X size={17} /></button></div><label className="modal-field"><span>Base target</span><div><span>₹</span><input type="number" value={baseTarget} onChange={(event) => setBaseTarget(event.target.value)} min="0.01" step="0.01" placeholder="Leave blank to clear" /></div></label><label className="modal-field"><span>Bull target</span><div><span>₹</span><input type="number" value={bullTarget} onChange={(event) => setBullTarget(event.target.value)} min="0.01" step="0.01" placeholder="Leave blank to clear" /></div></label>{error && <div className="form-error" role="alert">{error}</div>}<div className="modal-note"><ShieldCheck size={14} /> Version-checked backend update; changed targets are recorded in history.</div><div className="modal-actions"><button className="button secondary" onClick={onClose} disabled={saving}>Cancel</button><button className="button primary" onClick={submit} disabled={saving}>{saving ? "Saving…" : "Save targets"}</button></div></motion.div></>;
+
+  return (
+    <>
+      <motion.button
+        className="modal-backdrop"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onClick={onClose}
+        aria-label="Close edit dialog"
+      />
+      <motion.div
+        className="edit-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="edit-title"
+        initial={{ opacity: 0, scale: 0.96, y: 12 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.96, y: 12 }}
+      >
+        <div className="modal-head">
+          <div>
+            <div className="eyebrow">
+              TARGET & ALERT CONFIGURATION · VERSION {company.version}
+            </div>
+            <h2 id="edit-title">{company.name}</h2>
+            <p>
+              {company.exchange}:{company.symbol} · Saved Reference CMP:{" "}
+              {company.cmp == null ? "—" : money(company.cmp)}
+            </p>
+          </div>
+          <button
+            className="icon-button"
+            aria-label="Close modal"
+            onClick={onClose}
+          >
+            <X size={17} />
+          </button>
+        </div>
+
+        <label className="modal-field">
+          <span>Base Target Price (INR)</span>
+          <div>
+            <span>₹</span>
+            <input
+              type="number"
+              value={baseTarget}
+              onChange={(event) => setBaseTarget(event.target.value)}
+              min="0.01"
+              step="0.01"
+              placeholder="Leave blank to clear"
+            />
+          </div>
+        </label>
+
+        <div className="mapping-controls" style={{ marginBottom: 12 }}>
+          <label className="mapping-field">
+            <span>Base Comparison Direction</span>
+            <select
+              value={baseDirection}
+              onChange={(e) => setBaseDirection(e.target.value as TargetDirection)}
+            >
+              <option value="below">Price falls to or below target (≤)</option>
+              <option value="above">Price reaches or exceeds target (≥)</option>
+              <option value="pending">Pending configuration</option>
+            </select>
+          </label>
+          <label className="mapping-field">
+            <span>Base Trigger Mode</span>
+            <select
+              value={baseTriggerMode}
+              onChange={(e) => setBaseTriggerMode(e.target.value as TriggerMode)}
+            >
+              <option value="at_or_beyond">At or beyond target (including initial)</option>
+              <option value="crosses">Crosses target threshold</option>
+            </select>
+          </label>
+        </div>
+
+        <label className="modal-field">
+          <span>Bull Target Price (INR)</span>
+          <div>
+            <span>₹</span>
+            <input
+              type="number"
+              value={bullTarget}
+              onChange={(event) => setBullTarget(event.target.value)}
+              min="0.01"
+              step="0.01"
+              placeholder="Leave blank to clear"
+            />
+          </div>
+        </label>
+
+        <div className="mapping-controls" style={{ marginBottom: 12 }}>
+          <label className="mapping-field">
+            <span>Bull Comparison Direction</span>
+            <select
+              value={bullDirection}
+              onChange={(e) => setBullDirection(e.target.value as TargetDirection)}
+            >
+              <option value="above">Price reaches or exceeds target (≥)</option>
+              <option value="below">Price falls to or below target (≤)</option>
+              <option value="pending">Pending configuration</option>
+            </select>
+          </label>
+          <label className="mapping-field">
+            <span>Bull Trigger Mode</span>
+            <select
+              value={bullTriggerMode}
+              onChange={(e) => setBullTriggerMode(e.target.value as TriggerMode)}
+            >
+              <option value="at_or_beyond">At or beyond target (including initial)</option>
+              <option value="crosses">Crosses target threshold</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="mapping-controls" style={{ marginBottom: 12 }}>
+          <label className="mapping-field">
+            <span>Alert Re-trigger Policy</span>
+            <select
+              value={rearmPolicy}
+              onChange={(e) => setRearmPolicy(e.target.value as RearmPolicy)}
+            >
+              <option value="once_per_revision">Once per target revision</option>
+              <option value="rearm_on_reset">Re-arm after manual Reset/Resolve</option>
+              <option value="rearm_after_recovery">Re-arm automatically after price recovery</option>
+              <option value="cooldown">Re-arm after cooldown minutes</option>
+            </select>
+          </label>
+          {rearmPolicy === "cooldown" && (
+            <label className="mapping-field">
+              <span>Cooldown (minutes)</span>
+              <input
+                type="number"
+                min="1"
+                value={cooldownMinutes}
+                onChange={(e) => setCooldownMinutes(e.target.value)}
+              />
+            </label>
+          )}
+        </div>
+
+        <label className="formula-review" style={{ marginBottom: 12 }}>
+          <input
+            type="checkbox"
+            checked={monitoringActive}
+            onChange={(e) => setMonitoringActive(e.target.checked)}
+          />{" "}
+          Active in background price monitoring
+        </label>
+
+        {error && (
+          <div className="form-error" role="alert">
+            {error}
+          </div>
+        )}
+
+        <div className="modal-note">
+          <ShieldCheck size={14} /> Version-checked transaction; creates a new target revision if target prices change.
+        </div>
+
+        <div className="modal-actions">
+          <button className="button secondary" onClick={onClose} disabled={saving}>
+            Cancel
+          </button>
+          <button className="button primary" onClick={() => void submit()} disabled={saving}>
+            {saving ? "Saving…" : "Save Configuration"}
+          </button>
+        </div>
+      </motion.div>
+    </>
+  );
 }

@@ -1,17 +1,20 @@
 import type {
-  ApiAlert, ImportInspection, ImportPreview, ImportResult, PortfolioCompany, PriceHistory,
+  ApiAlert,
+  CompanyDetailsResponse,
+  ImportBatchHistoryItem,
+  ImportInspection,
+  ImportPreview,
+  ImportResult,
+  NotificationPreference,
+  PortfolioCompany,
+  PriceHistory,
+  RearmPolicy,
+  TargetDirection,
+  TriggerMode,
   WorkerStatus,
 } from "./types";
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
-
-export async function fetchCompanies(signal?: AbortSignal): Promise<PortfolioCompany[]> {
-  const response = await fetch(`${apiBaseUrl}/api/companies`, { signal });
-  if (!response.ok) {
-    throw await responseError(response);
-  }
-  return response.json() as Promise<PortfolioCompany[]>;
-}
 
 async function responseError(response: Response): Promise<Error> {
   const body: unknown = await response.json().catch(() => null);
@@ -25,6 +28,23 @@ async function responseError(response: Response): Promise<Error> {
 async function expectJson<T>(response: Response): Promise<T> {
   if (!response.ok) throw await responseError(response);
   return response.json() as Promise<T>;
+}
+
+export async function fetchCompanies(signal?: AbortSignal): Promise<PortfolioCompany[]> {
+  const response = await fetch(`${apiBaseUrl}/api/companies`, { signal });
+  return expectJson<PortfolioCompany[]>(response);
+}
+
+export async function fetchCompanyDetails(
+  exchange: string,
+  symbol: string,
+  signal?: AbortSignal,
+): Promise<CompanyDetailsResponse> {
+  const response = await fetch(
+    `${apiBaseUrl}/api/companies/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}/details`,
+    { signal },
+  );
+  return expectJson<CompanyDetailsResponse>(response);
 }
 
 export async function fetchCompanyHistory(
@@ -45,9 +65,32 @@ export async function fetchAlerts(signal?: AbortSignal): Promise<ApiAlert[]> {
   return expectJson<ApiAlert[]>(response);
 }
 
+export async function performAlertAction(
+  alertId: number,
+  action: "acknowledge" | "resolve" | "reset",
+  actor = "analyst",
+): Promise<ApiAlert> {
+  const response = await fetch(`${apiBaseUrl}/api/alerts/${alertId}/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, actor }),
+  });
+  return expectJson<ApiAlert>(response);
+}
+
 export async function fetchWorkerStatus(signal?: AbortSignal): Promise<WorkerStatus> {
   const response = await fetch(`${apiBaseUrl}/api/worker/status`, { signal });
   return expectJson<WorkerStatus>(response);
+}
+
+export async function triggerOnDemandPoll(): Promise<{
+  attempted: number;
+  recorded: number;
+  failed: number;
+  alerts_enabled: boolean;
+}> {
+  const response = await fetch(`${apiBaseUrl}/api/price-feed/poll`, { method: "POST" });
+  return expectJson(response);
 }
 
 export async function inspectImport(file: File, headerRow: number): Promise<ImportInspection> {
@@ -67,36 +110,123 @@ export interface ImportMapping {
   bull_target_column?: string;
   cmp_column?: string;
   sector_column?: string;
+  uploaded_by?: string;
 }
 
 export async function previewImport(file: File, mapping: ImportMapping): Promise<ImportPreview> {
   const form = new FormData();
   form.append("file", file);
-  Object.entries(mapping).forEach(([key, value]) => form.append(key, String(value)));
+  Object.entries(mapping).forEach(([key, value]) => {
+    if (value !== undefined) form.append(key, String(value));
+  });
   return expectJson(await fetch(`${apiBaseUrl}/api/imports/preview`, { method: "POST", body: form }));
+}
+
+export async function updateImportPreviewRow(
+  importId: string,
+  rowNumber: number,
+  patch: {
+    exchange?: string | null;
+    symbol?: string | null;
+    name?: string | null;
+    sector?: string | null;
+    cmp?: number | null;
+    base_target?: number | null;
+    bull_target?: number | null;
+    base_direction?: TargetDirection | null;
+    bull_direction?: TargetDirection | null;
+    approval_status?: "approved" | "rejected";
+  },
+): Promise<ImportPreview> {
+  return expectJson(
+    await fetch(
+      `${apiBaseUrl}/api/imports/${encodeURIComponent(importId)}/rows/${rowNumber}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      },
+    ),
+  );
 }
 
 export async function confirmImport(
   importId: string,
   reviewCachedTargets: boolean,
+  uploadedBy = "admin",
 ): Promise<ImportResult> {
-  return expectJson(await fetch(`${apiBaseUrl}/api/imports/${encodeURIComponent(importId)}/confirm`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ review_cached_targets: reviewCachedTargets }),
-  }));
+  return expectJson(
+    await fetch(`${apiBaseUrl}/api/imports/${encodeURIComponent(importId)}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        review_cached_targets: reviewCachedTargets,
+        uploaded_by: uploadedBy,
+      }),
+    }),
+  );
+}
+
+export async function rejectImport(importId: string): Promise<{ id: string; status: string }> {
+  return expectJson(
+    await fetch(`${apiBaseUrl}/api/imports/${encodeURIComponent(importId)}/reject`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function fetchImportHistory(signal?: AbortSignal): Promise<ImportBatchHistoryItem[]> {
+  return expectJson(await fetch(`${apiBaseUrl}/api/imports`, { signal }));
+}
+
+export async function restoreImportVersion(importId: string): Promise<ImportResult> {
+  return expectJson(
+    await fetch(`${apiBaseUrl}/api/imports/${encodeURIComponent(importId)}/restore`, {
+      method: "POST",
+    }),
+  );
 }
 
 export async function updateCompanyTargets(
   company: PortfolioCompany,
-  targets: { base_target: number | null; bull_target: number | null },
+  targets: {
+    base_target: number | null;
+    bull_target: number | null;
+    base_direction?: TargetDirection;
+    bull_direction?: TargetDirection;
+    base_trigger_mode?: TriggerMode;
+    bull_trigger_mode?: TriggerMode;
+    rearm_policy?: RearmPolicy;
+    cooldown_minutes?: number;
+    monitoring_active?: boolean;
+  },
 ): Promise<PortfolioCompany> {
-  return expectJson(await fetch(
-    `${apiBaseUrl}/api/companies/${encodeURIComponent(company.exchange)}/${encodeURIComponent(company.symbol)}/targets`,
-    {
+  return expectJson(
+    await fetch(
+      `${apiBaseUrl}/api/companies/${encodeURIComponent(company.exchange)}/${encodeURIComponent(company.symbol)}/targets`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expected_version: company.version, ...targets }),
+      },
+    ),
+  );
+}
+
+export async function fetchNotificationPreferences(
+  signal?: AbortSignal,
+): Promise<NotificationPreference> {
+  return expectJson(await fetch(`${apiBaseUrl}/api/notifications/preferences`, { signal }));
+}
+
+export async function updateNotificationPreferences(
+  prefs: Partial<NotificationPreference>,
+): Promise<NotificationPreference> {
+  return expectJson(
+    await fetch(`${apiBaseUrl}/api/notifications/preferences`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expected_version: company.version, ...targets }),
-    },
-  ));
+      body: JSON.stringify(prefs),
+    }),
+  );
 }

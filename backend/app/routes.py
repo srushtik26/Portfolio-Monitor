@@ -1,42 +1,82 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import os
 from pathlib import PurePath
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm.exc import StaleDataError
 
 from .database import get_db
-from .imports import create_preview, get_batch, inspect_upload, read_upload, serialize_batch
+from .imports import (
+    create_preview,
+    get_batch,
+    inspect_upload,
+    read_upload,
+    restore_import_version,
+    serialize_batch,
+    update_preview_row,
+)
 from .models import (
+    AuditLog,
     Company,
     ImportBatch,
     NotificationOutbox,
+    NotificationPreference,
     PriceQuote,
     TargetAlert,
+    TargetAlertState,
     TargetRevision,
     WorkerHeartbeat,
 )
-from .prices import normalize_utc, serialize_quote
-from .schemas import CompanyRead, ImportConfirm, PriceHistoryRead, TargetUpdate
+from .notifications import MultiChannelNotifier, drain_outbox, get_or_create_preferences
+from .prices import (
+    NseBseExchangeCalendar,
+    ProviderError,
+    YFinanceProvider,
+    apply_alert_lifecycle_action,
+    enrich_company_dict,
+    normalize_utc,
+    record_quote,
+    register_verified_ticker,
+    serialize_quote,
+)
+from .schemas import (
+    AlertActionRequest,
+    CompanyRead,
+    ImportConfirm,
+    ImportRowUpdate,
+    NotificationPreferenceUpdate,
+    PriceHistoryRead,
+    TargetConfigUpdate,
+    TargetUpdate,
+)
 
 router = APIRouter(prefix="/api")
 DbSession = Annotated[Session, Depends(get_db)]
 
 
-@router.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def _serialize_company(
+    session: Session,
+    company: Company,
+    quote_by_company: dict[tuple[str, str], dict[str, Any]],
+    states_by_key: dict[tuple[str, str, str], TargetAlertState],
+) -> CompanyRead:
+    company_data = CompanyRead.model_validate(company).model_dump()
+    identity = (company.exchange, company.symbol)
+    quote_data = quote_by_company.get(identity)
+    base_state = states_by_key.get((company.exchange, company.symbol, "base"))
+    bull_state = states_by_key.get((company.exchange, company.symbol, "bull"))
+    enrich_company_dict(company, company_data, quote_data, base_state, bull_state)
+    return CompanyRead.model_validate(company_data)
 
 
-@router.get("/companies", response_model=list[CompanyRead])
-def list_companies(session: DbSession) -> list[CompanyRead]:
-    companies = list(
-        session.scalars(select(Company).order_by(Company.exchange, Company.symbol))
-    )
+def _load_quotes_and_states(
+    session: Session,
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str, str], TargetAlertState]]:
     latest_quotes = (
         select(
             PriceQuote.id,
@@ -57,25 +97,160 @@ def list_companies(session: DbSession) -> list[CompanyRead]:
     quote_by_company = {
         (quote.exchange, quote.symbol): serialize_quote(quote) for quote in quotes
     }
-    results = []
-    for company in companies:
-        company_data = CompanyRead.model_validate(company).model_dump()
-        company_data["latest_quote"] = quote_by_company.get(
-            (company.exchange, company.symbol)
+    state_rows = session.scalars(
+        select(TargetAlertState).where(TargetAlertState.is_simulated.is_(False))
+    )
+    states_by_key = {
+        (row.exchange, row.symbol, row.target_kind): row for row in state_rows
+    }
+    return quote_by_company, states_by_key
+
+
+@router.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/companies", response_model=list[CompanyRead])
+def list_companies(session: DbSession) -> list[CompanyRead]:
+    companies = list(
+        session.scalars(select(Company).order_by(Company.exchange, Company.symbol))
+    )
+    quote_by_company, states_by_key = _load_quotes_and_states(session)
+    return [
+        _serialize_company(session, company, quote_by_company, states_by_key)
+        for company in companies
+    ]
+
+
+@router.get("/companies/{exchange}/{symbol}/details")
+def get_company_details(
+    exchange: str,
+    symbol: str,
+    session: DbSession,
+) -> dict[str, Any]:
+    identity = (exchange.upper(), symbol.upper())
+    company = session.get(Company, identity)
+    if company is None:
+        raise HTTPException(status_code=404, detail="Company not found.")
+    quote_by_company, states_by_key = _load_quotes_and_states(session)
+    company_read = _serialize_company(session, company, quote_by_company, states_by_key)
+
+    quotes = session.scalars(
+        select(PriceQuote)
+        .where(
+            PriceQuote.exchange == identity[0],
+            PriceQuote.symbol == identity[1],
         )
-        results.append(CompanyRead.model_validate(company_data))
-    return results
+        .order_by(PriceQuote.quoted_at.desc(), PriceQuote.id.desc())
+        .limit(100)
+    )
+    revisions = session.scalars(
+        select(TargetRevision)
+        .where(
+            TargetRevision.exchange == identity[0],
+            TargetRevision.symbol == identity[1],
+        )
+        .order_by(TargetRevision.version.desc(), TargetRevision.id.desc())
+        .limit(50)
+    )
+    alert_rows = session.execute(
+        select(TargetAlert, TargetRevision, PriceQuote, NotificationOutbox)
+        .join(TargetRevision, TargetRevision.id == TargetAlert.target_revision_id)
+        .join(PriceQuote, PriceQuote.id == TargetAlert.quote_id)
+        .outerjoin(
+            NotificationOutbox,
+            NotificationOutbox.target_alert_id == TargetAlert.id,
+        )
+        .where(
+            TargetRevision.exchange == identity[0],
+            TargetRevision.symbol == identity[1],
+        )
+        .order_by(TargetAlert.triggered_at.desc(), TargetAlert.id.desc())
+        .limit(50)
+    ).all()
+
+    alerts_serialized = []
+    seen_alerts: set[int] = set()
+    for alert, rev, quote, notification in alert_rows:
+        if alert.id in seen_alerts:
+            continue
+        seen_alerts.add(alert.id)
+        target_val = (
+            alert.target_price_snapshot
+            if alert.target_price_snapshot is not None
+            else (rev.base_target if alert.target_kind == "base" else rev.bull_target)
+        )
+        alerts_serialized.append(
+            {
+                "id": alert.id,
+                "target_kind": alert.target_kind,
+                "target": float(target_val) if target_val is not None else None,
+                "price": float(alert.price),
+                "comparison_direction": alert.comparison_direction,
+                "trigger_mode": alert.trigger_mode,
+                "lifecycle_status": alert.lifecycle_status,
+                "trigger_cycle": alert.trigger_cycle,
+                "triggered_at": normalize_utc(alert.triggered_at),
+                "is_simulated": alert.is_simulated,
+                "delivery_status": notification.status if notification else "not_queued",
+                "channel": notification.channel if notification else None,
+            }
+        )
+
+    revisions_serialized = [
+        {
+            "id": r.id,
+            "version": r.version,
+            "previous_base_target": float(r.previous_base_target) if r.previous_base_target is not None else None,
+            "previous_bull_target": float(r.previous_bull_target) if r.previous_bull_target is not None else None,
+            "base_target": float(r.base_target) if r.base_target is not None else None,
+            "bull_target": float(r.bull_target) if r.bull_target is not None else None,
+            "base_direction": r.base_direction,
+            "bull_direction": r.bull_direction,
+            "source": r.source,
+            "import_id": r.import_id,
+            "changed_by": r.changed_by,
+            "changed_at": normalize_utc(r.changed_at),
+            "cell_refs": r.cell_refs,
+        }
+        for r in revisions
+    ]
+
+    return {
+        "company": company_read.model_dump(),
+        "quote_history": [serialize_quote(q) for q in quotes],
+        "alert_history": alerts_serialized,
+        "target_revisions": revisions_serialized,
+        "excel_source": company.source_metadata,
+    }
 
 
 @router.get("/price-feed/status")
-def price_feed_status() -> dict[str, object]:
+def price_feed_status(session: DbSession) -> dict[str, object]:
+    heartbeat = session.get(WorkerHeartbeat, "price")
+    live_configured = bool(
+        heartbeat is not None
+        and heartbeat.provider != "fixture"
+        and heartbeat.exchange_calendar != "fixture"
+    )
+    if not live_configured:
+        return {
+            "provider": None,
+            "exchange_calendar": None,
+            "live_mode": "not_configured",
+            "alert_rules_enabled": False,
+            "reason": "Select and configure a live provider and exchange calendar before enabling alerts.",
+            "trigger": "price >= target",
+            "already_above": "alert on first eligible quote",
+        }
     return {
-        "provider": None,
-        "exchange_calendar": None,
-        "live_mode": "not_configured",
-        "alert_rules_enabled": False,
-        "reason": "Select and configure a live provider and exchange calendar before enabling alerts.",
-        "trigger": "price >= target",
+        "provider": heartbeat.provider,
+        "exchange_calendar": heartbeat.exchange_calendar,
+        "live_mode": "active",
+        "alert_rules_enabled": True,
+        "reason": "Live market price monitoring and configurable target alerts are active.",
+        "trigger": "configurable (below / above / crosses)",
         "already_above": "alert on first eligible quote",
     }
 
@@ -86,18 +261,144 @@ def worker_status(session: DbSession) -> dict[str, object]:
     now = datetime.now(timezone.utc)
     last_poll = normalize_utc(heartbeat.last_poll_at) if heartbeat and heartbeat.last_poll_at else None
     heartbeat_fresh = last_poll is not None and now - last_poll <= timedelta(minutes=3)
+    live_provider = bool(heartbeat and heartbeat.provider and heartbeat.provider != "fixture")
+    auth_calendar = bool(heartbeat and heartbeat.exchange_calendar and heartbeat.exchange_calendar != "fixture")
+    pref = session.get(NotificationPreference, "default")
+    notif_mode = (
+        "live_channels"
+        if (pref and (pref.dashboard_enabled or (pref.email_enabled and pref.email_recipients)))
+        else "dry_run_only"
+    )
+
+    quote_by_company, _ = _load_quotes_and_states(session)
+    companies = list(session.scalars(select(Company).where(Company.is_approved.is_(True), Company.monitoring_active.is_(True))))
+    stale_symbols = []
+    for c in companies:
+        q = quote_by_company.get((c.exchange, c.symbol))
+        if q is not None and not q.get("is_fresh") and not q.get("is_simulated"):
+            stale_symbols.append(f"{c.exchange}:{c.symbol}")
+
+    calendar = NseBseExchangeCalendar()
+    market_open = calendar.is_open("NSE", now)
+
     return {
         "state": "error" if heartbeat and heartbeat.last_error else "running" if heartbeat_fresh else "stopped",
         "provider": heartbeat.provider if heartbeat else None,
         "exchange_calendar": heartbeat.exchange_calendar if heartbeat else None,
         "last_started_at": normalize_utc(heartbeat.started_at) if heartbeat else None,
         "last_poll_at": last_poll,
+        "last_successful_quote_at": normalize_utc(heartbeat.last_successful_quote_at)
+        if heartbeat and heartbeat.last_successful_quote_at
+        else last_poll,
+        "last_failed_at": normalize_utc(heartbeat.last_failed_at)
+        if heartbeat and heartbeat.last_failed_at
+        else None,
         "last_error": heartbeat.last_error if heartbeat else None,
-        "live_provider_configured": False,
-        "authoritative_calendar_configured": False,
-        "live_alerts_enabled": False,
-        "notification_mode": "dry_run_only",
-        "note": "Fixture worker data is simulated. Laptop sleep or offline time stops polling.",
+        "connection_status": heartbeat.connection_status if heartbeat else "disconnected",
+        "websocket_status": heartbeat.websocket_status if heartbeat else "unavailable",
+        "failed_requests_count": heartbeat.failed_requests_count if heartbeat else 0,
+        "reconnect_count": heartbeat.reconnect_count if heartbeat else 0,
+        "monitored_symbols_count": len(companies),
+        "stale_symbols_count": len(stale_symbols),
+        "stale_symbols": stale_symbols,
+        "market_open": market_open,
+        "live_provider_configured": live_provider,
+        "authoritative_calendar_configured": auth_calendar,
+        "live_alerts_enabled": live_provider and auth_calendar,
+        "notification_mode": notif_mode,
+        "note": (
+            "Live NSE/BSE monitoring active."
+            if (live_provider and auth_calendar)
+            else "Fixture worker data is simulated. Laptop sleep or offline time stops polling."
+        ),
+    }
+
+
+@router.post("/price-feed/poll")
+def trigger_manual_poll(
+    session: DbSession,
+    exchange: str | None = Query(default=None),
+    symbol: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Fetch live quotes on demand for one or all approved active companies and evaluate target rules."""
+    provider = YFinanceProvider()
+    now = datetime.now(timezone.utc)
+    if exchange and symbol:
+        identity = (exchange.upper(), symbol.upper())
+        company = session.get(Company, identity)
+        if company is None:
+            raise HTTPException(status_code=404, detail="Company not found.")
+        companies = [company]
+    else:
+        companies = list(
+            session.scalars(
+                select(Company)
+                .where(Company.is_approved.is_(True), Company.monitoring_active.is_(True))
+                .order_by(Company.exchange, Company.symbol)
+            )
+        )
+
+    attempted = 0
+    recorded = 0
+    failed = 0
+    errors: list[str] = []
+    for company in companies:
+        attempted += 1
+        register_verified_ticker(company.exchange, company.symbol)
+        try:
+            quote = provider.fetch_quote(company.exchange, company.symbol)
+            record_quote(
+                session,
+                quote,
+                now=datetime.now(timezone.utc),
+                alerts_enabled=True,
+                fixture_alerts_enabled=False,
+            )
+            recorded += 1
+        except (ProviderError, ValueError) as exc:
+            failed += 1
+            errors.append(f"{company.exchange}:{company.symbol}: {exc}")
+
+    delivery = drain_outbox(MultiChannelNotifier(), session_factory=lambda: session, now=now)
+    heartbeat = session.get(WorkerHeartbeat, "price")
+    if heartbeat is None:
+        heartbeat = WorkerHeartbeat(
+            name="price",
+            provider="yfinance",
+            exchange_calendar="nse_bse",
+            started_at=now,
+            last_poll_at=now,
+            last_error=errors[0][:1000] if errors and recorded == 0 else None,
+            connection_status="polling" if recorded > 0 else ("error" if errors else "connected"),
+            websocket_status="fallback_polling",
+            last_successful_quote_at=now if recorded > 0 else None,
+            last_failed_at=now if failed > 0 else None,
+            failed_requests_count=failed,
+            monitored_symbols_count=len(companies),
+        )
+        session.add(heartbeat)
+    else:
+        heartbeat.provider = "yfinance"
+        heartbeat.exchange_calendar = "nse_bse"
+        heartbeat.last_poll_at = now
+        heartbeat.last_error = errors[0][:1000] if errors and recorded == 0 else None
+        heartbeat.connection_status = "polling" if recorded > 0 else ("error" if errors else "connected")
+        heartbeat.websocket_status = "fallback_polling"
+        if recorded > 0:
+            heartbeat.last_successful_quote_at = now
+        if failed > 0:
+            heartbeat.last_failed_at = now
+            heartbeat.failed_requests_count = (heartbeat.failed_requests_count or 0) + failed
+    session.commit()
+
+    return {
+        "attempted": attempted,
+        "recorded": recorded,
+        "failed": failed,
+        "errors": errors,
+        "notifications_sent": delivery.sent,
+        "notifications_retried": delivery.retried,
+        "notifications_failed": delivery.failed,
     }
 
 
@@ -118,16 +419,21 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
         )
         .order_by(TargetAlert.triggered_at.desc(), TargetAlert.id.desc())
     ).all()
-    events: list[dict[str, object]] = []
+
+    grouped: dict[int, dict[str, Any]] = {}
     for alert, revision, quote, company, notification in rows:
-        target = (
-            revision.base_target
-            if alert.target_kind == "base"
-            else revision.bull_target
-        )
-        quote_data = serialize_quote(quote)
-        events.append(
-            {
+        if alert.id not in grouped:
+            target = (
+                alert.target_price_snapshot
+                if alert.target_price_snapshot is not None
+                else (
+                    revision.base_target
+                    if alert.target_kind == "base"
+                    else revision.bull_target
+                )
+            )
+            quote_data = serialize_quote(quote)
+            grouped[alert.id] = {
                 "id": alert.id,
                 "exchange": company.exchange,
                 "symbol": company.symbol,
@@ -135,7 +441,14 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
                 "target_kind": alert.target_kind,
                 "target": float(target) if target is not None else None,
                 "price": float(alert.price),
+                "comparison_direction": alert.comparison_direction,
+                "trigger_mode": alert.trigger_mode,
+                "lifecycle_status": alert.lifecycle_status,
+                "trigger_cycle": alert.trigger_cycle,
                 "triggered_at": normalize_utc(alert.triggered_at),
+                "acknowledged_at": normalize_utc(alert.acknowledged_at) if alert.acknowledged_at else None,
+                "resolved_at": normalize_utc(alert.resolved_at) if alert.resolved_at else None,
+                "reset_at": normalize_utc(alert.reset_at) if alert.reset_at else None,
                 "target_revision_id": alert.target_revision_id,
                 "is_simulated": alert.is_simulated,
                 "event_type": "fixture" if alert.is_simulated else "live",
@@ -148,7 +461,9 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
                 "delivery_label": (
                     "Dry run (no network)"
                     if notification and notification.delivery_mode == "dry_run"
-                    else notification.status if notification else "Not queued"
+                    else f"{notification.channel.title()}: {notification.status}"
+                    if notification
+                    else "Not queued"
                 ),
                 "attempts": notification.attempts if notification else 0,
                 "max_attempts": notification.max_attempts if notification else 0,
@@ -159,9 +474,144 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
                 "provider_message_id": notification.provider_message_id
                 if notification
                 else None,
+                "channels": [],
             }
+        if notification is not None:
+            grouped[alert.id]["channels"].append(
+                {
+                    "id": notification.id,
+                    "channel": notification.channel,
+                    "destination": notification.destination,
+                    "delivery_mode": notification.delivery_mode,
+                    "status": notification.status,
+                    "attempts": notification.attempts,
+                    "max_attempts": notification.max_attempts,
+                    "last_error": notification.last_error,
+                    "sent_at": normalize_utc(notification.sent_at) if notification.sent_at else None,
+                }
+            )
+            # Prefer email channel status in top-level summary when present
+            if notification.channel == "email":
+                grouped[alert.id]["delivery_status"] = notification.status
+                grouped[alert.id]["delivery_mode"] = notification.delivery_mode
+                grouped[alert.id]["channel"] = notification.channel
+                grouped[alert.id]["delivery_label"] = f"Email: {notification.status}"
+                grouped[alert.id]["attempts"] = notification.attempts
+                grouped[alert.id]["max_attempts"] = notification.max_attempts
+                grouped[alert.id]["last_error"] = notification.last_error
+                grouped[alert.id]["sent_at"] = (
+                    normalize_utc(notification.sent_at) if notification.sent_at else None
+                )
+    return list(grouped.values())
+
+
+@router.post("/alerts/{alert_id}/action")
+def alert_action(
+    alert_id: int,
+    payload: AlertActionRequest,
+    session: DbSession,
+) -> dict[str, Any]:
+    try:
+        updated = apply_alert_lifecycle_action(
+            session,
+            alert_id,
+            payload.action,
+            actor=payload.actor,
         )
-    return events
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "id": updated.id,
+        "lifecycle_status": updated.lifecycle_status,
+        "acknowledged_at": normalize_utc(updated.acknowledged_at) if updated.acknowledged_at else None,
+        "resolved_at": normalize_utc(updated.resolved_at) if updated.resolved_at else None,
+        "reset_at": normalize_utc(updated.reset_at) if updated.reset_at else None,
+    }
+
+
+@router.post("/notifications/drain")
+def trigger_outbox_drain(session: DbSession) -> dict[str, int]:
+    result = drain_outbox(MultiChannelNotifier(), session_factory=lambda: session)
+    return {
+        "sent": result.sent,
+        "retried": result.retried,
+        "failed": result.failed,
+    }
+
+
+@router.get("/notifications/preferences")
+def read_notification_preferences(session: DbSession) -> dict[str, Any]:
+    pref = get_or_create_preferences(session)
+    session.commit()
+    return {
+        "id": pref.id,
+        "dashboard_enabled": pref.dashboard_enabled,
+        "email_enabled": pref.email_enabled,
+        "email_recipients": pref.email_recipients or [],
+        "notify_on_base": pref.notify_on_base,
+        "notify_on_bull": pref.notify_on_bull,
+        "notify_on_stale": pref.notify_on_stale,
+        "smtp_configured": bool(os.environ.get("SMTP_HOST") or os.environ.get("SMTP_SPOOL_DIR")),
+        "updated_at": normalize_utc(pref.updated_at),
+    }
+
+
+@router.put("/notifications/preferences")
+def update_notification_preferences(
+    payload: NotificationPreferenceUpdate,
+    session: DbSession,
+) -> dict[str, Any]:
+    pref = get_or_create_preferences(session)
+    now = datetime.now(timezone.utc)
+    fields = payload.model_fields_set
+    if "dashboard_enabled" in fields and payload.dashboard_enabled is not None:
+        pref.dashboard_enabled = payload.dashboard_enabled
+    if "email_enabled" in fields and payload.email_enabled is not None:
+        pref.email_enabled = payload.email_enabled
+    if "email_recipients" in fields and payload.email_recipients is not None:
+        raw_list = (
+            payload.email_recipients.split(",")
+            if isinstance(payload.email_recipients, str)
+            else payload.email_recipients
+        )
+        cleaned = [addr.strip() for addr in raw_list if addr.strip()]
+        for addr in cleaned:
+            if "@" not in addr or "." not in addr.split("@")[-1]:
+                raise HTTPException(status_code=422, detail=f"Invalid email address: {addr}")
+        pref.email_recipients = cleaned
+    if "notify_on_base" in fields and payload.notify_on_base is not None:
+        pref.notify_on_base = payload.notify_on_base
+    if "notify_on_bull" in fields and payload.notify_on_bull is not None:
+        pref.notify_on_bull = payload.notify_on_bull
+    if "notify_on_stale" in fields and payload.notify_on_stale is not None:
+        pref.notify_on_stale = payload.notify_on_stale
+    pref.updated_at = now
+    session.add(
+        AuditLog(
+            action="notification_preferences_updated",
+            actor=payload.actor,
+            entity_type="notification_preferences",
+            entity_id=pref.id,
+            details={
+                "dashboard_enabled": pref.dashboard_enabled,
+                "email_enabled": pref.email_enabled,
+                "email_recipients": pref.email_recipients,
+            },
+            created_at=now,
+        )
+    )
+    session.commit()
+    return {
+        "id": pref.id,
+        "dashboard_enabled": pref.dashboard_enabled,
+        "email_enabled": pref.email_enabled,
+        "email_recipients": pref.email_recipients or [],
+        "notify_on_base": pref.notify_on_base,
+        "notify_on_bull": pref.notify_on_bull,
+        "notify_on_stale": pref.notify_on_stale,
+        "smtp_configured": bool(os.environ.get("SMTP_HOST") or os.environ.get("SMTP_SPOOL_DIR")),
+        "updated_at": normalize_utc(pref.updated_at),
+    }
 
 
 @router.get(
@@ -197,7 +647,7 @@ def company_price_history(
 )
 def update_company_targets(
     exchange: str, symbol: str, update: TargetUpdate, session: DbSession
-) -> Company:
+) -> CompanyRead:
     identity = (exchange.upper(), symbol.upper())
     company = session.get(Company, identity)
     if company is None:
@@ -207,25 +657,29 @@ def update_company_targets(
             status_code=409,
             detail=f"Targets changed since they were loaded (current version {company.version}). Refresh and try again.",
         )
-    fields = update.model_fields_set - {"expected_version"}
+    fields = update.model_fields_set - {"expected_version", "actor"}
     if not fields:
-        raise HTTPException(status_code=422, detail="Provide at least one target to update.")
-    for field in fields:
-        value = getattr(update, field)
-        if value is not None and (
-            not value.is_finite()
-            or value <= 0
-            or value >= Decimal("1000000000000")
-            or value.as_tuple().exponent < -2
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail=f"{field} must be finite, positive, and have at most 12 integer digits and two decimal places.",
-            )
+        raise HTTPException(status_code=422, detail="Provide at least one target or configuration field to update.")
+    for field in ("base_target", "bull_target"):
+        if field in fields:
+            value = getattr(update, field)
+            if value is not None and (
+                not value.is_finite()
+                or value <= 0
+                or value >= Decimal("1000000000000")
+                or value.as_tuple().exponent < -2
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{field} must be finite, positive, and have at most 12 integer digits and two decimal places.",
+                )
     old_targets = (company.base_target, company.bull_target)
     for field in fields:
-        setattr(company, field, getattr(update, field))
+        val = getattr(update, field)
+        if field in ("base_target", "bull_target") or val is not None:
+            setattr(company, field, val)
     new_targets = (company.base_target, company.bull_target)
+    now = datetime.now(timezone.utc)
     if old_targets != new_targets:
         company.version += 1
         session.add(
@@ -233,12 +687,38 @@ def update_company_targets(
                 exchange=company.exchange,
                 symbol=company.symbol,
                 version=company.version,
+                previous_base_target=old_targets[0],
+                previous_bull_target=old_targets[1],
                 base_target=company.base_target,
                 bull_target=company.bull_target,
+                base_direction=company.base_direction,
+                bull_direction=company.bull_direction,
                 source="manual",
-                changed_at=datetime.now(timezone.utc),
+                changed_by=update.actor,
+                changed_at=now,
             )
         )
+    session.add(
+        AuditLog(
+            action="company_targets_updated",
+            actor=update.actor,
+            entity_type="company",
+            entity_id=f"{company.exchange}:{company.symbol}",
+            details={
+                "previous_base_target": float(old_targets[0]) if old_targets[0] is not None else None,
+                "previous_bull_target": float(old_targets[1]) if old_targets[1] is not None else None,
+                "base_target": float(company.base_target) if company.base_target is not None else None,
+                "bull_target": float(company.bull_target) if company.bull_target is not None else None,
+                "base_direction": company.base_direction,
+                "bull_direction": company.bull_direction,
+                "base_trigger_mode": company.base_trigger_mode,
+                "bull_trigger_mode": company.bull_trigger_mode,
+                "rearm_policy": company.rearm_policy,
+                "version": company.version,
+            },
+            created_at=now,
+        )
+    )
     try:
         session.commit()
     except StaleDataError as error:
@@ -248,7 +728,48 @@ def update_company_targets(
             detail="Targets changed while saving. Refresh and try again.",
         ) from error
     session.refresh(company)
-    return company
+    quote_by_company, states_by_key = _load_quotes_and_states(session)
+    return _serialize_company(session, company, quote_by_company, states_by_key)
+
+
+@router.put(
+    "/companies/{exchange}/{symbol}/target-config", response_model=CompanyRead
+)
+def update_company_target_config(
+    exchange: str, symbol: str, config: TargetConfigUpdate, session: DbSession
+) -> CompanyRead:
+    identity = (exchange.upper(), symbol.upper())
+    company = session.get(Company, identity)
+    if company is None:
+        raise HTTPException(status_code=404, detail="Company not found.")
+    fields = config.model_fields_set - {"actor"}
+    for field in fields:
+        val = getattr(config, field)
+        if val is not None:
+            setattr(company, field, val)
+    now = datetime.now(timezone.utc)
+    session.add(
+        AuditLog(
+            action="target_config_updated",
+            actor=config.actor,
+            entity_type="company",
+            entity_id=f"{company.exchange}:{company.symbol}",
+            details={
+                "base_direction": company.base_direction,
+                "bull_direction": company.bull_direction,
+                "base_trigger_mode": company.base_trigger_mode,
+                "bull_trigger_mode": company.bull_trigger_mode,
+                "rearm_policy": company.rearm_policy,
+                "cooldown_minutes": company.cooldown_minutes,
+                "monitoring_active": company.monitoring_active,
+            },
+            created_at=now,
+        )
+    )
+    session.commit()
+    session.refresh(company)
+    quote_by_company, states_by_key = _load_quotes_and_states(session)
+    return _serialize_company(session, company, quote_by_company, states_by_key)
 
 
 @router.post("/imports/inspect")
@@ -295,6 +816,35 @@ async def preview_import(
     )
 
 
+@router.get("/imports")
+def list_imports(session: DbSession) -> list[dict[str, Any]]:
+    batches = list(
+        session.scalars(
+            select(ImportBatch)
+            .options(selectinload(ImportBatch.rows))
+            .order_by(ImportBatch.created_at.desc())
+            .limit(50)
+        )
+    )
+    return [
+        {
+            "id": b.id,
+            "filename": b.filename,
+            "status": b.status,
+            "version_number": b.version_number,
+            "uploaded_by": b.uploaded_by,
+            "approved_by": b.approved_by,
+            "approved_at": normalize_utc(b.approved_at) if b.approved_at else None,
+            "created_at": normalize_utc(b.created_at),
+            "sheet_name": b.sheet_name,
+            "row_count": len(b.rows),
+            "result": b.result,
+            "changes_snapshot": b.changes_snapshot,
+        }
+        for b in batches
+    ]
+
+
 @router.get("/imports/{batch_id}")
 def read_import(batch_id: str, session: DbSession) -> dict:
     batch = get_batch(session, batch_id)
@@ -303,6 +853,41 @@ def read_import(batch_id: str, session: DbSession) -> dict:
         for company in session.scalars(select(Company))
     }
     return serialize_batch(batch, companies)
+
+
+@router.put("/imports/{batch_id}/rows/{row_number}")
+def edit_import_row(
+    batch_id: str,
+    row_number: int,
+    payload: ImportRowUpdate,
+    session: DbSession,
+) -> dict[str, Any]:
+    return update_preview_row(session, batch_id, row_number, payload)
+
+
+@router.post("/imports/{batch_id}/reject")
+def reject_import(batch_id: str, session: DbSession) -> dict[str, Any]:
+    batch = get_batch(session, batch_id)
+    if batch.status == "confirmed":
+        raise HTTPException(status_code=409, detail="Confirmed imports cannot be rejected.")
+    batch.status = "rejected"
+    session.add(
+        AuditLog(
+            action="import_rejected",
+            actor="Srushti Kadam",
+            entity_type="import_batch",
+            entity_id=batch.id,
+            details={"filename": batch.filename},
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+    session.commit()
+    return {"id": batch.id, "status": "rejected"}
+
+
+@router.post("/imports/{batch_id}/restore")
+def restore_import(batch_id: str, session: DbSession) -> dict[str, Any]:
+    return restore_import_version(session, batch_id)
 
 
 @router.post("/imports/{batch_id}/confirm")
@@ -318,7 +903,13 @@ def confirm_import(
         raise HTTPException(status_code=404, detail="Import preview not found.")
     if batch.status == "confirmed":
         return batch.result or {"id": batch.id, "status": "confirmed"}
-    invalid_rows = [row.row_number for row in batch.rows if row.errors]
+    if batch.status == "rejected":
+        raise HTTPException(status_code=409, detail="Rejected imports cannot be confirmed.")
+
+    approved_rows = [row for row in batch.rows if row.approval_status != "rejected"]
+    if not approved_rows:
+        raise HTTPException(status_code=409, detail="At least one row must be approved to confirm import.")
+    invalid_rows = [row.row_number for row in approved_rows if row.errors]
     if invalid_rows:
         raise HTTPException(
             status_code=409,
@@ -330,7 +921,7 @@ def confirm_import(
             detail="Review the cached formula target values before confirming this import.",
         )
 
-    identities = [(row.exchange, row.symbol) for row in batch.rows]
+    identities = [(row.exchange, row.symbol) for row in approved_rows]
     companies = {
         identity: company
         for identity in identities
@@ -338,7 +929,7 @@ def confirm_import(
         if (company := session.get(Company, identity)) is not None
     }
     existing_identities = set(companies)
-    for row in batch.rows:
+    for row in approved_rows:
         identity = (row.exchange or "", row.symbol or "")
         existing = companies.get(identity)
         if existing and row.expected_version != existing.version:
@@ -347,24 +938,35 @@ def confirm_import(
                 detail=f"{identity[0]}:{identity[1]} changed after preview. Create a fresh preview before confirming.",
             )
 
+    max_ver = session.scalar(select(func.max(ImportBatch.version_number))) or 0
+    next_version_number = max_ver + 1
+
     created = 0
     updated = 0
     unchanged = 0
+    rejected_count = len(batch.rows) - len(approved_rows)
+    changes_snapshot: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
     try:
-        for row in batch.rows:
+        for row in approved_rows:
             identity = (row.exchange or "", row.symbol or "")
             company = companies.get(identity)
+            is_new = company is None
             if company is None:
                 company = Company(
                     exchange=identity[0],
                     symbol=identity[1],
                     name=row.name or "",
+                    is_approved=True,
+                    monitoring_active=True,
                 )
                 session.add(company)
                 session.flush()
                 companies[identity] = company
                 created += 1
+            else:
+                company.is_approved = True
+
             if row.update_sector:
                 company.sector = row.sector
             if row.update_cmp:
@@ -375,6 +977,45 @@ def confirm_import(
                 company.base_target = row.base_target
             if row.update_bull_target and row.bull_target is not None:
                 company.bull_target = row.bull_target
+
+            if confirmation.default_base_direction:
+                company.base_direction = confirmation.default_base_direction
+            elif row.base_direction:
+                company.base_direction = row.base_direction
+
+            if confirmation.default_bull_direction:
+                company.bull_direction = confirmation.default_bull_direction
+            elif row.bull_direction:
+                company.bull_direction = row.bull_direction
+
+            company.source_metadata = {
+                "import_id": batch.id,
+                "version_number": next_version_number,
+                "filename": batch.filename,
+                "sheet_name": batch.sheet_name,
+                "row_number": row.row_number,
+                "cell_refs": row.cell_refs or {},
+                "imported_at": now.isoformat(),
+                "approved_by": confirmation.approved_by,
+            }
+            register_verified_ticker(company.exchange, company.symbol)
+
+            changes_snapshot.append(
+                {
+                    "exchange": company.exchange,
+                    "symbol": company.symbol,
+                    "name": company.name,
+                    "row_number": row.row_number,
+                    "cell_refs": row.cell_refs or {},
+                    "previous_base_target": float(old_targets[0]) if old_targets[0] is not None and not is_new else None,
+                    "previous_bull_target": float(old_targets[1]) if old_targets[1] is not None and not is_new else None,
+                    "new_base_target": float(company.base_target) if company.base_target is not None else None,
+                    "new_bull_target": float(company.bull_target) if company.bull_target is not None else None,
+                    "base_direction": company.base_direction,
+                    "bull_direction": company.bull_direction,
+                }
+            )
+
             if old_targets != (company.base_target, company.bull_target):
                 company.version += 1
                 if identity in existing_identities:
@@ -384,10 +1025,16 @@ def confirm_import(
                         exchange=company.exchange,
                         symbol=company.symbol,
                         version=company.version,
+                        previous_base_target=old_targets[0] if not is_new else None,
+                        previous_bull_target=old_targets[1] if not is_new else None,
                         base_target=company.base_target,
                         bull_target=company.bull_target,
+                        base_direction=company.base_direction,
+                        bull_direction=company.bull_direction,
                         source="import",
                         import_id=batch.id,
+                        changed_by=confirmation.approved_by,
+                        cell_refs=row.cell_refs,
                         changed_at=now,
                     )
                 )
@@ -395,13 +1042,37 @@ def confirm_import(
                 unchanged += 1
         session.flush()
         batch.status = "confirmed"
+        batch.version_number = next_version_number
+        batch.uploaded_by = confirmation.uploaded_by
+        batch.approved_by = confirmation.approved_by
+        batch.approved_at = now
+        batch.changes_snapshot = changes_snapshot
         batch.result = {
             "id": batch.id,
             "status": "confirmed",
+            "version_number": next_version_number,
             "created": created,
             "updated": updated,
             "unchanged": unchanged,
+            "rejected": rejected_count,
         }
+        session.add(
+            AuditLog(
+                action="import_confirmed",
+                actor=confirmation.approved_by,
+                entity_type="import_batch",
+                entity_id=batch.id,
+                details={
+                    "filename": batch.filename,
+                    "version_number": next_version_number,
+                    "created": created,
+                    "updated": updated,
+                    "unchanged": unchanged,
+                    "rejected": rejected_count,
+                },
+                created_at=now,
+            )
+        )
         session.commit()
     except IntegrityError as error:
         session.rollback()
@@ -419,3 +1090,25 @@ def confirm_import(
         session.rollback()
         raise
     return batch.result
+
+
+@router.get("/audit-logs")
+def list_audit_logs(
+    session: DbSession,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
+    logs = session.scalars(
+        select(AuditLog).order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).limit(limit)
+    )
+    return [
+        {
+            "id": log.id,
+            "action": log.action,
+            "actor": log.actor,
+            "entity_type": log.entity_type,
+            "entity_id": log.entity_id,
+            "details": log.details,
+            "created_at": normalize_utc(log.created_at),
+        }
+        for log in logs
+    ]

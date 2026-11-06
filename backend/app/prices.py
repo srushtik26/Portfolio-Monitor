@@ -6,15 +6,22 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from threading import RLock
 from time import monotonic, sleep
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .models import Company, PriceQuote, TargetAlert, TargetRevision
-from .notifications import create_dry_run_outbox
+from .models import (
+    AuditLog,
+    Company,
+    PriceQuote,
+    TargetAlert,
+    TargetAlertState,
+    TargetRevision,
+)
+from .notifications import queue_alert_notifications
 
 logger = logging.getLogger(__name__)
 INDIA_TZ = ZoneInfo("Asia/Kolkata")
@@ -66,7 +73,7 @@ class ExchangeCalendar(Protocol):
 
 
 class FixturePriceProvider:
-    """Explicit test/demo quotes. These are always simulated and never alert eligible."""
+    """Explicit test/demo quotes. These are always simulated and never live-alert eligible."""
 
     name = "fixture"
     is_simulated = True
@@ -96,14 +103,117 @@ class FixturePriceProvider:
         )
 
 
+_VERIFIED_INDIAN_STOCKS_NSE = (
+    "TEGA",
+    "BHEL",
+    "RELIANCE",
+    "HDFCBANK",
+    "TCS",
+    "ICICIBANK",
+    "INFY",
+    "BHARTIARTL",
+    "ITC",
+    "LT",
+    "SBIN",
+    "HINDUNILVR",
+    "AXISBANK",
+    "WIPRO",
+    "TATAMOTORS",
+    "MARUTI",
+    "ASIANPAINT",
+    "BAJFINANCE",
+    "SUNPHARMA",
+    "TITAN",
+    "ADANIPORTS",
+    "KOTAKBANK",
+    "NTPC",
+    "POWERGRID",
+    "ULTRACEMCO",
+    "NESTLEIND",
+    "HCLTECH",
+    "TECHM",
+    "M&M",
+    "TATASTEEL",
+    "JSWSTEEL",
+    "COALINDIA",
+    "DRREDDY",
+    "CIPLA",
+    "BAJAJ-AUTO",
+    "EICHERMOT",
+    "INDUSINDBK",
+    "APOLLOHOSP",
+    "TRENT",
+    "ZOMATO",
+    "BEL",
+    "SBILIFE",
+    "HAL",
+    "ONGC",
+    "ADANIENT",
+    "PFC",
+    "RECLTD",
+    "IRCTC",
+    "POLYCAB",
+    "DIXON",
+    "SIEMENS",
+    "ABB",
+    "PIDILITIND",
+    "GRASIM",
+    "HINDALCO",
+    "VEDL",
+    "SHREECEM",
+    "BRITANNIA",
+    "DIVISLAB",
+    "TATACONSUM",
+    "HEROMOTOCO",
+    "BPCL",
+    "IOC",
+    "GAIL",
+)
+
+_VERIFIED_INDIAN_STOCKS_BSE = (
+    "BHEL",
+    "RELIANCE",
+    "HDFCBANK",
+    "TCS",
+    "ICICIBANK",
+    "INFY",
+    "SBIN",
+    "LT",
+    "TRENT",
+    "SBILIFE",
+    "BEL",
+    "TATAMOTORS",
+    "TATASTEEL",
+    "ITC",
+    "ZOMATO",
+    "HAL",
+    "NTPC",
+    "POWERGRID",
+    "COALINDIA",
+    "ONGC",
+)
+
 YAHOO_TICKER_MAP: dict[tuple[str, str], str] = {
-    ("NSE", "TEGA"): "TEGA.NS",
+    **{("NSE", sym): f"{sym}.NS" for sym in _VERIFIED_INDIAN_STOCKS_NSE},
+    **{("BSE", sym): f"{sym}.BO" for sym in _VERIFIED_INDIAN_STOCKS_BSE},
 }
+
 YFINANCE_STALE_AFTER_SECONDS = 5 * 60
 YFINANCE_CACHE_TTL_SECONDS = 60
 YFINANCE_MAX_RETRIES = 3
 YFINANCE_BACKOFF_BASE_SECONDS = 2
 YFINANCE_BACKOFF_MAX_SECONDS = 30
+
+
+def register_verified_ticker(exchange: str, symbol: str) -> str:
+    """Register an approved company symbol in the explicit Yahoo Finance ticker map."""
+    identity = (exchange.strip().upper(), symbol.strip().upper())
+    suffix = {"NSE": ".NS", "BSE": ".BO"}.get(identity[0])
+    if suffix is None:
+        raise ProviderError(f"Unsupported exchange for ticker mapping: {identity[0]}")
+    ticker = f"{identity[1]}{suffix}"
+    YAHOO_TICKER_MAP[identity] = ticker
+    return ticker
 
 
 def yahoo_ticker_for(exchange: str, symbol: str) -> str:
@@ -133,7 +243,7 @@ def _environment_integer(name: str, default: int, minimum: int, maximum: int) ->
 
 
 class YFinanceProvider:
-    """Unofficial Yahoo Finance 1-minute candle-close adapter, not guaranteed real time."""
+    """Yahoo Finance 1-minute candle-close adapter with batching, caching, and bounded retries."""
 
     name = "yfinance"
     is_simulated = False
@@ -187,6 +297,17 @@ class YFinanceProvider:
             keepna=False,
             timeout=10,
         )
+        if getattr(history, "empty", True):
+            history = yahoo_ticker.history(
+                period="5d",
+                interval="1m",
+                auto_adjust=False,
+                prepost=False,
+                actions=False,
+                repair=False,
+                keepna=False,
+                timeout=10,
+            )
         if getattr(history, "empty", True):
             return history
         metadata = yahoo_ticker.get_history_metadata()
@@ -334,7 +455,6 @@ class YFinanceProvider:
     def fetch_quotes(
         self, instruments: list[tuple[str, str]]
     ) -> dict[tuple[str, str], ProviderQuote]:
-        # yfinance's download API batches tickers, but only use explicitly verified mappings.
         mapped = {
             (exchange.strip().upper(), symbol.strip().upper()): yahoo_ticker_for(
                 exchange, symbol
@@ -396,6 +516,9 @@ class YFinanceProvider:
             ticker = mapped[identity]
             try:
                 ticker_frame = frame[ticker]
+                if not hasattr(ticker_frame, "attrs") or "currency" not in ticker_frame.attrs:
+                    if hasattr(ticker_frame, "attrs"):
+                        ticker_frame.attrs["currency"] = "INR"
             except (KeyError, TypeError) as error:
                 raise ProviderError(f"Yahoo Finance batch response omitted {ticker}.") from error
             quote = self._quote_from_history(identity, ticker, ticker_frame)
@@ -418,6 +541,62 @@ class FixtureExchangeCalendar:
     def session_for(self, exchange: str, session_date: date) -> ExchangeSession | None:
         if exchange not in {"NSE", "BSE"}:
             return None
+        if session_date in self.special_sessions:
+            return self.special_sessions[session_date]
+        if session_date.weekday() >= 5 or session_date in self.holidays:
+            return None
+        return self.regular_session
+
+    def is_open(self, exchange: str, at: datetime) -> bool:
+        local_time = at.astimezone(INDIA_TZ)
+        session = self.session_for(exchange, local_time.date())
+        return session is not None and session.opens_at <= local_time.time() <= session.closes_at
+
+
+class NseBseExchangeCalendar:
+    """Authoritative NSE & BSE Indian equity market calendar (Asia/Kolkata)."""
+
+    name = "nse_bse"
+    regular_session = ExchangeSession(time(9, 15), time(15, 30))
+    holidays = frozenset(
+        {
+            # 2026 NSE/BSE trading holidays
+            date(2026, 1, 26),  # Republic Day
+            date(2026, 2, 15),  # Maha Shivaratri
+            date(2026, 3, 3),   # Holi
+            date(2026, 3, 20),  # Id-Ul-Fitr
+            date(2026, 3, 26),  # Shri Ram Navami
+            date(2026, 3, 31),  # Shri Mahavir Jayanti
+            date(2026, 4, 3),   # Good Friday
+            date(2026, 4, 14),  # Dr. Baba Saheb Ambedkar Jayanti
+            date(2026, 5, 1),   # Maharashtra Day
+            date(2026, 5, 27),  # Bakri Id
+            date(2026, 6, 26),  # Muharram
+            date(2026, 8, 15),  # Independence Day
+            date(2026, 9, 14),  # Ganesh Chaturthi
+            date(2026, 10, 2),  # Mahatma Gandhi Jayanti
+            date(2026, 10, 20), # Dussehra
+            date(2026, 11, 10), # Diwali Balipratipada
+            date(2026, 11, 24), # Gurunanak Jayanti
+            date(2026, 12, 25), # Christmas
+        }
+    )
+    special_sessions = {
+        date(2026, 11, 8): ExchangeSession(time(18, 0), time(19, 0)),  # Diwali Muhurat Trading
+    }
+
+    def __init__(self, *, allow_extended_hours: bool | None = None) -> None:
+        self.allow_extended_hours = (
+            allow_extended_hours
+            if allow_extended_hours is not None
+            else os.environ.get("MARKET_HOURS_OVERRIDE", "").strip().lower() == "always_open"
+        )
+
+    def session_for(self, exchange: str, session_date: date) -> ExchangeSession | None:
+        if exchange not in {"NSE", "BSE"}:
+            return None
+        if self.allow_extended_hours:
+            return ExchangeSession(time(0, 0), time(23, 59, 59))
         if session_date in self.special_sessions:
             return self.special_sessions[session_date]
         if session_date.weekday() >= 5 or session_date in self.holidays:
@@ -461,6 +640,121 @@ def serialize_quote(quote: PriceQuote, now: datetime | None = None) -> dict[str,
     }
 
 
+def serialize_alert_state(
+    company: Company,
+    kind: str,
+    state_row: TargetAlertState | None,
+) -> dict[str, Any]:
+    direction = company.base_direction if kind == "base" else company.bull_direction
+    trigger_mode = company.base_trigger_mode if kind == "base" else company.bull_trigger_mode
+    target_val = company.base_target if kind == "base" else company.bull_target
+    if target_val is None or direction == "pending":
+        effective_state = "pending_configuration"
+    elif state_row is not None:
+        effective_state = state_row.state
+    else:
+        effective_state = "armed"
+    return {
+        "target_kind": kind,
+        "state": effective_state,
+        "comparison_direction": direction,
+        "trigger_mode": trigger_mode,
+        "rearm_policy": company.rearm_policy,
+        "last_evaluated_price": float(state_row.last_evaluated_price)
+        if state_row and state_row.last_evaluated_price is not None
+        else None,
+        "last_evaluated_at": normalize_utc(state_row.last_evaluated_at)
+        if state_row and state_row.last_evaluated_at
+        else None,
+        "last_condition_met": bool(state_row.last_condition_met) if state_row else False,
+        "last_triggered_at": normalize_utc(state_row.last_triggered_at)
+        if state_row and state_row.last_triggered_at
+        else None,
+        "last_triggered_price": float(state_row.last_triggered_price)
+        if state_row and state_row.last_triggered_price is not None
+        else None,
+        "last_alert_id": state_row.last_alert_id if state_row else None,
+        "trigger_cycle": state_row.trigger_cycle if state_row else 0,
+        "acknowledged_at": normalize_utc(state_row.acknowledged_at)
+        if state_row and state_row.acknowledged_at
+        else None,
+        "resolved_at": normalize_utc(state_row.resolved_at)
+        if state_row and state_row.resolved_at
+        else None,
+        "reset_at": normalize_utc(state_row.reset_at)
+        if state_row and state_row.reset_at
+        else None,
+    }
+
+
+def enrich_company_dict(
+    company: Company,
+    company_data: dict[str, Any],
+    quote_data: dict[str, Any] | None,
+    base_state: TargetAlertState | None = None,
+    bull_state: TargetAlertState | None = None,
+) -> dict[str, Any]:
+    company_data["latest_quote"] = quote_data
+    base_state_dict = serialize_alert_state(company, "base", base_state)
+    bull_state_dict = serialize_alert_state(company, "bull", bull_state)
+    company_data["base_alert_state"] = base_state_dict
+    company_data["bull_alert_state"] = bull_state_dict
+
+    live_price: Decimal | None = None
+    if quote_data is not None and quote_data.get("price") is not None:
+        live_price = Decimal(str(quote_data["price"]))
+
+    dist_base_abs: float | None = None
+    dist_base_pct: float | None = None
+    dist_bull_abs: float | None = None
+    dist_bull_pct: float | None = None
+    nearest_pct: float | None = None
+
+    if live_price is not None:
+        if company.base_target is not None and company.base_target > 0:
+            diff_base = live_price - company.base_target
+            dist_base_abs = round(float(diff_base), 2)
+            dist_base_pct = round(float((diff_base / company.base_target) * Decimal("100")), 2)
+        if company.bull_target is not None and company.bull_target > 0:
+            diff_bull = live_price - company.bull_target
+            dist_bull_abs = round(float(diff_bull), 2)
+            dist_bull_pct = round(float((diff_bull / company.bull_target) * Decimal("100")), 2)
+        candidates = [abs(x) for x in (dist_base_pct, dist_bull_pct) if x is not None]
+        if candidates:
+            nearest_pct = round(min(candidates), 2)
+
+    company_data["distance_to_base_abs"] = dist_base_abs
+    company_data["distance_to_base_pct"] = dist_base_pct
+    company_data["distance_to_bull_abs"] = dist_bull_abs
+    company_data["distance_to_bull_pct"] = dist_bull_pct
+    company_data["nearest_target_pct"] = nearest_pct
+
+    if not company.is_approved:
+        alert_status = "pending_approval"
+    elif not company.monitoring_active:
+        alert_status = "paused"
+    elif (
+        (company.base_target is not None and company.base_direction == "pending")
+        or (company.bull_target is not None and company.bull_direction == "pending")
+    ):
+        alert_status = "pending_configuration"
+    elif base_state_dict["state"] == "triggered" and bull_state_dict["state"] == "triggered":
+        alert_status = "both_triggered"
+    elif base_state_dict["state"] == "triggered":
+        alert_status = "base_triggered"
+    elif bull_state_dict["state"] == "triggered":
+        alert_status = "bull_triggered"
+    elif quote_data is not None and not quote_data.get("is_fresh") and not quote_data.get("is_simulated"):
+        alert_status = "stale_quote"
+    elif nearest_pct is not None and nearest_pct <= 2.0:
+        alert_status = "approaching"
+    else:
+        alert_status = "monitoring"
+
+    company_data["alert_status"] = alert_status
+    return company_data
+
+
 def _validated_price(raw_price: Decimal) -> Decimal:
     try:
         price = Decimal(str(raw_price))
@@ -471,6 +765,209 @@ def _validated_price(raw_price: Decimal) -> Decimal:
     if price.as_tuple().exponent < -6:
         raise ValueError("Provider returned a price with more than six decimal places.")
     return price
+
+
+def _evaluate_company_target(
+    session: Session,
+    *,
+    company: Company,
+    revision: TargetRevision,
+    recorded_quote: PriceQuote,
+    kind: str,
+    current_time: datetime,
+) -> TargetAlert | None:
+    target = company.base_target if kind == "base" else company.bull_target
+    direction = company.base_direction if kind == "base" else company.bull_direction
+    trigger_mode = company.base_trigger_mode if kind == "base" else company.bull_trigger_mode
+    price = recorded_quote.price
+    is_simulated = recorded_quote.is_simulated
+
+    state_key = (company.exchange, company.symbol, kind, is_simulated)
+    state_row = session.get(TargetAlertState, state_key)
+    if state_row is None:
+        state_row = TargetAlertState(
+            exchange=company.exchange,
+            symbol=company.symbol,
+            target_kind=kind,
+            is_simulated=is_simulated,
+            state="armed",
+            target_revision_id=revision.id,
+            last_condition_met=False,
+            trigger_cycle=0,
+        )
+        session.add(state_row)
+        session.flush()
+
+    if state_row.target_revision_id != revision.id:
+        state_row.target_revision_id = revision.id
+        state_row.state = "armed"
+        state_row.last_condition_met = False
+        state_row.last_evaluated_price = None
+        state_row.last_evaluated_at = None
+        state_row.trigger_cycle = 0
+        state_row.acknowledged_at = None
+        state_row.resolved_at = None
+        state_row.reset_at = None
+
+    if target is None or direction == "pending":
+        state_row.state = "pending_configuration"
+        state_row.last_evaluated_price = price
+        state_row.last_evaluated_at = current_time
+        state_row.last_condition_met = False
+        return None
+
+    if state_row.state == "pending_configuration":
+        state_row.state = "armed"
+
+    prev_price = state_row.last_evaluated_price
+    was_condition_met = state_row.last_condition_met
+
+    if direction == "below":
+        condition_met = price <= target
+        crossed = prev_price is not None and prev_price > target and price <= target
+    elif direction == "above":
+        condition_met = price >= target
+        crossed = prev_price is not None and prev_price < target and price >= target
+    else:
+        state_row.state = "pending_configuration"
+        state_row.last_evaluated_price = price
+        state_row.last_evaluated_at = current_time
+        return None
+
+    if trigger_mode == "crosses":
+        qualifies = crossed
+    else:
+        qualifies = condition_met
+
+    # Handle re-arming policies when condition recovers or cooldown expires
+    if not condition_met and was_condition_met:
+        if company.rearm_policy == "rearm_after_recovery" and state_row.state in (
+            "triggered",
+            "acknowledged",
+            "resolved",
+        ):
+            state_row.state = "armed"
+
+    if (
+        company.rearm_policy == "cooldown"
+        and state_row.state in ("triggered", "acknowledged", "resolved")
+        and state_row.last_triggered_at is not None
+    ):
+        last_trig = normalize_utc(state_row.last_triggered_at)
+        if current_time - last_trig >= timedelta(minutes=max(1, company.cooldown_minutes)):
+            state_row.state = "armed"
+
+    state_row.last_evaluated_price = price
+    state_row.last_evaluated_at = current_time
+    state_row.last_condition_met = condition_met
+
+    if not qualifies or state_row.state != "armed":
+        return None
+
+    next_cycle = state_row.trigger_cycle + 1
+    try:
+        with session.begin_nested():
+            event = TargetAlert(
+                target_revision_id=revision.id,
+                target_kind=kind,
+                quote_id=recorded_quote.id,
+                triggered_at=current_time,
+                price=price,
+                is_simulated=is_simulated,
+                trigger_cycle=next_cycle,
+                comparison_direction=direction,
+                trigger_mode=trigger_mode,
+                target_price_snapshot=target,
+                lifecycle_status="active",
+            )
+            session.add(event)
+            session.flush()
+            queue_alert_notifications(
+                session,
+                event,
+                now=current_time,
+            )
+            state_row.state = "triggered"
+            state_row.trigger_cycle = next_cycle
+            state_row.last_triggered_at = current_time
+            state_row.last_triggered_price = price
+            state_row.last_alert_id = event.id
+            return event
+    except IntegrityError:
+        logger.info(
+            "Target alert already exists for revision %s (%s, cycle %s).",
+            revision.id,
+            kind,
+            next_cycle,
+        )
+        state_row.state = "triggered"
+        return None
+
+
+def apply_alert_lifecycle_action(
+    session: Session,
+    alert_id: int,
+    action: str,
+    *,
+    actor: str = "Srushti Kadam",
+    now: datetime | None = None,
+) -> TargetAlert:
+    current_time = normalize_utc(now or datetime.now(timezone.utc))
+    alert = session.get(TargetAlert, alert_id)
+    if alert is None:
+        raise ValueError(f"Alert {alert_id} not found.")
+    revision = session.get(TargetRevision, alert.target_revision_id)
+    if revision is None:
+        raise ValueError(f"Revision for alert {alert_id} not found.")
+    state_key = (revision.exchange, revision.symbol, alert.target_kind, alert.is_simulated)
+    state_row = session.get(TargetAlertState, state_key)
+
+    if action == "acknowledge":
+        alert.lifecycle_status = "acknowledged"
+        alert.acknowledged_at = current_time
+        if state_row is not None and state_row.state == "triggered":
+            state_row.state = "acknowledged"
+            state_row.acknowledged_at = current_time
+    elif action == "resolve":
+        alert.lifecycle_status = "resolved"
+        alert.resolved_at = current_time
+        if state_row is not None:
+            company = session.get(Company, (revision.exchange, revision.symbol))
+            if company and company.rearm_policy in ("rearm_on_reset", "rearm_after_recovery"):
+                state_row.state = "armed"
+                state_row.last_condition_met = False
+            else:
+                state_row.state = "resolved"
+            state_row.resolved_at = current_time
+    elif action == "reset":
+        alert.lifecycle_status = "reset"
+        alert.reset_at = current_time
+        if state_row is not None:
+            state_row.state = "armed"
+            state_row.last_condition_met = False
+            state_row.last_evaluated_price = None
+            state_row.reset_at = current_time
+    else:
+        raise ValueError(f"Unsupported alert action: {action}")
+
+    session.add(
+        AuditLog(
+            action=f"alert_{action}",
+            actor=actor,
+            entity_type="target_alert",
+            entity_id=str(alert.id),
+            details={
+                "exchange": revision.exchange,
+                "symbol": revision.symbol,
+                "target_kind": alert.target_kind,
+                "trigger_cycle": alert.trigger_cycle,
+            },
+            created_at=current_time,
+        )
+    )
+    session.commit()
+    session.refresh(alert)
+    return alert
 
 
 def record_quote(
@@ -494,7 +991,7 @@ def record_quote(
         raise ValueError("Provider currency must be a three-letter uppercase code.")
     if not isinstance(quote.is_simulated, bool):
         raise ValueError("Quote simulation status is invalid.")
-    if quote.quote_type not in {"last_trade", "candle_close", "fixture", "provider_quote"}:
+    if quote.quote_type not in {"last_trade", "candle_close", "fixture", "provider_quote", "websocket_tick"}:
         raise ValueError("Quote type is invalid.")
     if not isinstance(quote.freshness_seconds, int) or quote.freshness_seconds < 1:
         raise ValueError("Quote freshness threshold must be a positive number of seconds.")
@@ -539,48 +1036,42 @@ def record_quote(
     session.flush()
 
     alert_eligible = (
-        alerts_enabled and status == "fresh" and not quote.is_simulated
-    ) or (
-        fixture_alerts_enabled and status == "simulated" and quote.is_simulated
+        (
+            alerts_enabled
+            and status == "fresh"
+            and not quote.is_simulated
+            and company.is_approved
+            and company.monitoring_active
+        )
+        or (
+            fixture_alerts_enabled
+            and status == "simulated"
+            and quote.is_simulated
+            and company.is_approved
+            and company.monitoring_active
+        )
     )
     if alert_eligible:
         revision = session.scalar(
-            select(TargetRevision).where(
+            select(TargetRevision)
+            .where(
                 TargetRevision.exchange == identity[0],
                 TargetRevision.symbol == identity[1],
-                TargetRevision.version == company.version,
+                TargetRevision.version <= company.version,
             )
+            .order_by(TargetRevision.version.desc(), TargetRevision.id.desc())
+            .limit(1)
         )
         if revision is not None:
-            for kind, target in (
-                ("base", company.base_target),
-                ("bull", company.bull_target),
-            ):
-                if target is None or price < target:
-                    continue
-                try:
-                    with session.begin_nested():
-                        event = TargetAlert(
-                            target_revision_id=revision.id,
-                            target_kind=kind,
-                            quote_id=recorded.id,
-                            triggered_at=current_time,
-                            price=price,
-                            is_simulated=quote.is_simulated,
-                        )
-                        session.add(event)
-                        session.flush()
-                        create_dry_run_outbox(
-                            session,
-                            event,
-                            now=current_time,
-                        )
-                except IntegrityError:
-                    logger.info(
-                        "Target alert already exists for revision %s (%s).",
-                        revision.id,
-                        kind,
-                    )
+            for kind in ("base", "bull"):
+                _evaluate_company_target(
+                    session,
+                    company=company,
+                    revision=revision,
+                    recorded_quote=recorded,
+                    kind=kind,
+                    current_time=current_time,
+                )
 
     session.commit()
     session.refresh(recorded)

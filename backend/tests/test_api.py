@@ -122,19 +122,23 @@ def test_companies_return_imported_cmp_without_using_it_as_a_quote(client: TestC
     response = client.get("/api/companies")
 
     assert response.status_code == 200
-    assert response.json() == [
-        {
-            "name": "Example Company",
-            "symbol": "EXAMPLE",
-            "exchange": "NSE",
-            "sector": "Technology",
-            "cmp": 101.25,
-            "base_target": 100.0,
-            "bull_target": 125.0,
-            "version": 1,
-            "latest_quote": None,
-        }
-    ]
+    data = response.json()
+    assert len(data) == 1
+    item = data[0]
+    assert item["name"] == "Example Company"
+    assert item["symbol"] == "EXAMPLE"
+    assert item["exchange"] == "NSE"
+    assert item["sector"] == "Technology"
+    assert item["cmp"] == 101.25
+    assert item["base_target"] == 100.0
+    assert item["bull_target"] == 125.0
+    assert item["version"] == 1
+    assert item["latest_quote"] is None
+    assert item["distance_to_base_abs"] is None
+    assert item["distance_to_base_pct"] is None
+    assert item["distance_to_bull_abs"] is None
+    assert item["distance_to_bull_pct"] is None
+    assert item["alert_status"] == "monitoring"
 
 
 def test_exchange_and_symbol_are_company_identity(client: TestClient) -> None:
@@ -1102,3 +1106,478 @@ def test_confirmed_import_and_history_survive_database_reopen() -> None:
             assert batch is not None
             assert batch.status == "confirmed"
         reopened_engine.dispose()
+
+
+def test_bhel_downward_base_and_upward_bull_target_directions_and_crosses(
+    client: TestClient,
+) -> None:
+    """Covers BHEL example (Saved CMP 433.70, Base Target 426.91 downward, Bull Target 561.09 upward)
+    plus crosses vs at_or_beyond trigger modes."""
+    with TestSession() as session:
+        company = Company(
+            exchange="NSE",
+            symbol="BHEL",
+            name="Bharat Heavy Electricals Ltd",
+            sector="Capital Goods",
+            cmp=Decimal("433.70"),
+            base_target=Decimal("426.91"),
+            bull_target=Decimal("561.09"),
+            base_direction="below",
+            bull_direction="above",
+            base_trigger_mode="crosses",
+            bull_trigger_mode="crosses",
+            rearm_policy="rearm_after_recovery",
+        )
+        session.add(company)
+        session.flush()
+        session.add(
+            TargetRevision(
+                exchange="NSE",
+                symbol="BHEL",
+                version=1,
+                base_target=company.base_target,
+                bull_target=company.bull_target,
+                base_direction="below",
+                bull_direction="above",
+                source="import",
+                changed_at=datetime(2026, 11, 3, 9, tzinfo=timezone.utc),
+            )
+        )
+        session.commit()
+
+        start = datetime(2026, 11, 3, 9, 15, tzinfo=timezone.utc)
+        # 1. Quote at 430.00 (between base 426.91 and bull 561.09) -> no alert
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="BHEL",
+                price=Decimal("430.00"),
+                currency="INR",
+                provider="test-provider",
+                quoted_at=start,
+                is_simulated=False,
+            ),
+            now=start,
+            alerts_enabled=True,
+        )
+        assert session.scalar(select(func.count(TargetAlert.id))) == 0
+
+        # 2. Quote crosses downward to 426.85 (<= 426.91 from 430.00) -> triggers Base alert
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="BHEL",
+                price=Decimal("426.85"),
+                currency="INR",
+                provider="test-provider",
+                quoted_at=start + timedelta(seconds=10),
+                is_simulated=False,
+            ),
+            now=start + timedelta(seconds=10),
+            alerts_enabled=True,
+        )
+        alerts = list(session.scalars(select(TargetAlert)))
+        assert len(alerts) == 1
+        assert alerts[0].target_kind == "base"
+        assert alerts[0].comparison_direction == "below"
+        assert alerts[0].price == Decimal("426.850000")
+        assert alerts[0].target_price_snapshot == Decimal("426.910000")
+
+        # 3. Repeated downward quote 425.00 does NOT duplicate alert
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="BHEL",
+                price=Decimal("425.00"),
+                currency="INR",
+                provider="test-provider",
+                quoted_at=start + timedelta(seconds=20),
+                is_simulated=False,
+            ),
+            now=start + timedelta(seconds=20),
+            alerts_enabled=True,
+        )
+        assert session.scalar(select(func.count(TargetAlert.id))) == 1
+
+        # 4. Recovery back to 440.00 re-arms Base under rearm_after_recovery
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="BHEL",
+                price=Decimal("440.00"),
+                currency="INR",
+                provider="test-provider",
+                quoted_at=start + timedelta(seconds=30),
+                is_simulated=False,
+            ),
+            now=start + timedelta(seconds=30),
+            alerts_enabled=True,
+        )
+
+        # 5. Crosses upward to 562.00 (>= 561.09 from 440.00) -> triggers Bull alert
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="BHEL",
+                price=Decimal("562.00"),
+                currency="INR",
+                provider="test-provider",
+                quoted_at=start + timedelta(seconds=40),
+                is_simulated=False,
+            ),
+            now=start + timedelta(seconds=40),
+            alerts_enabled=True,
+        )
+        assert session.scalar(select(func.count(TargetAlert.id))) == 2
+
+    # Verify distance metrics via API
+    companies = client.get("/api/companies").json()
+    bhel = companies[0]
+    assert bhel["symbol"] == "BHEL"
+    assert bhel["base_direction"] == "below"
+    assert bhel["bull_direction"] == "above"
+    assert bhel["alert_status"] == "bull_triggered"
+    assert bhel["distance_to_bull_abs"] > 0
+
+
+def test_pending_target_direction_does_not_trigger_until_configured(
+    client: TestClient,
+) -> None:
+    with TestSession() as session:
+        company = Company(
+            exchange="NSE",
+            symbol="PEND",
+            name="Pending Config Co",
+            base_target=Decimal("100.00"),
+            bull_target=Decimal("150.00"),
+            base_direction="pending",
+            bull_direction="pending",
+        )
+        session.add(company)
+        session.flush()
+        session.add(
+            TargetRevision(
+                exchange="NSE",
+                symbol="PEND",
+                version=1,
+                base_target=company.base_target,
+                bull_target=company.bull_target,
+                base_direction="pending",
+                bull_direction="pending",
+                source="manual",
+                changed_at=datetime(2026, 11, 3, 9, tzinfo=timezone.utc),
+            )
+        )
+        session.commit()
+
+        now = datetime(2026, 11, 3, 9, 30, tzinfo=timezone.utc)
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="PEND",
+                price=Decimal("90.00"),
+                currency="INR",
+                provider="test-provider",
+                quoted_at=now,
+                is_simulated=False,
+            ),
+            now=now,
+            alerts_enabled=True,
+        )
+        assert session.scalar(select(func.count(TargetAlert.id))) == 0
+
+    data = client.get("/api/companies").json()[0]
+    assert data["alert_status"] == "pending_configuration"
+
+    # Configure direction via API
+    updated = client.put(
+        "/api/companies/NSE/PEND/target-config",
+        json={
+            "base_direction": "below",
+            "bull_direction": "above",
+            "base_trigger_mode": "at_or_beyond",
+            "bull_trigger_mode": "at_or_beyond",
+            "rearm_policy": "rearm_on_reset",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["base_direction"] == "below"
+
+
+def test_alert_lifecycle_acknowledge_resolve_reset_and_rearm_policies(
+    client: TestClient,
+) -> None:
+    with TestSession() as session:
+        company = _create_price_company(session, symbol="REARM")
+        company.rearm_policy = "rearm_on_reset"
+        session.commit()
+
+        now = datetime(2026, 11, 3, 10, tzinfo=timezone.utc)
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="REARM",
+                price=Decimal("105.00"),
+                currency="INR",
+                provider="test-provider",
+                quoted_at=now,
+                is_simulated=False,
+            ),
+            now=now,
+            alerts_enabled=True,
+        )
+        alert = session.scalar(select(TargetAlert))
+        assert alert is not None
+        alert_id = alert.id
+
+    ack = client.post(
+        f"/api/alerts/{alert_id}/action",
+        json={"action": "acknowledge", "actor": "analyst"},
+    )
+    assert ack.status_code == 200
+    assert ack.json()["lifecycle_status"] == "acknowledged"
+
+    reset = client.post(
+        f"/api/alerts/{alert_id}/action",
+        json={"action": "reset", "actor": "analyst"},
+    )
+    assert reset.status_code == 200
+    assert reset.json()["lifecycle_status"] == "reset"
+
+    # Now a subsequent quote triggers a second alert on the same revision
+    with TestSession() as session:
+        later = datetime(2026, 11, 3, 10, 5, tzinfo=timezone.utc)
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="REARM",
+                price=Decimal("106.00"),
+                currency="INR",
+                provider="test-provider",
+                quoted_at=later,
+                is_simulated=False,
+            ),
+            now=later,
+            alerts_enabled=True,
+        )
+        assert session.scalar(select(func.count(TargetAlert.id))) == 2
+
+
+def test_excel_workflow_cell_refs_inline_edit_row_reject_and_version_restore(
+    client: TestClient,
+) -> None:
+    # Upload v1
+    v1_preview = csv_upload(
+        client,
+        "Exchange,Symbol,Company,CMP,Base,Bull\n"
+        "NSE,BHEL,BHEL Ltd,433.70,426.91,561.09\n"
+        "NSE,BADROW,Bad Co,100,-5,200\n",
+    ).json()
+
+    assert v1_preview["rows"][0]["cell_refs"]["base_target"] == "E2"
+    assert v1_preview["rows"][0]["base_direction"] == "below"
+    assert v1_preview["rows"][0]["bull_direction"] == "above"
+    assert v1_preview["invalid_rows"] == 1
+
+    # Reject the invalid row inline so the batch can be confirmed
+    edit_res = client.put(
+        f"/api/imports/{v1_preview['id']}/rows/3",
+        json={"approval_status": "rejected"},
+    )
+    assert edit_res.status_code == 200
+    assert edit_res.json()["invalid_rows"] == 0
+
+    confirm_v1 = client.post(
+        f"/api/imports/{v1_preview['id']}/confirm",
+        json={"uploaded_by": "portfolio_mgr"},
+    )
+    assert confirm_v1.status_code == 200
+    assert confirm_v1.json()["version_number"] == 1
+
+    # Upload v2 with updated targets
+    v2_preview = csv_upload(
+        client,
+        "Exchange,Symbol,Company,CMP,Base,Bull\n"
+        "NSE,BHEL,BHEL Ltd,433.70,410.00,580.00\n",
+    ).json()
+    confirm_v2 = client.post(
+        f"/api/imports/{v2_preview['id']}/confirm",
+        json={"uploaded_by": "portfolio_mgr"},
+    )
+    assert confirm_v2.status_code == 200
+    assert confirm_v2.json()["version_number"] == 2
+    assert client.get("/api/companies").json()[0]["base_target"] == 410.0
+
+    # Restore v1
+    restored = client.post(f"/api/imports/{v1_preview['id']}/restore")
+    assert restored.status_code == 200
+    assert client.get("/api/companies").json()[0]["base_target"] == 426.91
+
+
+def test_multi_channel_notification_delivery_and_formatted_email_spool(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool_dir = tmp_path / "email_spool"
+    monkeypatch.setenv("SMTP_SPOOL_DIR", str(spool_dir))
+    monkeypatch.setenv("NOTIFICATION_DELIVERY_MODE", "live")
+
+    # Enable email notifications with recipient
+    pref_res = client.put(
+        "/api/notifications/preferences",
+        json={
+            "dashboard_enabled": True,
+            "email_enabled": True,
+            "email_recipients": "alerts@plutuswealth.com",
+            "notify_on_base": True,
+            "notify_on_bull": True,
+            "notify_on_stale": True,
+        },
+    )
+    assert pref_res.status_code == 200
+    assert pref_res.json()["email_enabled"] is True
+
+    with TestSession() as session:
+        company = Company(
+            exchange="NSE",
+            symbol="BHEL",
+            name="BHEL",
+            base_target=Decimal("426.91"),
+            bull_target=Decimal("561.09"),
+            base_direction="below",
+            bull_direction="above",
+        )
+        session.add(company)
+        session.flush()
+        session.add(
+            TargetRevision(
+                exchange="NSE",
+                symbol="BHEL",
+                version=1,
+                base_target=company.base_target,
+                bull_target=company.bull_target,
+                base_direction="below",
+                bull_direction="above",
+                source="import",
+                changed_at=datetime(2026, 11, 3, 9, tzinfo=timezone.utc),
+            )
+        )
+        session.commit()
+
+        now = datetime(2026, 11, 3, 9, 30, tzinfo=timezone.utc)
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="BHEL",
+                price=Decimal("426.85"),
+                currency="INR",
+                provider="yfinance",
+                quoted_at=now,
+                is_simulated=False,
+            ),
+            now=now,
+            alerts_enabled=True,
+        )
+
+    drain_res = client.post("/api/notifications/drain")
+    assert drain_res.status_code == 200
+    assert drain_res.json()["sent"] >= 2  # dashboard + email
+
+    spooled_files = list(spool_dir.glob("*.eml"))
+    assert len(spooled_files) == 1
+    email_text = spooled_files[0].read_text(encoding="utf-8")
+    assert "Subject: Price Target Alert" in email_text
+    assert "BHEL has reached its configured Base Target Price." in email_text
+    assert "Target Price: ₹426.91" in email_text
+    assert "Current Price: ₹426.85" in email_text
+    assert "Price Direction: Downward" in email_text
+
+
+def test_scale_40_companies_monitoring_and_nse_bse_calendar(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.prices import NseBseExchangeCalendar
+
+    monkeypatch.setenv("ALERT_RULES_ENABLED", "true")
+    cal = NseBseExchangeCalendar()
+    # Tuesday during market hours (10:00 IST = 04:30 UTC)
+    market_open_utc = datetime(2026, 11, 3, 4, 30, tzinfo=timezone.utc)
+    assert cal.is_open("NSE", market_open_utc) is True
+    assert cal.is_open("BSE", market_open_utc) is True
+
+    with TestSession() as session:
+        for idx in range(40):
+            exch = "NSE" if idx % 2 == 0 else "BSE"
+            sym = f"STOCK{idx:02d}"
+            company = Company(
+                exchange=exch,
+                symbol=sym,
+                name=f"Portfolio Company {idx:02d}",
+                cmp=Decimal("200.00"),
+                base_target=Decimal("180.00"),
+                bull_target=Decimal("240.00"),
+                base_direction="below",
+                bull_direction="above",
+            )
+            session.add(company)
+            session.flush()
+            session.add(
+                TargetRevision(
+                    exchange=exch,
+                    symbol=sym,
+                    version=1,
+                    base_target=company.base_target,
+                    bull_target=company.bull_target,
+                    base_direction="below",
+                    bull_direction="above",
+                    source="import",
+                    changed_at=market_open_utc,
+                )
+            )
+        session.commit()
+
+    class FortyStockProvider:
+        name = "batch-live-test"
+        is_simulated = False
+
+        def fetch_quote(self, exchange: str, symbol: str) -> ProviderQuote:
+            idx = int(symbol.replace("STOCK", ""))
+            price = Decimal("175.00") if idx < 5 else (Decimal("250.00") if idx >= 35 else Decimal("205.00"))
+            return ProviderQuote(
+                exchange=exchange,
+                symbol=symbol,
+                price=price,
+                currency="INR",
+                provider=self.name,
+                quoted_at=market_open_utc,
+                is_simulated=False,
+            )
+
+    result = poll_once(
+        FortyStockProvider(),
+        cal,
+        now=market_open_utc + timedelta(seconds=2),
+        session_factory=TestSession,
+    )
+    assert result.attempted == 40
+    assert result.recorded == 40
+    assert result.failed == 0
+
+    companies = client.get("/api/companies").json()
+    assert len(companies) == 40
+    base_triggered = [c for c in companies if c["alert_status"] == "base_triggered"]
+    bull_triggered = [c for c in companies if c["alert_status"] == "bull_triggered"]
+    assert len(base_triggered) == 5
+    assert len(bull_triggered) == 5
+

@@ -14,7 +14,8 @@ from openpyxl.utils.exceptions import InvalidFileException
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from .models import Company, ImportBatch, ImportRow
+from .models import AuditLog, Company, ImportBatch, ImportRow, TargetRevision
+from .schemas import ImportRowUpdate
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_IMPORT_ROWS = 2000
@@ -64,7 +65,8 @@ def _decimal(value: Any) -> Decimal | None:
     if isinstance(value, bool):
         raise InvalidOperation
     try:
-        result = Decimal(str(value).strip().replace(",", ""))
+        cleaned = str(value).strip().replace(",", "").replace("₹", "").strip()
+        result = Decimal(cleaned)
     except (InvalidOperation, ValueError):
         raise InvalidOperation from None
     if not result.is_finite():
@@ -180,6 +182,19 @@ def _source_rows(
     return rows, names
 
 
+def _infer_target_direction(
+    target_val: Decimal | None,
+    cmp_val: Decimal | None,
+    default_dir: str = "above",
+) -> str:
+    """Infer target direction when CMP is available in Excel, or use default."""
+    if target_val is None:
+        return "pending"
+    if cmp_val is not None and cmp_val > 0:
+        return "below" if target_val < cmp_val else "above"
+    return default_dir
+
+
 def create_preview(
     session: Session,
     *,
@@ -188,6 +203,7 @@ def create_preview(
     sheet_name: str | None,
     header_row: int,
     mapping: dict[str, str | None],
+    uploaded_by: str = "Srushti Kadam",
 ) -> dict[str, Any]:
     if not mapping.get("exchange_column") or not mapping.get("symbol_column") or not mapping.get("name_column"):
         raise HTTPException(
@@ -244,7 +260,8 @@ def create_preview(
             return values[index] if index is not None and index < len(values) else None
 
         def coordinate(field: str) -> str:
-            return f"{mapping[field]}{row_number}"
+            col = (mapping.get(field) or "").strip().upper()
+            return f"{col}{row_number}" if col else f"Row {row_number}"
 
         def formula_for(field: str) -> bool:
             index = column_indexes[field]
@@ -254,6 +271,13 @@ def create_preview(
                 and index < len(formulas)
                 and formulas[index] is not None
             )
+
+        cell_refs: dict[str, str] = {}
+        for field in MAPPED_FIELDS:
+            col = (mapping.get(field) or "").strip().upper()
+            if col:
+                short_key = field.replace("_column", "")
+                cell_refs[short_key] = f"{col}{row_number}"
 
         errors: list[str] = []
         warnings: list[str] = []
@@ -318,6 +342,18 @@ def create_preview(
             errors.append(
                 f"Row {row_number}: company name does not match the existing {exchange}:{symbol} identity."
             )
+
+        base_dir = (
+            existing.base_direction
+            if existing and existing.base_direction != "pending" and parsed_values["cmp"] is None
+            else _infer_target_direction(parsed_values["base_target"], parsed_values["cmp"], "above")
+        )
+        bull_dir = (
+            existing.bull_direction
+            if existing and existing.bull_direction != "pending" and parsed_values["cmp"] is None
+            else _infer_target_direction(parsed_values["bull_target"], parsed_values["cmp"], "above")
+        )
+
         row = ImportRow(
             row_number=row_number,
             exchange=exchange or None,
@@ -334,6 +370,10 @@ def create_preview(
             update_bull_target=update_flags["bull_target"],
             errors=errors,
             warnings=warnings,
+            base_direction=base_dir,
+            bull_direction=bull_dir,
+            cell_refs=cell_refs,
+            approval_status="approved",
         )
         rows.append(row)
         seen.setdefault(identity, []).append(row)
@@ -354,9 +394,116 @@ def create_preview(
         status="preview",
         formula_review_required=formula_review_required,
         created_at=datetime.now(timezone.utc),
+        uploaded_by=uploaded_by,
+        sheet_name=sheet_name or ("CSV" if PurePath(filename).suffix.lower() == ".csv" else None),
+        header_row=header_row,
         rows=rows,
     )
     session.add(batch)
+    session.commit()
+    session.refresh(batch)
+    return serialize_batch(batch, company_lookup)
+
+
+def revalidate_batch_rows(session: Session, batch: ImportBatch) -> dict[tuple[str, str], Company]:
+    company_lookup = {
+        (company.exchange, company.symbol): company
+        for company in session.scalars(select(Company))
+    }
+    seen: dict[tuple[str | None, str | None], list[ImportRow]] = {}
+    for row in batch.rows:
+        if row.approval_status == "rejected":
+            row.errors = []
+            continue
+        errors: list[str] = []
+        exchange = (row.exchange or "").strip().upper()
+        symbol = (row.symbol or "").strip().upper()
+        name = (row.name or "").strip()
+        row.exchange = exchange or None
+        row.symbol = symbol or None
+        row.name = name or None
+
+        if exchange not in {"NSE", "BSE"}:
+            errors.append(f"Row {row.row_number}: exchange must be NSE or BSE.")
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9.&_-]{0,31}", symbol):
+            errors.append(
+                f"Row {row.row_number}: symbol must be 1-32 letters, digits, or . & _ - characters."
+            )
+        if not name or len(name) > 200:
+            errors.append(f"Row {row.row_number}: company name is required and must be at most 200 characters.")
+
+        for field_name, val in (("cmp", row.cmp), ("base_target", row.base_target), ("bull_target", row.bull_target)):
+            if val is not None:
+                if val <= 0:
+                    errors.append(f"Row {row.row_number}: {field_name.replace('_', ' ').upper()} must be greater than zero.")
+                if val.as_tuple().exponent < -2 or val >= Decimal("1000000000000"):
+                    errors.append(
+                        f"Row {row.row_number}: {field_name.replace('_', ' ').upper()} supports at most 12 integer digits and 2 decimal places."
+                    )
+        if row.base_target is None and row.bull_target is None:
+            errors.append(f"Row {row.row_number}: at least one target value is required.")
+
+        if row.sector is not None and len(row.sector) > 100:
+            errors.append(f"Row {row.row_number}: sector must be at most 100 characters.")
+
+        identity = (exchange, symbol)
+        existing = company_lookup.get(identity) if exchange in {"NSE", "BSE"} and symbol else None
+        if existing and name and existing.name.strip().casefold() != name.strip().casefold():
+            errors.append(
+                f"Row {row.row_number}: company name does not match the existing {exchange}:{symbol} identity."
+            )
+        row.expected_version = existing.version if existing else None
+        row.errors = errors
+        seen.setdefault(identity, []).append(row)
+
+    for identity, duplicates in seen.items():
+        if len(duplicates) > 1:
+            label = ":".join(part or "" for part in identity)
+            for row in duplicates:
+                row.errors = [*row.errors, f"Row {row.row_number}: duplicate company identity {label} in this file."]
+    return company_lookup
+
+
+def update_preview_row(
+    session: Session,
+    batch_id: str,
+    row_number: int,
+    update_data: ImportRowUpdate,
+) -> dict[str, Any]:
+    batch = get_batch(session, batch_id)
+    if batch.status != "preview":
+        raise HTTPException(status_code=409, detail="Only preview imports can be edited.")
+    target_row = next((r for r in batch.rows if r.row_number == row_number), None)
+    if target_row is None:
+        raise HTTPException(status_code=404, detail=f"Row {row_number} not found in import batch.")
+
+    fields = update_data.model_fields_set
+    if "exchange" in fields:
+        target_row.exchange = (update_data.exchange or "").strip().upper() or None
+    if "symbol" in fields:
+        target_row.symbol = (update_data.symbol or "").strip().upper() or None
+    if "name" in fields:
+        target_row.name = (update_data.name or "").strip() or None
+    if "sector" in fields:
+        target_row.sector = (update_data.sector or "").strip() or None
+        target_row.update_sector = True
+    if "cmp" in fields:
+        target_row.cmp = update_data.cmp
+        target_row.update_cmp = True
+    if "base_target" in fields:
+        target_row.base_target = update_data.base_target
+        target_row.update_base_target = True
+    if "bull_target" in fields:
+        target_row.bull_target = update_data.bull_target
+        target_row.update_bull_target = True
+    if "base_direction" in fields:
+        target_row.base_direction = update_data.base_direction
+    if "bull_direction" in fields:
+        target_row.bull_direction = update_data.bull_direction
+    if "approval_status" in fields and update_data.approval_status is not None:
+        target_row.approval_status = update_data.approval_status
+
+    company_lookup = revalidate_batch_rows(session, batch)
     session.commit()
     session.refresh(batch)
     return serialize_batch(batch, company_lookup)
@@ -379,6 +526,10 @@ def serialize_batch(
                 "cmp": float(row.cmp) if row.cmp is not None else None,
                 "base_target": float(row.base_target) if row.base_target is not None else None,
                 "bull_target": float(row.bull_target) if row.bull_target is not None else None,
+                "base_direction": row.base_direction or (existing.base_direction if existing else "above"),
+                "bull_direction": row.bull_direction or (existing.bull_direction if existing else "above"),
+                "cell_refs": row.cell_refs or {},
+                "approval_status": row.approval_status or "approved",
                 "current_cmp": float(existing.cmp) if existing and existing.cmp is not None else None,
                 "current_base_target": float(existing.base_target) if existing and existing.base_target is not None else None,
                 "current_bull_target": float(existing.bull_target) if existing and existing.bull_target is not None else None,
@@ -388,13 +539,27 @@ def serialize_batch(
                 "warnings": row.warnings,
             }
         )
+    active_rows = [r for r in rows if r["approval_status"] != "rejected"]
+    invalid_rows = sum(1 for r in active_rows if r["errors"])
+    valid_rows = len(active_rows) - invalid_rows
     return {
         "id": batch.id,
         "filename": batch.filename,
         "status": batch.status,
+        "version_number": batch.version_number,
+        "uploaded_by": batch.uploaded_by,
+        "approved_by": batch.approved_by,
+        "approved_at": batch.approved_at.isoformat() if batch.approved_at else None,
+        "created_at": batch.created_at.isoformat() if batch.created_at else None,
+        "sheet_name": batch.sheet_name,
+        "header_row": batch.header_row,
         "formula_review_required": batch.formula_review_required,
+        "total_rows": len(rows),
+        "valid_rows": valid_rows,
+        "invalid_rows": invalid_rows,
         "rows": rows,
         "result": batch.result,
+        "changes_snapshot": batch.changes_snapshot,
     }
 
 
@@ -407,3 +572,77 @@ def get_batch(session: Session, batch_id: str) -> ImportBatch:
     if batch is None:
         raise HTTPException(status_code=404, detail="Import preview not found.")
     return batch
+
+
+def restore_import_version(
+    session: Session,
+    batch_id: str,
+    *,
+    actor: str = "Srushti Kadam",
+) -> dict[str, Any]:
+    batch = get_batch(session, batch_id)
+    if batch.status not in ("confirmed", "restored") or not batch.changes_snapshot:
+        raise HTTPException(
+            status_code=409,
+            detail="Only confirmed import versions with a saved snapshot can be restored.",
+        )
+    now = datetime.now(timezone.utc)
+    restored_count = 0
+    for item in batch.changes_snapshot:
+        exchange = item.get("exchange")
+        symbol = item.get("symbol")
+        if not exchange or not symbol:
+            continue
+        company = session.get(Company, (exchange, symbol))
+        if company is None:
+            continue
+        new_base = Decimal(str(item["new_base_target"])) if item.get("new_base_target") is not None else None
+        new_bull = Decimal(str(item["new_bull_target"])) if item.get("new_bull_target") is not None else None
+        old_targets = (company.base_target, company.bull_target)
+        company.base_target = new_base
+        company.bull_target = new_bull
+        if item.get("base_direction"):
+            company.base_direction = item["base_direction"]
+        if item.get("bull_direction"):
+            company.bull_direction = item["bull_direction"]
+        if old_targets != (company.base_target, company.bull_target):
+            company.version += 1
+            restored_count += 1
+            session.add(
+                TargetRevision(
+                    exchange=company.exchange,
+                    symbol=company.symbol,
+                    version=company.version,
+                    previous_base_target=old_targets[0],
+                    previous_bull_target=old_targets[1],
+                    base_target=company.base_target,
+                    bull_target=company.bull_target,
+                    base_direction=company.base_direction,
+                    bull_direction=company.bull_direction,
+                    source="restore",
+                    import_id=batch.id,
+                    changed_by=actor,
+                    changed_at=now,
+                )
+            )
+    session.add(
+        AuditLog(
+            action="import_version_restored",
+            actor=actor,
+            entity_type="import_batch",
+            entity_id=batch.id,
+            details={
+                "filename": batch.filename,
+                "version_number": batch.version_number,
+                "restored_companies": restored_count,
+            },
+            created_at=now,
+        )
+    )
+    session.commit()
+    return {
+        "id": batch.id,
+        "version_number": batch.version_number,
+        "status": "restored",
+        "restored_companies": restored_count,
+    }
