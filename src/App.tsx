@@ -16,11 +16,9 @@ import {
   ChevronDown,
   ChevronRight,
   CircleHelp,
-  Clock3,
   Command,
   Download,
   FileSpreadsheet,
-  History,
   LayoutDashboard,
   LineChart,
   Menu,
@@ -34,8 +32,6 @@ import {
   ShieldCheck,
   Sun,
   Target,
-  TrendingDown,
-  TrendingUp,
   Upload,
   Users,
   X,
@@ -65,6 +61,7 @@ import {
   updateNotificationPreferences,
 } from "./api";
 import BackendUploadPage from "./UploadPage";
+import { useLiveMarketStream } from "./useLiveMarketStream";
 import type {
   ApiAlert,
   CompanyDetailsResponse,
@@ -164,6 +161,19 @@ export default function App() {
     setToast(message);
     window.setTimeout(() => setToast(""), 3500);
   };
+
+  const liveStream = useLiveMarketStream({
+    setPortfolioCompanies,
+    setApiAlerts,
+    onOutboxAlert: (outboxNotif) => {
+      const targetLabel = outboxNotif.alert.target_kind === "base" ? "Base Target" : "Bull Target";
+      notify(
+        `Live Alert: ${outboxNotif.alert.symbol} reached ${targetLabel} (${money(
+          outboxNotif.alert.price,
+        )})`,
+      );
+    },
+  });
 
   const reloadAll = () => setPortfolioRequest((r) => r + 1);
 
@@ -394,8 +404,10 @@ export default function App() {
                   ? "Backend Disconnected"
                   : staleCompanies.length > 0
                     ? `${staleCompanies.length} Stale Quote(s)`
-                    : `Feed ${workerStatus?.provider ?? "yfinance"} · ${
-                        workerStatus?.state ?? "ready"
+                    : `Feed ${workerStatus?.provider ?? "shoonya"} · ${
+                        liveStream.state === "connected"
+                          ? `Live ${liveStream.transport.toUpperCase()}`
+                          : (workerStatus?.state ?? "ready")
                       }`}
               </span>
             </div>
@@ -586,6 +598,77 @@ export default function App() {
               reloadAll();
             }}
           />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {liveStream.liveNotifications.length > 0 && (
+          <div className="live-outbox-toast-stack" role="region" aria-label="Live Target Alerts">
+            {liveStream.liveNotifications.map((item) => {
+              const isBase = item.alert.target_kind === "base";
+              return (
+                <motion.div
+                  key={item.outboxId}
+                  className={`live-outbox-toast ${isBase ? "outbox-base" : "outbox-bull"}`}
+                  initial={{ opacity: 0, x: 24, scale: 0.96 }}
+                  animate={{ opacity: 1, x: 0, scale: 1 }}
+                  exit={{ opacity: 0, x: 24, scale: 0.96 }}
+                >
+                  <div className="live-outbox-toast-header">
+                    <span className={`status-badge ${isBase ? "badge-buy" : "badge-sell"}`}>
+                      <i />
+                      {isBase ? "Base Target Triggered" : "Bull Target Triggered"}
+                    </span>
+                    <button
+                      className="icon-button small-icon"
+                      aria-label="Dismiss alert notification"
+                      onClick={() => liveStream.dismissLiveNotification(item.outboxId)}
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                  <div className="live-outbox-toast-body">
+                    <b>
+                      {item.alert.company} ({item.alert.exchange}:{item.alert.symbol})
+                    </b>
+                    <p>
+                      CMP <strong>{money(item.alert.price)}</strong> crossed{" "}
+                      {isBase ? "Base" : "Bull"} Target{" "}
+                      <strong>
+                        {item.alert.target != null ? money(item.alert.target) : "—"}
+                      </strong>{" "}
+                      ({item.alert.price_direction ?? (isBase ? "Downward" : "Upward")})
+                    </p>
+                  </div>
+                  <div className="live-outbox-toast-actions">
+                    <button
+                      className="button secondary small"
+                      onClick={() => {
+                        const match = portfolioCompanies.find(
+                          (c) =>
+                            c.exchange === item.alert.exchange &&
+                            c.symbol === item.alert.symbol,
+                        );
+                        if (match) setSelectedCompany(match);
+                        liveStream.dismissLiveNotification(item.outboxId);
+                      }}
+                    >
+                      Inspect Symbol
+                    </button>
+                    <button
+                      className="button primary small"
+                      onClick={() => {
+                        void handleAlertLifecycle(item.alert.id, "acknowledge");
+                        liveStream.dismissLiveNotification(item.outboxId);
+                      }}
+                    >
+                      Acknowledge
+                    </button>
+                  </div>
+                </motion.div>
+              );
+            })}
+          </div>
         )}
       </AnimatePresence>
 

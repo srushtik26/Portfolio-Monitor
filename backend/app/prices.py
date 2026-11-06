@@ -16,12 +16,16 @@ from sqlalchemy.orm import Session
 from .models import (
     AuditLog,
     Company,
+    ImportBatch,
+    ImportRow,
+    NotificationOutbox,
+    NotificationPreference,
     PriceQuote,
     TargetAlert,
     TargetAlertState,
     TargetRevision,
 )
-from .notifications import queue_alert_notifications
+from .notifications import queue_alert_notifications, write_alert_to_outbox
 
 logger = logging.getLogger(__name__)
 INDIA_TZ = ZoneInfo("Asia/Kolkata")
@@ -767,6 +771,175 @@ def _validated_price(raw_price: Decimal) -> Decimal:
     return price
 
 
+@dataclass(frozen=True)
+class UploadedExcelRules:
+    """Consolidated view of a company's uploaded Excel target rules and alert state."""
+
+    company: Company
+    revision: TargetRevision | None
+    import_row: ImportRow | None
+    state_by_kind: dict[str, TargetAlertState]
+
+
+@dataclass(frozen=True)
+class TickEvaluationOutcome:
+    """Outcome of evaluating a single incoming live CMP tick against uploaded Excel rules."""
+
+    quote: PriceQuote | None
+    triggered_alerts: list[TargetAlert]
+    outbox_rows: list[NotificationOutbox]
+    throttled: bool = False
+
+
+class HighFrequencyTickDeduplicator:
+    """Thread-safe in-memory filter that suppresses redundant identical-price ticks within a micro-window
+    so high-frequency Shoonya WebSocket bursts do not exhaust the SQLAlchemy connection pool.
+    """
+
+    def __init__(self, default_window_seconds: float = 0.25) -> None:
+        self._default_window_seconds = max(0.0, default_window_seconds)
+        self._lock = RLock()
+        self._last_seen: dict[tuple[str, str], tuple[Decimal, float]] = {}
+
+    def should_skip(
+        self,
+        exchange: str,
+        symbol: str,
+        price: Decimal,
+        *,
+        window_seconds: float | None = None,
+    ) -> bool:
+        win = self._default_window_seconds if window_seconds is None else max(0.0, window_seconds)
+        if win <= 0.0:
+            return False
+        key = (exchange.upper(), symbol.upper())
+        now_mono = monotonic()
+        with self._lock:
+            prev = self._last_seen.get(key)
+            if prev is not None:
+                prev_price, prev_ts = prev
+                if prev_price == price and (now_mono - prev_ts) < win:
+                    return True
+            self._last_seen[key] = (price, now_mono)
+            return False
+
+    def invalidate(self, exchange: str | None = None, symbol: str | None = None) -> None:
+        with self._lock:
+            if exchange is None or symbol is None:
+                self._last_seen.clear()
+            else:
+                self._last_seen.pop((exchange.upper(), symbol.upper()), None)
+
+
+LIVE_TICK_DEDUPLICATOR = HighFrequencyTickDeduplicator(
+    default_window_seconds=float(os.environ.get("SHOONYA_TICK_DEDUP_WINDOW_SECONDS", "0.0"))
+)
+
+
+def query_uploaded_excel_rules(
+    session: Session,
+    exchange: str,
+    symbol: str,
+    *,
+    is_simulated: bool = False,
+    current_time: datetime | None = None,
+) -> UploadedExcelRules | None:
+    """Query the database using SQLAlchemy to retrieve the uploaded Excel target rules
+    (`Company`, `TargetRevision`, confirmed `ImportRow`, and `TargetAlertState` rows)
+    for a specific company inside the current session transaction.
+    """
+    exch = exchange.upper()
+    sym = symbol.upper()
+    company = session.get(Company, (exch, sym))
+    if company is None:
+        return None
+
+    revision = session.scalar(
+        select(TargetRevision)
+        .where(
+            TargetRevision.exchange == exch,
+            TargetRevision.symbol == sym,
+            TargetRevision.version <= company.version,
+        )
+        .order_by(TargetRevision.version.desc(), TargetRevision.id.desc())
+        .limit(1)
+    )
+
+    import_row: ImportRow | None = None
+    if revision is not None and revision.import_id is not None:
+        import_row = session.scalar(
+            select(ImportRow)
+            .where(
+                ImportRow.batch_id == revision.import_id,
+                ImportRow.exchange == exch,
+                ImportRow.symbol == sym,
+                ImportRow.approval_status == "approved",
+            )
+            .order_by(ImportRow.row_number.desc())
+            .limit(1)
+        )
+    elif revision is None:
+        import_row = session.scalar(
+            select(ImportRow)
+            .join(ImportBatch, ImportBatch.id == ImportRow.batch_id)
+            .where(
+                ImportBatch.status == "confirmed",
+                ImportRow.exchange == exch,
+                ImportRow.symbol == sym,
+                ImportRow.approval_status == "approved",
+            )
+            .order_by(ImportBatch.approved_at.desc(), ImportBatch.created_at.desc(), ImportRow.id.desc())
+            .limit(1)
+        )
+
+    # Sync any missing company target fields from the latest confirmed Excel ImportRow if present
+    if import_row is not None:
+        if company.base_target is None and import_row.base_target is not None:
+            company.base_target = import_row.base_target
+        if company.bull_target is None and import_row.bull_target is not None:
+            company.bull_target = import_row.bull_target
+
+    # If a company was uploaded via an Excel ImportRow with Base or Bull targets but lacks a TargetRevision row,
+    # materialize revision v1 in the same transaction so alert evaluation can link to it.
+    if (
+        revision is None
+        and import_row is not None
+        and (company.base_target is not None or company.bull_target is not None)
+    ):
+        revision = TargetRevision(
+            exchange=exch,
+            symbol=sym,
+            version=max(1, company.version),
+            base_target=company.base_target,
+            bull_target=company.bull_target,
+            base_direction=company.base_direction,
+            bull_direction=company.bull_direction,
+            import_id=import_row.batch_id,
+            source="import",
+            changed_at=current_time or datetime.now(timezone.utc),
+        )
+        session.add(revision)
+        session.flush()
+
+    states = list(
+        session.scalars(
+            select(TargetAlertState).where(
+                TargetAlertState.exchange == exch,
+                TargetAlertState.symbol == sym,
+                TargetAlertState.is_simulated == is_simulated,
+            )
+        )
+    )
+    state_by_kind = {st.target_kind: st for st in states}
+
+    return UploadedExcelRules(
+        company=company,
+        revision=revision,
+        import_row=import_row,
+        state_by_kind=state_by_kind,
+    )
+
+
 def _evaluate_company_target(
     session: Session,
     *,
@@ -775,15 +948,23 @@ def _evaluate_company_target(
     recorded_quote: PriceQuote,
     kind: str,
     current_time: datetime,
+    state_row: TargetAlertState | None = None,
+    preference: NotificationPreference | None = None,
+    outbox_collector: list[NotificationOutbox] | None = None,
 ) -> TargetAlert | None:
-    target = company.base_target if kind == "base" else company.bull_target
+    target = (
+        (company.base_target if company.base_target is not None else revision.base_target)
+        if kind == "base"
+        else (company.bull_target if company.bull_target is not None else revision.bull_target)
+    )
     direction = company.base_direction if kind == "base" else company.bull_direction
     trigger_mode = company.base_trigger_mode if kind == "base" else company.bull_trigger_mode
     price = recorded_quote.price
     is_simulated = recorded_quote.is_simulated
 
-    state_key = (company.exchange, company.symbol, kind, is_simulated)
-    state_row = session.get(TargetAlertState, state_key)
+    if state_row is None:
+        state_key = (company.exchange, company.symbol, kind, is_simulated)
+        state_row = session.get(TargetAlertState, state_key)
     if state_row is None:
         state_row = TargetAlertState(
             exchange=company.exchange,
@@ -882,11 +1063,14 @@ def _evaluate_company_target(
             )
             session.add(event)
             session.flush()
-            queue_alert_notifications(
+            queued_rows = write_alert_to_outbox(
                 session,
                 event,
+                preference=preference,
                 now=current_time,
             )
+            if outbox_collector is not None:
+                outbox_collector.extend(queued_rows)
             state_row.state = "triggered"
             state_row.trigger_cycle = next_cycle
             state_row.last_triggered_at = current_time
@@ -1035,6 +1219,9 @@ def record_quote(
     session.add(recorded)
     session.flush()
 
+    triggered_alerts: list[TargetAlert] = []
+    outbox_rows: list[NotificationOutbox] = []
+
     alert_eligible = (
         (
             alerts_enabled
@@ -1052,27 +1239,83 @@ def record_quote(
         )
     )
     if alert_eligible:
-        revision = session.scalar(
-            select(TargetRevision)
-            .where(
-                TargetRevision.exchange == identity[0],
-                TargetRevision.symbol == identity[1],
-                TargetRevision.version <= company.version,
-            )
-            .order_by(TargetRevision.version.desc(), TargetRevision.id.desc())
-            .limit(1)
+        excel_rules = query_uploaded_excel_rules(
+            session,
+            identity[0],
+            identity[1],
+            is_simulated=quote.is_simulated,
+            current_time=current_time,
         )
-        if revision is not None:
+        if excel_rules is not None and excel_rules.revision is not None:
+            preference = session.get(NotificationPreference, "default")
             for kind in ("base", "bull"):
-                _evaluate_company_target(
+                alert = _evaluate_company_target(
                     session,
-                    company=company,
-                    revision=revision,
+                    company=excel_rules.company,
+                    revision=excel_rules.revision,
                     recorded_quote=recorded,
                     kind=kind,
                     current_time=current_time,
+                    state_row=excel_rules.state_by_kind.get(kind),
+                    preference=preference,
+                    outbox_collector=outbox_rows,
                 )
+                if alert is not None:
+                    triggered_alerts.append(alert)
 
     session.commit()
     session.refresh(recorded)
+    # Attach transient metadata so callers (like worker.py) know if outbox draining is needed
+    # without opening an extra database session.
+    recorded._triggered_alerts = triggered_alerts  # type: ignore[attr-defined]
+    recorded._queued_outbox = outbox_rows  # type: ignore[attr-defined]
     return recorded
+
+
+def evaluate_live_cmp_tick(
+    session: Session,
+    quote: ProviderQuote,
+    *,
+    now: datetime | None = None,
+    alerts_enabled: bool = True,
+    dedup_window_seconds: float | None = None,
+) -> TickEvaluationOutcome:
+    """High-frequency entry point for evaluating a live CMP tick from Shoonya against
+    uploaded Excel rules in a single optimized SQLAlchemy transaction.
+
+    - Optionally suppresses sub-second duplicate ticks with unchanged CMP before hitting the DB.
+    - Queries the company's uploaded Excel rules (`Company`, `TargetRevision`, `ImportRow`, `TargetAlertState`).
+    - If CMP drops at/below the Base target (`base_direction == 'below'`) or rises at/above the Bull target
+      (`bull_direction == 'above'`), writes a `TargetAlert` and a new record in `notification_outbox`
+      within the same commit.
+    """
+    price = _validated_price(quote.price)
+    if LIVE_TICK_DEDUPLICATOR.should_skip(
+        quote.exchange,
+        quote.symbol,
+        price,
+        window_seconds=dedup_window_seconds,
+    ):
+        return TickEvaluationOutcome(
+            quote=None,
+            triggered_alerts=[],
+            outbox_rows=[],
+            throttled=True,
+        )
+
+    stored = record_quote(
+        session,
+        quote,
+        now=now,
+        alerts_enabled=alerts_enabled,
+        fixture_alerts_enabled=quote.is_simulated,
+    )
+    triggered: list[TargetAlert] = getattr(stored, "_triggered_alerts", [])
+    outbox: list[NotificationOutbox] = getattr(stored, "_queued_outbox", [])
+    return TickEvaluationOutcome(
+        quote=stored,
+        triggered_alerts=triggered,
+        outbox_rows=outbox,
+        throttled=False,
+    )
+

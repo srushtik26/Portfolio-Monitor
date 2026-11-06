@@ -230,3 +230,120 @@ export async function updateNotificationPreferences(
     }),
   );
 }
+
+export function getLiveSseStreamUrl(params?: {
+  sinceQuoteId?: number;
+  pollIntervalMs?: number;
+}): string {
+  const url = new URL(`${apiBaseUrl}/api/stream/live`);
+  if (params?.sinceQuoteId !== undefined) {
+    url.searchParams.set("since_quote_id", String(params.sinceQuoteId));
+  }
+  if (params?.pollIntervalMs !== undefined) {
+    url.searchParams.set("poll_interval_ms", String(params.pollIntervalMs));
+  }
+  return url.toString();
+}
+
+export function getLiveWebSocketUrl(params?: {
+  sinceQuoteId?: number;
+  pollIntervalMs?: number;
+}): string {
+  const wsBase = apiBaseUrl.replace(/^http/i, "ws");
+  const url = new URL(`${wsBase}/api/ws/live`);
+  if (params?.sinceQuoteId !== undefined) {
+    url.searchParams.set("since_quote_id", String(params.sinceQuoteId));
+  }
+  if (params?.pollIntervalMs !== undefined) {
+    url.searchParams.set("poll_interval_ms", String(params.pollIntervalMs));
+  }
+  return url.toString();
+}
+
+export function computeDistanceMetrics(
+  company: PortfolioCompany,
+  livePrice: number,
+): Pick<
+  PortfolioCompany,
+  | "distance_to_base_abs"
+  | "distance_to_base_pct"
+  | "distance_to_bull_abs"
+  | "distance_to_bull_pct"
+  | "nearest_target_pct"
+  | "alert_status"
+> {
+  const baseTarget = company.base_target;
+  const bullTarget = company.bull_target;
+  const baseDir = company.base_direction ?? "below";
+  const bullDir = company.bull_direction ?? "above";
+
+  const distBaseAbs =
+    baseTarget != null && livePrice > 0 ? Number((livePrice - baseTarget).toFixed(2)) : null;
+  const distBasePct =
+    baseTarget != null && baseTarget > 0 && livePrice > 0
+      ? Number((((livePrice - baseTarget) / baseTarget) * 100).toFixed(2))
+      : null;
+
+  const distBullAbs =
+    bullTarget != null && livePrice > 0 ? Number((bullTarget - livePrice).toFixed(2)) : null;
+  const distBullPct =
+    bullTarget != null && livePrice > 0
+      ? Number((((bullTarget - livePrice) / livePrice) * 100).toFixed(2))
+      : null;
+
+  const candidatePcts = [distBasePct, distBullPct]
+    .filter((v): v is number => v != null)
+    .map((v) => Math.abs(v));
+  const nearestTargetPct =
+    candidatePcts.length > 0 ? Number(Math.min(...candidatePcts).toFixed(2)) : null;
+
+  if (company.monitoring_active === false) {
+    return {
+      distance_to_base_abs: distBaseAbs,
+      distance_to_base_pct: distBasePct,
+      distance_to_bull_abs: distBullAbs,
+      distance_to_bull_pct: distBullPct,
+      nearest_target_pct: nearestTargetPct,
+      alert_status: "inactive",
+    };
+  }
+
+  if (baseDir === "pending" || bullDir === "pending") {
+    return {
+      distance_to_base_abs: distBaseAbs,
+      distance_to_base_pct: distBasePct,
+      distance_to_bull_abs: distBullAbs,
+      distance_to_bull_pct: distBullPct,
+      nearest_target_pct: nearestTargetPct,
+      alert_status: "pending_configuration",
+    };
+  }
+
+  const baseTriggered =
+    baseTarget != null &&
+    ((baseDir === "below" && livePrice <= baseTarget) ||
+      (baseDir === "above" && livePrice >= baseTarget));
+  const bullTriggered =
+    bullTarget != null &&
+    ((bullDir === "above" && livePrice >= bullTarget) ||
+      (bullDir === "below" && livePrice <= bullTarget));
+
+  let alertStatus: PortfolioCompany["alert_status"] = "monitoring";
+  if (baseTriggered && bullTriggered) {
+    alertStatus = "both_triggered";
+  } else if (baseTriggered) {
+    alertStatus = "base_triggered";
+  } else if (bullTriggered) {
+    alertStatus = "bull_triggered";
+  }
+
+  return {
+    distance_to_base_abs: distBaseAbs,
+    distance_to_base_pct: distBasePct,
+    distance_to_bull_abs: distBullAbs,
+    distance_to_bull_pct: distBullPct,
+    nearest_target_pct: nearestTargetPct,
+    alert_status: alertStatus,
+  };
+}
+

@@ -53,7 +53,7 @@ export interface PriceQuote {
   price: number;
   currency: string;
   provider: string;
-  quote_type: "last_trade" | "candle_close" | "fixture" | "provider_quote";
+  quote_type: "last_trade" | "candle_close" | "fixture" | "provider_quote" | "websocket_tick";
   quoted_at: string;
   received_at: string;
   is_simulated: boolean;
@@ -224,3 +224,58 @@ export interface CompanyDetailsResponse {
   alerts: ApiAlert[];
   price_history: PriceQuote[];
 }
+
+export interface LivePriceTickEvent {
+  type: "price_tick";
+  exchange: Exchange;
+  symbol: string;
+  company_name: string;
+  quote: PriceQuote;
+  base_target: number | null;
+  bull_target: number | null;
+  base_direction?: TargetDirection;
+  bull_direction?: TargetDirection;
+  distance_to_base_abs: number | null;
+  distance_to_base_pct: number | null;
+  distance_to_bull_abs: number | null;
+  distance_to_bull_pct: number | null;
+  nearest_target_pct: number | null;
+  alert_status?: PortfolioCompany["alert_status"];
+  base_alert_state?: TargetAlertStateInfo | null;
+  bull_alert_state?: TargetAlertStateInfo | null;
+}
+
+export interface LiveOutboxAlertEvent {
+  type: "outbox_alert";
+  outbox_id: string;
+  channel: string;
+  delivery_mode: "dry_run" | "live";
+  status: string;
+  created_at: string;
+  alert: ApiAlert;
+}
+
+export interface LiveStreamConnectedEvent {
+  type: "connected";
+  cursor_quote_id: number;
+  timestamp: string;
+}
+
+export interface LiveStreamHeartbeatEvent {
+  type: "heartbeat";
+  timestamp: string;
+}
+
+export type LiveMarketStreamEvent =
+  | LivePriceTickEvent
+  | LiveOutboxAlertEvent
+  | LiveStreamConnectedEvent
+  | LiveStreamHeartbeatEvent;
+
+export interface LiveUiAlertNotification {
+  outboxId: string;
+  alert: ApiAlert;
+  channel: string;
+  createdAt: string;
+}
+

@@ -543,9 +543,10 @@ def queue_alert_notifications(
     session: Session,
     target_alert: TargetAlert,
     *,
+    preference: NotificationPreference | None = None,
     now: datetime | None = None,
 ) -> list[NotificationOutbox]:
-    """Queue notifications for a triggered alert.
+    """Queue notifications for a triggered alert in the active SQLAlchemy transaction.
 
     Simulated alerts always use the dry-run channel.
     Live alerts check NotificationPreference (or NOTIFICATION_MODE=live):
@@ -557,7 +558,7 @@ def queue_alert_notifications(
     if target_alert.is_simulated:
         return [create_dry_run_outbox(session, target_alert, now=created_at)]
 
-    pref = session.get(NotificationPreference, "default")
+    pref = preference if preference is not None else session.get(NotificationPreference, "default")
     live_mode_env = os.environ.get("NOTIFICATION_MODE", "").strip().lower() == "live"
     if pref is None and not live_mode_env:
         return [create_dry_run_outbox(session, target_alert, now=created_at)]
@@ -610,3 +611,22 @@ def queue_alert_notifications(
     if not queued:
         return [create_dry_run_outbox(session, target_alert, now=created_at)]
     return queued
+
+
+def write_alert_to_outbox(
+    session: Session,
+    target_alert: TargetAlert,
+    *,
+    preference: NotificationPreference | None = None,
+    now: datetime | None = None,
+) -> list[NotificationOutbox]:
+    """Write a newly triggered Base or Bull target alert into `notification_outbox`
+    within the caller's existing SQLAlchemy session transaction.
+    """
+    return queue_alert_notifications(
+        session,
+        target_alert,
+        preference=preference,
+        now=now,
+    )
+

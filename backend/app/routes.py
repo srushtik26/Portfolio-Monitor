@@ -1,16 +1,31 @@
+import asyncio
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 import os
 from pathlib import PurePath
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.orm.exc import StaleDataError
 
-from .database import get_db
+from .database import SessionLocal, get_db
 from .imports import (
     create_preview,
     get_batch,
@@ -321,7 +336,16 @@ def trigger_manual_poll(
     symbol: str | None = Query(default=None),
 ) -> dict[str, Any]:
     """Fetch live quotes on demand for one or all approved active companies and evaluate target rules."""
-    provider = YFinanceProvider()
+    use_shoonya = (
+        os.environ.get("PRICE_PROVIDER", "").strip().lower() in {"shoonya", "shoonya_ws"}
+        or bool(os.environ.get("SHOONYA_USER_ID"))
+    )
+    if use_shoonya:
+        from .shoonya_feed import ShoonyaPriceProvider
+
+        provider = ShoonyaPriceProvider()
+    else:
+        provider = YFinanceProvider()
     now = datetime.now(timezone.utc)
     if exchange and symbol:
         identity = (exchange.upper(), symbol.upper())
@@ -1112,3 +1136,333 @@ def list_audit_logs(
         }
         for log in logs
     ]
+
+
+def _serialize_single_outbox_alert(
+    outbox: NotificationOutbox,
+    alert: TargetAlert,
+    revision: TargetRevision,
+    quote: PriceQuote,
+    company: Company,
+) -> dict[str, Any]:
+    target = (
+        alert.target_price_snapshot
+        if alert.target_price_snapshot is not None
+        else (revision.base_target if alert.target_kind == "base" else revision.bull_target)
+    )
+    quote_data = serialize_quote(quote)
+    price_dir = "Downward" if alert.comparison_direction == "below" else "Upward"
+    return {
+        "outbox_id": outbox.id,
+        "channel": outbox.channel,
+        "delivery_mode": outbox.delivery_mode,
+        "status": outbox.status,
+        "created_at": normalize_utc(outbox.created_at).isoformat(),
+        "alert": {
+            "id": alert.id,
+            "exchange": company.exchange,
+            "symbol": company.symbol,
+            "company": company.name,
+            "target_kind": alert.target_kind,
+            "target": float(target) if target is not None else None,
+            "price": float(alert.price),
+            "comparison_direction": alert.comparison_direction,
+            "price_direction": price_dir,
+            "trigger_mode": alert.trigger_mode,
+            "lifecycle_status": alert.lifecycle_status,
+            "trigger_cycle": alert.trigger_cycle,
+            "triggered_at": normalize_utc(alert.triggered_at).isoformat(),
+            "target_revision_id": alert.target_revision_id,
+            "is_simulated": alert.is_simulated,
+            "event_type": "fixture" if alert.is_simulated else "live",
+            "quote_status": quote.status,
+            "quote_is_fresh": quote_data["is_fresh"],
+            "provider": quote.provider,
+            "delivery_status": outbox.status,
+            "delivery_mode": outbox.delivery_mode,
+            "channel": outbox.channel,
+            "delivery_label": (
+                "Dry run (no network)"
+                if outbox.delivery_mode == "dry_run"
+                else f"{outbox.channel.title()}: {outbox.status}"
+            ),
+            "attempts": outbox.attempts,
+            "max_attempts": outbox.max_attempts,
+            "last_error": outbox.last_error,
+            "sent_at": normalize_utc(outbox.sent_at).isoformat() if outbox.sent_at else None,
+            "provider_message_id": outbox.provider_message_id,
+        },
+    }
+
+
+def _poll_stream_delta(
+    session: Session,
+    state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Query newly recorded PriceQuote rows and newly queued NotificationOutbox rows since the last cursor."""
+    events: list[dict[str, Any]] = []
+    last_quote_id: int = state.get("last_quote_id", 0)
+    seen_outbox_ids: set[str] = state.setdefault("seen_outbox_ids", set())
+    last_outbox_created_at: datetime | None = state.get("last_outbox_created_at")
+
+    new_quotes = list(
+        session.scalars(
+            select(PriceQuote)
+            .where(PriceQuote.id > last_quote_id)
+            .order_by(PriceQuote.id.asc())
+            .limit(100)
+        )
+    )
+    if new_quotes:
+        state["last_quote_id"] = new_quotes[-1].id
+        # Group by latest quote per company so distance metrics are computed once per symbol
+        latest_by_company: dict[tuple[str, str], PriceQuote] = {}
+        for q in new_quotes:
+            latest_by_company[(q.exchange, q.symbol)] = q
+
+        for (exch, sym), quote in latest_by_company.items():
+            company = session.get(Company, (exch, sym))
+            if company is None:
+                continue
+            quote_data = serialize_quote(quote)
+            state_rows = list(
+                session.scalars(
+                    select(TargetAlertState).where(
+                        TargetAlertState.exchange == exch,
+                        TargetAlertState.symbol == sym,
+                        TargetAlertState.is_simulated.is_(False),
+                    )
+                )
+            )
+            states_map = {st.target_kind: st for st in state_rows}
+            company_dict = CompanyRead.model_validate(company).model_dump()
+            enrich_company_dict(
+                company,
+                company_dict,
+                quote_data,
+                states_map.get("base"),
+                states_map.get("bull"),
+            )
+            events.append(
+                {
+                    "type": "price_tick",
+                    "exchange": exch,
+                    "symbol": sym,
+                    "company_name": company.name,
+                    "quote": {
+                        **quote_data,
+                        "quoted_at": normalize_utc(quote.quoted_at).isoformat(),
+                        "received_at": normalize_utc(quote.received_at).isoformat(),
+                    },
+                    "base_target": float(company.base_target) if company.base_target is not None else None,
+                    "bull_target": float(company.bull_target) if company.bull_target is not None else None,
+                    "base_direction": company.base_direction,
+                    "bull_direction": company.bull_direction,
+                    "distance_to_base_abs": company_dict.get("distance_to_base_abs"),
+                    "distance_to_base_pct": company_dict.get("distance_to_base_pct"),
+                    "distance_to_bull_abs": company_dict.get("distance_to_bull_abs"),
+                    "distance_to_bull_pct": company_dict.get("distance_to_bull_pct"),
+                    "nearest_target_pct": company_dict.get("nearest_target_pct"),
+                    "alert_status": company_dict.get("alert_status"),
+                    "base_alert_state": company_dict.get("base_alert_state"),
+                    "bull_alert_state": company_dict.get("bull_alert_state"),
+                }
+            )
+
+    outbox_stmt = (
+        select(NotificationOutbox, TargetAlert, TargetRevision, PriceQuote, Company)
+        .join(TargetAlert, TargetAlert.id == NotificationOutbox.target_alert_id)
+        .join(TargetRevision, TargetRevision.id == TargetAlert.target_revision_id)
+        .join(PriceQuote, PriceQuote.id == TargetAlert.quote_id)
+        .join(
+            Company,
+            (Company.exchange == TargetRevision.exchange)
+            & (Company.symbol == TargetRevision.symbol),
+        )
+    )
+    if last_outbox_created_at is not None:
+        outbox_stmt = outbox_stmt.where(
+            NotificationOutbox.created_at >= last_outbox_created_at - timedelta(seconds=2)
+        )
+    outbox_rows = session.execute(
+        outbox_stmt.order_by(NotificationOutbox.created_at.asc()).limit(50)
+    ).all()
+
+    for outbox, alert, revision, quote, company in outbox_rows:
+        if outbox.id in seen_outbox_ids:
+            continue
+        seen_outbox_ids.add(outbox.id)
+        state["last_outbox_created_at"] = normalize_utc(outbox.created_at)
+        payload = _serialize_single_outbox_alert(outbox, alert, revision, quote, company)
+        events.append({"type": "outbox_alert", **payload})
+
+    return events
+
+
+def _init_stream_cursor(
+    session: Session,
+    *,
+    since_quote_id: int | None = None,
+    include_existing_outbox: bool = False,
+) -> dict[str, Any]:
+    if since_quote_id is not None:
+        max_quote_id = since_quote_id
+    else:
+        max_quote_id = session.scalar(select(func.max(PriceQuote.id))) or 0
+
+    seen_outbox_ids: set[str] = set()
+    last_outbox_created_at: datetime | None = None
+    if not include_existing_outbox:
+        existing_outbox = session.scalars(select(NotificationOutbox.id)).all()
+        seen_outbox_ids.update(existing_outbox)
+        latest_created = session.scalar(select(func.max(NotificationOutbox.created_at)))
+        if latest_created is not None:
+            last_outbox_created_at = normalize_utc(latest_created)
+
+    return {
+        "last_quote_id": max_quote_id,
+        "seen_outbox_ids": seen_outbox_ids,
+        "last_outbox_created_at": last_outbox_created_at,
+    }
+
+
+@router.get("/stream/live")
+async def stream_live_events(
+    request: Request,
+    since_quote_id: int | None = Query(default=None, ge=0),
+    include_existing_outbox: bool = Query(default=False),
+    poll_interval_ms: int = Query(default=750, ge=100, le=10000),
+    max_events: int | None = Query(default=None, ge=1, le=500),
+) -> StreamingResponse:
+    """Server-Sent Events (SSE) endpoint streaming real-time price ticks, Distance-from-Target updates,
+    and new `notification_outbox` alert events to the React dashboard.
+    """
+    override_db = request.app.dependency_overrides.get(get_db)
+
+    def _run_with_session(fn):
+        if override_db is not None:
+            gen = override_db()
+            sess = next(gen)
+            try:
+                return fn(sess)
+            finally:
+                try:
+                    next(gen)
+                except StopIteration:
+                    pass
+        with SessionLocal() as sess:
+            return fn(sess)
+
+    cursor = await asyncio.to_thread(
+        _run_with_session,
+        lambda s: _init_stream_cursor(
+            s,
+            since_quote_id=since_quote_id,
+            include_existing_outbox=include_existing_outbox,
+        ),
+    )
+
+    async def event_generator() -> AsyncIterator[str]:
+        emitted = 0
+        connected_event = {
+            "type": "connected",
+            "cursor_quote_id": cursor["last_quote_id"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        yield f"event: connected\ndata: {json.dumps(connected_event, default=str)}\n\n"
+        emitted += 1
+        if max_events is not None and emitted >= max_events:
+            return
+
+        while True:
+            if await request.is_disconnected():
+                break
+            delta_events = await asyncio.to_thread(
+                _run_with_session,
+                lambda s: _poll_stream_delta(s, cursor),
+            )
+            for ev in delta_events:
+                ev_type = ev.get("type", "message")
+                yield f"event: {ev_type}\ndata: {json.dumps(ev, default=str)}\n\n"
+                emitted += 1
+                if max_events is not None and emitted >= max_events:
+                    return
+
+            if not delta_events:
+                heartbeat_ev = {
+                    "type": "heartbeat",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                yield f"event: heartbeat\ndata: {json.dumps(heartbeat_ev)}\n\n"
+                emitted += 1
+                if max_events is not None and emitted >= max_events:
+                    return
+
+            await asyncio.sleep(poll_interval_ms / 1000.0)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.websocket("/ws/live")
+async def websocket_live_events(
+    websocket: WebSocket,
+    since_quote_id: int | None = Query(default=None),
+    include_existing_outbox: bool = Query(default=False),
+    poll_interval_ms: int = Query(default=750),
+) -> None:
+    """WebSocket endpoint streaming real-time price ticks, Distance-from-Target metrics,
+    and `notification_outbox` alert events to the React dashboard.
+    """
+    await websocket.accept()
+    override_db = websocket.app.dependency_overrides.get(get_db)
+
+    def _run_with_session(fn):
+        if override_db is not None:
+            gen = override_db()
+            sess = next(gen)
+            try:
+                return fn(sess)
+            finally:
+                try:
+                    next(gen)
+                except StopIteration:
+                    pass
+        with SessionLocal() as sess:
+            return fn(sess)
+
+    cursor = await asyncio.to_thread(
+        _run_with_session,
+        lambda s: _init_stream_cursor(
+            s,
+            since_quote_id=since_quote_id,
+            include_existing_outbox=include_existing_outbox,
+        ),
+    )
+    await websocket.send_json(
+        {
+            "type": "connected",
+            "cursor_quote_id": cursor["last_quote_id"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    try:
+        while True:
+            delta_events = await asyncio.to_thread(
+                _run_with_session,
+                lambda s: _poll_stream_delta(s, cursor),
+            )
+            for ev in delta_events:
+                await websocket.send_json(json.loads(json.dumps(ev, default=str)))
+            await asyncio.sleep(max(0.1, poll_interval_ms / 1000.0))
+    except WebSocketDisconnect:
+        return
+

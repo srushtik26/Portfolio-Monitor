@@ -81,3 +81,12 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 .state-reset{background:var(--green-soft);color:var(--green)}
 .import-history-card{margin-top:16px}
 
+
+.live-outbox-toast-stack{position:fixed;bottom:24px;right:24px;z-index:65;display:flex;flex-direction:column;gap:10px;width:340px;max-width:calc(100vw - 32px)}
+.live-outbox-toast{background:var(--surface-raised);border:1px solid var(--border);border-left:3px solid var(--green);border-radius:9px;padding:12px 14px;box-shadow:0 12px 32px #00000045;display:flex;flex-direction:column;gap:8px}
+.live-outbox-toast.outbox-bull{border-left-color:var(--red)}
+.live-outbox-toast-header{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.live-outbox-toast-body b{font-size:11px;color:var(--text);display:block}
+.live-outbox-toast-body p{margin:4px 0 0;font-size:10px;color:var(--muted);line-height:1.45}
+.live-outbox-toast-body strong{color:var(--text);font-weight:600}
+.live-outbox-toast-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;margin-top:2px}

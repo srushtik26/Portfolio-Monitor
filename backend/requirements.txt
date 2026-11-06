@@ -8,3 +8,9 @@ sqlalchemy>=2,<3
 uvicorn[standard]>=0.30,<1
 tzdata
 yfinance>=0.2.54,<1
+NorenRestApiPy>=0.0.22
+pyotp>=2.9,<3
+websocket-client>=1.8,<2
+NorenRestApiPy>=0.0.22
+pyotp>=2.9,<3
+websocket-client>=1.8,<2
