@@ -1,7 +1,7 @@
 import csv
 import re
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO, StringIO
 from pathlib import PurePath
 from typing import Any
@@ -65,13 +65,60 @@ def _decimal(value: Any) -> Decimal | None:
     if isinstance(value, bool):
         raise InvalidOperation
     try:
-        cleaned = str(value).strip().replace(",", "").replace("₹", "").strip()
+        cleaned = (
+            str(value)
+            .strip()
+            .replace(",", "")
+            .replace("₹", "")
+            .replace("Rs.", "")
+            .replace("Rs", "")
+            .replace("INR", "")
+            .strip()
+        )
         result = Decimal(cleaned)
     except (InvalidOperation, ValueError):
         raise InvalidOperation from None
     if not result.is_finite():
         raise InvalidOperation
+    if result.as_tuple().exponent < -2:
+        result = result.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return result
+
+
+_HEADER_KEYWORDS = (
+    "exchange",
+    "exch",
+    "symbol",
+    "ticker",
+    "scrip",
+    "code",
+    "company",
+    "name",
+    "stock",
+    "security",
+    "particulars",
+    "cmp",
+    "ltp",
+    "price",
+    "base",
+    "bull",
+    "target",
+    "sector",
+    "industry",
+)
+
+
+def _score_header_row(values: Any) -> int:
+    score = 0
+    for val in values or ():
+        text = (_text(val) or "").lower()
+        if not text:
+            continue
+        if any(kw in text for kw in _HEADER_KEYWORDS):
+            score += 3
+        elif not re.fullmatch(r"[-+]?\d+(\.\d+)?", text):
+            score += 1
+    return score
 
 
 async def read_upload(file: UploadFile) -> tuple[str, bytes]:
@@ -93,25 +140,48 @@ def inspect_upload(content: bytes, filename: str, header_row: int) -> dict[str, 
     if PurePath(filename).suffix.lower() == ".csv":
         rows = _read_csv(content)
         header_values = rows[header_row - 1] if len(rows) >= header_row else []
+        best_row = header_row
+        best_score = _score_header_row(header_values)
+        for idx, candidate in enumerate(rows[:10], start=1):
+            sc = _score_header_row(candidate)
+            if sc > best_score:
+                best_score = sc
+                best_row = idx
         sheets = [{"name": "CSV", "headers": _headers(header_values)}]
-        return {"file_type": "csv", "header_row": header_row, "sheets": sheets}
+        return {
+            "file_type": "csv",
+            "header_row": header_row,
+            "suggested_header_row": best_row,
+            "sheets": sheets,
+        }
     try:
-        workbook = load_workbook(BytesIO(content), read_only=True, data_only=False)
+        workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
         sheets = []
-        for sheet in workbook.worksheets:
-            values = next(
-                sheet.iter_rows(
-                    min_row=header_row, max_row=header_row, values_only=True
-                ),
-                (),
+        suggested_row = header_row
+        for sheet_idx, sheet in enumerate(workbook.worksheets):
+            preview_rows = list(
+                sheet.iter_rows(min_row=1, max_row=max(header_row, 10), values_only=True)
             )
+            values = preview_rows[header_row - 1] if len(preview_rows) >= header_row else ()
+            if sheet_idx == 0:
+                best_score = _score_header_row(values)
+                for r_idx, candidate in enumerate(preview_rows[:10], start=1):
+                    sc = _score_header_row(candidate)
+                    if sc > best_score:
+                        best_score = sc
+                        suggested_row = r_idx
             sheets.append({"name": sheet.title, "headers": _headers(values)})
         workbook.close()
     except (ValueError, OSError, KeyError, BadZipFile, InvalidFileException) as error:
         raise HTTPException(status_code=400, detail=f"Could not read workbook: {error}") from error
     if not sheets:
         raise HTTPException(status_code=400, detail="The workbook has no worksheets.")
-    return {"file_type": "xlsx", "header_row": header_row, "sheets": sheets}
+    return {
+        "file_type": "xlsx",
+        "header_row": header_row,
+        "suggested_header_row": suggested_row,
+        "sheets": sheets,
+    }
 
 
 def _headers(values: Any) -> list[dict[str, str | None]]:
@@ -195,6 +265,16 @@ def _infer_target_direction(
     return default_dir
 
 
+def _normalize_symbol(raw_symbol: str) -> str:
+    cleaned = raw_symbol.strip().upper()
+    for suffix in (".NS", ".BO", ":NSE", ":BSE"):
+        if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+            cleaned = cleaned[: -len(suffix)].strip()
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"[^A-Z0-9.&_-]", "", cleaned)
+    return cleaned[:32]
+
+
 def create_preview(
     session: Session,
     *,
@@ -205,10 +285,10 @@ def create_preview(
     mapping: dict[str, str | None],
     uploaded_by: str = "Srushti Kadam",
 ) -> dict[str, Any]:
-    if not mapping.get("exchange_column") or not mapping.get("symbol_column") or not mapping.get("name_column"):
+    if not mapping.get("symbol_column") and not mapping.get("name_column"):
         raise HTTPException(
             status_code=422,
-            detail="Map exchange, symbol, and company name columns.",
+            detail="Map at least a symbol or company name column.",
         )
     if not mapping.get("base_target_column") and not mapping.get("bull_target_column"):
         raise HTTPException(
@@ -218,8 +298,17 @@ def create_preview(
     column_indexes = {
         field: _column_index(mapping.get(field)) for field in MAPPED_FIELDS
     }
-    configured = [index for index in column_indexes.values() if index is not None]
-    if len(configured) != len(set(configured)):
+    non_identity_fields = [
+        f for f in MAPPED_FIELDS if f not in ("symbol_column", "name_column")
+    ]
+    configured_check: list[int] = [
+        column_indexes[f] for f in non_identity_fields if column_indexes[f] is not None
+    ]
+    if column_indexes["symbol_column"] is not None:
+        configured_check.append(column_indexes["symbol_column"])
+    elif column_indexes["name_column"] is not None:
+        configured_check.append(column_indexes["name_column"])
+    if len(configured_check) != len(set(configured_check)):
         raise HTTPException(status_code=422, detail="Each mapped field must use a different column.")
 
     source_rows, sheet_names = _source_rows(content, filename, sheet_name, header_row)
@@ -281,9 +370,16 @@ def create_preview(
 
         errors: list[str] = []
         warnings: list[str] = []
-        exchange = (_text(value_for("exchange_column")) or "").upper()
-        symbol = (_text(value_for("symbol_column")) or "").upper()
+        raw_exchange = (_text(value_for("exchange_column")) or "").upper()
+        exchange = raw_exchange if raw_exchange else "NSE"
+        raw_symbol = (_text(value_for("symbol_column")) or "").upper()
         name = _text(value_for("name_column"))
+        if not raw_symbol and name:
+            symbol = _normalize_symbol(name.split()[0] if name.split() else name)
+        else:
+            symbol = _normalize_symbol(raw_symbol) if raw_symbol else ""
+        if not name and symbol:
+            name = symbol
         if exchange not in {"NSE", "BSE"}:
             errors.append(f"{coordinate('exchange_column')}: exchange must be NSE or BSE.")
         if not re.fullmatch(r"[A-Z0-9][A-Z0-9.&_-]{0,31}", symbol):
@@ -339,8 +435,8 @@ def create_preview(
         identity = (exchange, symbol)
         existing = company_lookup.get(identity) if exchange in {"NSE", "BSE"} and symbol else None
         if existing and name and existing.name.strip().casefold() != name.strip().casefold():
-            errors.append(
-                f"Row {row_number}: company name does not match the existing {exchange}:{symbol} identity."
+            warnings.append(
+                f"Row {row_number}: company name will update from '{existing.name}' to '{name}'."
             )
 
         base_dir = (
@@ -448,10 +544,6 @@ def revalidate_batch_rows(session: Session, batch: ImportBatch) -> dict[tuple[st
 
         identity = (exchange, symbol)
         existing = company_lookup.get(identity) if exchange in {"NSE", "BSE"} and symbol else None
-        if existing and name and existing.name.strip().casefold() != name.strip().casefold():
-            errors.append(
-                f"Row {row.row_number}: company name does not match the existing {exchange}:{symbol} identity."
-            )
         row.expected_version = existing.version if existing else None
         row.errors = errors
         seen.setdefault(identity, []).append(row)

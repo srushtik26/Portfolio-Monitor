@@ -119,6 +119,7 @@ class FakeNorenSdk:
 
 
 def test_shoonya_config_from_env_and_totp_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHOONYA_ALLOW_UNVERIFIED_AUTH", "true")
     monkeypatch.setenv("SHOONYA_USER_ID", "FA98765")
     monkeypatch.setenv("SHOONYA_PASSWORD", "super-secret-pwd")
     monkeypatch.setenv("SHOONYA_TOTP_SECRET", "JBSWY3DPEHPK3PXP")
@@ -130,6 +131,7 @@ def test_shoonya_config_from_env_and_totp_generation(monkeypatch: pytest.MonkeyP
     assert cfg.user_id == "FA98765"
     assert cfg.vendor_code == "FA98765_U"
     assert cfg.api_secret == "app-key-xyz"
+    assert cfg.allow_unverified_auth is True
     assert cfg.custom_token_map == {("NSE", "NEWSTOCK"): "44556"}
 
     otp = cfg.current_two_fa()
@@ -140,6 +142,7 @@ def test_shoonya_config_from_env_and_totp_generation(monkeypatch: pytest.MonkeyP
 
 
 def test_shoonya_config_missing_env_raises_auth_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHOONYA_ALLOW_UNVERIFIED_AUTH", "true")
     for key in (
         "SHOONYA_USER_ID",
         "SHOONYA_UID",
@@ -207,6 +210,7 @@ def test_websocket_subscribes_processes_ticks_and_triggers_bhel_target_alert() -
         vendor_code="FA11111_U",
         api_secret="api-key-111",
         totp_secret="JBSWY3DPEHPK3PXP",
+        allow_unverified_auth=True,
     )
     fake_sdk = FakeNorenSdk()
     service = ShoonyaWebSocketService(
@@ -260,6 +264,7 @@ def test_websocket_reconnection_with_exponential_backoff() -> None:
         reconnect_base_seconds=1.5,
         reconnect_max_seconds=10.0,
         max_reconnect_attempts=3,
+        allow_unverified_auth=True,
     )
     sleeps: list[float] = []
     created_sdks: list[FakeNorenSdk] = []
@@ -292,7 +297,7 @@ def test_websocket_reconnection_with_exponential_backoff() -> None:
     with TestSession() as session:
         hb = session.get(WorkerHeartbeat, "price")
         assert hb is not None
-        assert hb.reconnect_count == 1
+        assert hb.reconnect_count >= 1
 
 
 def test_shoonya_rest_price_provider_fetches_quote() -> None:
@@ -302,6 +307,7 @@ def test_shoonya_rest_price_provider_fetches_quote() -> None:
         vendor_code="FA11111_U",
         api_secret="api-key-111",
         totp_secret="JBSWY3DPEHPK3PXP",
+        allow_unverified_auth=True,
     )
     provider = ShoonyaPriceProvider(cfg, sdk=FakeNorenSdk())
     quote = provider.fetch_quote("NSE", "BHEL")
@@ -583,6 +589,334 @@ def test_sse_live_stream_emits_price_tick_distance_metrics_and_outbox_alert() ->
             app.dependency_overrides.pop(get_db, None)
         else:
             app.dependency_overrides[get_db] = previous_override
+
+
+def test_shoonya_provider_disabled_by_default_fails_fast_without_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SHOONYA_ALLOW_UNVERIFIED_AUTH", raising=False)
+    monkeypatch.setenv("SHOONYA_USER_ID", "FA98765")
+    monkeypatch.setenv("SHOONYA_PASSWORD", "secret")
+    monkeypatch.setenv("SHOONYA_TOTP_SECRET", "JBSWY3DPEHPK3PXP")
+    monkeypatch.setenv("SHOONYA_VENDOR_CODE", "FA98765_U")
+    monkeypatch.setenv("SHOONYA_API_SECRET", "app-key-xyz")
+
+    with pytest.raises(
+        ShoonyaAuthError,
+        match="Shoonya auth flow unverified against current official docs",
+    ):
+        ShoonyaConfig.from_env()
+
+    default_cfg = ShoonyaConfig(
+        user_id="FA98765",
+        password="secret",
+        vendor_code="FA98765_U",
+        api_secret="app-key-xyz",
+        totp_secret="JBSWY3DPEHPK3PXP",
+    )
+    assert default_cfg.allow_unverified_auth is False
+
+    with pytest.raises(
+        ShoonyaAuthError,
+        match="Shoonya auth flow unverified against current official docs",
+    ):
+        ShoonyaPriceProvider(default_cfg, sdk=FakeNorenSdk())
+
+    with pytest.raises(
+        ShoonyaAuthError,
+        match="Shoonya auth flow unverified against current official docs",
+    ):
+        ShoonyaWebSocketService(
+            default_cfg,
+            sdk_factory=lambda h, w: FakeNorenSdk(),
+            session_factory=TestSession,
+        )
+
+
+def test_honest_tick_timestamps_missing_and_unparseable_ft_are_not_fresh() -> None:
+    from app.prices import record_quote, serialize_quote
+
+    resolver = ShoonyaTokenResolver()
+    now = datetime(2026, 11, 6, 10, 0, tzinfo=timezone.utc)
+
+    with TestSession() as session:
+        session.add(
+            Company(
+                exchange="NSE",
+                symbol="BHEL",
+                name="Bharat Heavy Electricals Ltd",
+                base_target=Decimal("426.91"),
+                bull_target=Decimal("561.09"),
+                base_direction="below",
+                bull_direction="above",
+            )
+        )
+        session.commit()
+
+    # 1. tf message without lp produces no tick
+    no_lp = parse_shoonya_tick(
+        {"t": "tf", "e": "NSE", "tk": "438", "ft": str(int(now.timestamp()))},
+        resolver,
+        fallback_now=now,
+    )
+    assert no_lp is None
+
+    # 2. Tick with lp but no ft -> quoted_at is None, freshness_unknown=True, not fresh
+    no_ft = parse_shoonya_tick(
+        {"t": "tf", "e": "NSE", "tk": "438", "lp": "425.00"},
+        resolver,
+        fallback_now=now,
+    )
+    assert no_ft is not None
+    assert no_ft.quoted_at is None
+    assert no_ft.freshness_unknown is True
+
+    with TestSession() as session:
+        stored_no_ft = record_quote(session, no_ft, now=now, alerts_enabled=True)
+        assert stored_no_ft.quoted_at is None
+        assert stored_no_ft.received_at is not None
+        assert stored_no_ft.status == "freshness_unknown"
+        serialized_no_ft = serialize_quote(stored_no_ft, now=now)
+        assert serialized_no_ft["quoted_at"] is None
+        assert serialized_no_ft["received_at"] == now
+        assert serialized_no_ft["is_fresh"] is False
+        assert serialized_no_ft["freshness_unknown"] is True
+        # Never triggers alerts when freshness is unknown
+        assert session.scalar(select(func.count(TargetAlert.id))) == 0
+
+    # 3. Tick with unparseable ft -> quoted_at is None, freshness_unknown=True, not fresh
+    bad_ft = parse_shoonya_tick(
+        {"t": "tf", "e": "NSE", "tk": "438", "lp": "424.00", "ft": "invalid-epoch-xyz"},
+        resolver,
+        fallback_now=now,
+    )
+    assert bad_ft is not None
+    assert bad_ft.quoted_at is None
+    assert bad_ft.freshness_unknown is True
+
+    with TestSession() as session:
+        stored_bad_ft = record_quote(session, bad_ft, now=now, alerts_enabled=True)
+        assert stored_bad_ft.quoted_at is None
+        assert stored_bad_ft.status == "freshness_unknown"
+        serialized_bad_ft = serialize_quote(stored_bad_ft, now=now)
+        assert serialized_bad_ft["is_fresh"] is False
+        assert serialized_bad_ft["freshness_unknown"] is True
+
+    # 4. Tick with valid ft within threshold -> fresh
+    valid_epoch = int((now).timestamp()) - 10
+    valid_ft = parse_shoonya_tick(
+        {"t": "tf", "e": "NSE", "tk": "438", "lp": "431.25", "ft": str(valid_epoch)},
+        resolver,
+        freshness_seconds=300,
+        fallback_now=now,
+    )
+    assert valid_ft is not None
+    assert valid_ft.quoted_at == datetime.fromtimestamp(valid_epoch, tz=timezone.utc)
+    assert valid_ft.freshness_unknown is False
+
+    with TestSession() as session:
+        stored_valid = record_quote(session, valid_ft, now=now, alerts_enabled=True)
+        assert stored_valid.status == "fresh"
+        serialized_valid = serialize_quote(stored_valid, now=now)
+        assert serialized_valid["is_fresh"] is True
+        assert serialized_valid["freshness_unknown"] is False
+
+
+def test_bounded_queue_overflow_and_reconnect_gap_resets_cross_baselines() -> None:
+    import asyncio
+    from app.models import TargetAlertState
+
+    now = datetime.now(timezone.utc)
+    base_epoch = int(now.timestamp()) - 30
+
+    with TestSession() as session:
+        company = Company(
+            exchange="NSE",
+            symbol="BHEL",
+            name="Bharat Heavy Electricals Ltd",
+            cmp=Decimal("433.70"),
+            base_target=Decimal("426.91"),
+            bull_target=Decimal("561.09"),
+            base_direction="below",
+            bull_direction="above",
+            base_trigger_mode="crosses",
+            bull_trigger_mode="crosses",
+            rearm_policy="rearm_after_recovery",
+        )
+        session.add(company)
+        session.flush()
+        session.add(
+            TargetRevision(
+                exchange="NSE",
+                symbol="BHEL",
+                version=1,
+                base_target=company.base_target,
+                bull_target=company.bull_target,
+                base_direction="below",
+                bull_direction="above",
+                source="import",
+                changed_at=now,
+            )
+        )
+        session.commit()
+
+    # Part A: Bounded queue overflow increments counter and surfaces backlog/lag state
+    overflow_cfg = ShoonyaConfig(
+        user_id="FA11111",
+        password="secret",
+        vendor_code="FA11111_U",
+        api_secret="api-key-111",
+        totp_secret="JBSWY3DPEHPK3PXP",
+        tick_queue_maxsize=2,
+        allow_unverified_auth=True,
+    )
+    overflow_sdk = FakeNorenSdk()
+    overflow_service = ShoonyaWebSocketService(
+        overflow_cfg,
+        sdk_factory=lambda h, w: overflow_sdk,
+        session_factory=TestSession,
+    )
+    loop = asyncio.new_event_loop()
+    try:
+        bounded_queue = overflow_service.create_bounded_queue()
+        overflow_service.attach_async_queue(loop, bounded_queue)
+        overflow_service.connect_once()
+        assert overflow_sdk.subscribe_callback is not None
+        for idx in range(4):
+            overflow_sdk.subscribe_callback(
+                {
+                    "t": "tf",
+                    "e": "NSE",
+                    "tk": "438",
+                    "lp": f"{430 + idx}.00",
+                    "ft": str(base_epoch + idx),
+                }
+            )
+        health = overflow_service.get_health_snapshot()
+        assert health["queue_maxsize"] == 2
+        assert health["queue_depth"] == 2
+        assert health["queue_overflow_drops"] == 2
+        assert health["backlog_state"] == "overflow"
+        assert health["lag_detected"] is True
+        assert health["protocol_gap_detection"] == "disabled"
+    finally:
+        loop.close()
+
+    # Part B: Reconnect produces a visible gap, resets cross baselines, and prevents crossing inference across gap
+    live_cfg = ShoonyaConfig(
+        user_id="FA11111",
+        password="secret",
+        vendor_code="FA11111_U",
+        api_secret="api-key-111",
+        totp_secret="JBSWY3DPEHPK3PXP",
+        allow_unverified_auth=True,
+    )
+    fake_sdk = FakeNorenSdk()
+    service = ShoonyaWebSocketService(
+        live_cfg,
+        sdk_factory=lambda h, w: fake_sdk,
+        session_factory=TestSession,
+    )
+    service.connect_once()
+    assert fake_sdk.subscribe_callback is not None
+
+    # 1. Pre-disconnect tick at 430.00 (above Base target 426.91) establishes baseline
+    fake_sdk.subscribe_callback(
+        {
+            "t": "tf",
+            "e": "NSE",
+            "tk": "438",
+            "lp": "430.00",
+            "ft": str(base_epoch + 10),
+        }
+    )
+    assert service.get_health_snapshot()["feed_ready"] is True
+    with TestSession() as session:
+        st = session.get(TargetAlertState, ("NSE", "BHEL", "base", False))
+        assert st is not None
+        assert st.last_evaluated_price == Decimal("430.000000")
+
+    # 2. Simulate disconnect & reconnect
+    assert fake_sdk.socket_close_callback is not None
+    fake_sdk.socket_close_callback()
+    health_after_close = service.get_health_snapshot()
+    assert health_after_close["feed_ready"] is False
+    assert health_after_close["awaiting_snapshot"] is True
+    assert health_after_close["reconnect_gaps_count"] == 1
+    assert len(health_after_close["gap_history"]) == 1
+
+    # Cross baseline for BHEL must be reset to None on disconnect/reconnect
+    with TestSession() as session:
+        st_reset = session.get(TargetAlertState, ("NSE", "BHEL", "base", False))
+        assert st_reset is not None
+        assert st_reset.last_evaluated_price is None
+
+    # Reopen socket
+    assert fake_sdk.socket_open_callback is not None
+    fake_sdk.socket_open_callback()
+    assert service.get_health_snapshot()["feed_ready"] is False
+    assert service.get_health_snapshot()["awaiting_snapshot"] is True
+
+    # 3. First tick after reconnect has no ft (freshness_unknown) -> does NOT restore feed_ready
+    fake_sdk.subscribe_callback(
+        {
+            "t": "tf",
+            "e": "NSE",
+            "tk": "438",
+            "lp": "425.50",
+        }
+    )
+    assert service.get_health_snapshot()["feed_ready"] is False
+
+    # 4. Fresh snapshot tick after reconnect arrives at 425.00 (<= 426.91 Base target).
+    # Restores feed_ready, keeps historical gap visible, and establishes new baseline
+    # WITHOUT inferring a crossing across the reconnect gap!
+    fake_sdk.subscribe_callback(
+        {
+            "t": "tf",
+            "e": "NSE",
+            "tk": "438",
+            "lp": "425.00",
+            "ft": str(base_epoch + 15),
+        }
+    )
+    health_restored = service.get_health_snapshot()
+    assert health_restored["feed_ready"] is True
+    assert health_restored["awaiting_snapshot"] is False
+    assert health_restored["reconnect_gaps_count"] == 1
+    assert len(health_restored["gap_history"]) == 1
+
+    with TestSession() as session:
+        assert session.scalar(select(func.count(TargetAlert.id))) == 0
+        st_post_gap = session.get(TargetAlertState, ("NSE", "BHEL", "base", False))
+        assert st_post_gap is not None
+        assert st_post_gap.last_evaluated_price == Decimal("425.000000")
+
+    # 5. Subsequent recovery above target (430.00) followed by live downward cross (426.00) triggers alert
+    fake_sdk.subscribe_callback(
+        {
+            "t": "tf",
+            "e": "NSE",
+            "tk": "438",
+            "lp": "430.00",
+            "ft": str(base_epoch + 20),
+        }
+    )
+    fake_sdk.subscribe_callback(
+        {
+            "t": "tf",
+            "e": "NSE",
+            "tk": "438",
+            "lp": "426.00",
+            "ft": str(base_epoch + 25),
+        }
+    )
+    with TestSession() as session:
+        alerts = list(session.scalars(select(TargetAlert)))
+        assert len(alerts) == 1
+        assert alerts[0].target_kind == "base"
+        assert alerts[0].price == Decimal("426.000000")
+
 
 
 

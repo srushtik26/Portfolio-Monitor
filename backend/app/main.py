@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .database import ensure_sqlite_schema
 from .routes import router
+
+ensure_sqlite_schema()
 
 app = FastAPI(title="Portfolio Monitor API")
 app.add_middleware(

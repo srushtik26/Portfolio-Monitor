@@ -19,12 +19,13 @@ class PriceQuoteRead(BaseModel):
     currency: str
     provider: str
     quote_type: Literal["last_trade", "candle_close", "fixture", "provider_quote", "websocket_tick"]
-    quoted_at: datetime
+    quoted_at: datetime | None = None
     received_at: datetime
     is_simulated: bool
     freshness_seconds: int
-    status: Literal["fresh", "stale", "out_of_order", "simulated"]
+    status: Literal["fresh", "stale", "out_of_order", "simulated", "freshness_unknown"]
     is_fresh: bool
+    freshness_unknown: bool = False
 
 
 class TargetAlertStateRead(BaseModel):

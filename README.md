@@ -11,7 +11,7 @@ A production-ready React + TypeScript and FastAPI **price-monitoring and target-
 1. **Configurable Target Alert Engine (`backend/app/prices.py`)**:
    - Tracks both **Base Target Price** and **Bull Target Price** per `(exchange, symbol)` identity.
    - Configurable comparison direction per target: `below` (`price <= target`), `above` (`price >= target`), or `pending` (awaits explicit configuration rather than silently assuming a direction).
-   - Configurable trigger conditions: `at_or_beyond` (triggers immediately if already beyond target when monitoring starts) or `crosses` (requires crossing from the opposite side).
+   - Configurable trigger conditions: `at_or_beyond` (triggers immediately if already beyond target when monitoring starts) or `crosses` (requires crossing from the opposite side, with automatic cross-baseline reset on feed gaps/reconnects).
    - Configurable re-trigger policies: `once_per_revision`, `rearm_on_reset`, `rearm_after_recovery`, and `cooldown` (with configurable cooldown minutes).
    - Saved CMP from Excel uploads is stored strictly as historical reference data and is **never** treated as a live market price.
 
@@ -23,11 +23,37 @@ A production-ready React + TypeScript and FastAPI **price-monitoring and target-
 
 3. **Independent Background Monitoring Service (`backend/app/worker.py`)**:
    - Runs independently of browser tabs using a single-instance file lock (`single_worker_lock`).
-   - Supports NSE and BSE stocks with an authoritative Indian market calendar (`NseBseExchangeCalendar`, 09:15–15:30 IST with NSE/BSE holidays and Muhurat sessions) and automatic Yahoo Finance polling with retry/backoff and stale-price detection.
+   - Supports NSE and BSE stocks with an authoritative Indian market calendar (`NseBseExchangeCalendar`, 09:15–15:30 IST with NSE/BSE holidays and Muhurat sessions), honest source-only tick timestamps (marking ticks without a valid source timestamp as `freshness_unknown`), bounded tick queues with overflow counters, and explicit reconnect gap tracking.
 
 4. **Reliable Multi-Channel Notification System (`backend/app/notifications.py`)**:
-   - Transactional notification outbox (`NotificationOutbox`) with bounded exponential backoff retries (15s to 15m), claim leases, and idempotency keys.
-   - Supports **Dashboard notifications** and **Email notifications** (`SmtpEmailNotifier` via SMTP TLS or local `.eml` spool directory `SMTP_SPOOL_DIR`) with configurable recipient lists (`GET/PUT /api/notifications/preferences`).
+   - Controlled by a single environment variable: `NOTIFICATION_MODE` (`dry_run` by default, or `live`).
+   - Even if live channels are enabled in the Settings UI, the worker requires **BOTH** `NOTIFICATION_MODE=live` **AND** complete SMTP configuration (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`) before attempting any real delivery; otherwise it stays in `dry_run` mode and logs the reason.
+
+---
+
+## Shoonya prerequisites before enabling
+
+The Shoonya (`backend/app/shoonya_feed.py`) adapter is **disabled by default** and marked **UNVERIFIED** in code and configuration. Starting the Shoonya provider without explicit opt-in (`SHOONYA_ALLOW_UNVERIFIED_AUTH=true`) fails fast with:
+
+```text
+Shoonya auth flow unverified against current official docs
+```
+
+Before enabling Shoonya in any live environment, verify and complete the following prerequisites:
+
+1. **Supported Login Flow (OAuth vs Legacy SDK Login)**:
+   - Current official Shoonya API documentation specifies an **OAuth-based authentication flow**, while also containing conflicting legacy TOTP guidance.
+   - The legacy `NorenRestApiPy` direct login (`userid`, `password`, `twoFA` TOTP, `vendor_code`, `api_secret`, `imei`) implemented in `backend/app/shoonya_feed.py` is **UNVERIFIED** against the current official specification and must be confirmed with Finvasia support or updated to the verified OAuth token exchange before live use.
+2. **Exact WebSocket & REST Endpoints**:
+   - Current official documentation references `wss://api.shoonya.com/NorenWSAPI/` for WebSocket connections, whereas legacy `NorenRestApiPy` defaults use `https://api.shoonya.com/NorenWClientTP/` (REST) and `wss://api.shoonya.com/NorenWSTP/` (WebSocket).
+   - Confirm the exact production endpoints for your account tier and set `SHOONYA_HOST` and `SHOONYA_WS_ENDPOINT` accordingly.
+3. **Token & Field Mapping Verification**:
+   - All static scrip tokens in `DEFAULT_SHOONYA_TOKENS` and payload field mappings (`e`, `tk`, `lp`, `ft`, sequence fields) are marked **UNVERIFIED**.
+   - Replace static token mappings with values dynamically verified from the official Shoonya scrip master / authenticated login response before enabling live monitoring.
+4. **Static-IP Requirement**:
+   - Finvasia / NSE / BSE API regulations require registering a **whitelisted static public IP address** against your API key/vendor code before authentication and market-data subscriptions will succeed.
+5. **Credential Storage**:
+   - Store all broker credentials and secrets exclusively in runtime environment variables or an encrypted secret manager outside the repository (e.g., `.env` excluded via `.gitignore`, OS secret store, or vault). Never commit credentials, tokens, or TOTP secrets to source control.
 
 ---
 
@@ -45,13 +71,13 @@ python -m venv .venv
 
 ### 2. Independent Background Price Monitoring Worker
 
-Run in a separate always-on process (e.g., systemd service, Windows Service / NSSM, Docker container, or supervisor):
+Run in a separate always-on process (defaults to `NOTIFICATION_MODE=dry_run`):
 
 ```powershell
 cd "Portfolio-Monitor/backend"
 $env:ALERT_RULES_ENABLED = "true"
-$env:NOTIFICATION_DELIVERY_MODE = "live"
-.\.venv\Scripts\python.exe -m app.worker --provider yfinance --calendar nse_bse --interval-seconds 60
+$env:NOTIFICATION_MODE = "dry_run"
+.\.venv\Scripts\python.exe -m app.worker --provider fixture --calendar fixture --interval-seconds 60
 ```
 
 ### 3. Frontend Dashboard
@@ -66,10 +92,13 @@ npm run dev -- --host 127.0.0.1
 Build the production frontend bundle with:
 
 ```powershell
+npx tsc --noEmit
 npm run build
 ```
 
 ### 4. Running Automated Tests
+
+All tests run in simulated/fixture dry-run mode without network calls:
 
 ```powershell
 cd "Portfolio-Monitor/backend"

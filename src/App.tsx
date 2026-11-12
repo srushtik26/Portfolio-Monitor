@@ -55,6 +55,7 @@ import {
   fetchNotificationPreferences,
   fetchWorkerStatus,
   performAlertAction,
+  resetWorkspaceData,
   restoreImportVersion,
   triggerOnDemandPoll,
   updateCompanyTargets,
@@ -105,8 +106,32 @@ function formatDistance(absVal?: number | null, pctVal?: number | null) {
   return `${sign}${money(absVal)} (${percent(pctVal)})`;
 }
 
+function isQuoteFreshnessUnknown(quote: PortfolioCompany["latest_quote"]): boolean {
+  if (!quote) return false;
+  return (
+    quote.status === "freshness_unknown" ||
+    quote.freshness_unknown === true ||
+    quote.quoted_at == null
+  );
+}
+
+function isAlertActive(alert: ApiAlert): boolean {
+  const st = alert.lifecycle_status ?? "active";
+  return st === "active" || st === "triggered";
+}
+
 function alertStatusBadge(company: PortfolioCompany) {
   const quote = company.latest_quote;
+  const freshnessUnknown =
+    isQuoteFreshnessUnknown(quote) || company.alert_status === "freshness_unknown";
+  if (freshnessUnknown) {
+    return (
+      <span className="status-badge badge-approaching">
+        <i />
+        FRESHNESS UNKNOWN
+      </span>
+    );
+  }
   const isStale = quote != null && !quote.is_fresh && !quote.is_simulated;
   if (isStale) {
     return <span className="status-badge badge-sell"><i />STALE QUOTE</span>;
@@ -124,7 +149,7 @@ function alertStatusBadge(company: PortfolioCompany) {
   if (st === "pending_configuration") {
     return <span className="status-badge badge-approaching"><i />Pending Config</span>;
   }
-  if (st === "inactive") {
+  if (st === "inactive" || st === "paused") {
     return <span className="status-badge badge-neutral"><i />Paused</span>;
   }
   if (company.nearest_target_pct != null && company.nearest_target_pct <= 2.5) {
@@ -264,16 +289,60 @@ export default function App() {
     }
   };
 
-  const activeAlertsCount = apiAlerts.filter(
-    (a) => (a.lifecycle_status ?? "triggered") === "triggered",
-  ).length;
-  const staleCompanies = portfolioCompanies.filter(
-    (c) => c.latest_quote != null && !c.latest_quote.is_fresh && !c.latest_quote.is_simulated,
+  const activeAlertsCount = apiAlerts.filter(isAlertActive).length;
+  const freshnessUnknownCompanies = portfolioCompanies.filter((c) =>
+    isQuoteFreshnessUnknown(c.latest_quote),
   );
-  const feedHealthy =
+  const staleCompanies = portfolioCompanies.filter(
+    (c) =>
+      c.latest_quote != null &&
+      !isQuoteFreshnessUnknown(c.latest_quote) &&
+      !c.latest_quote.is_fresh &&
+      !c.latest_quote.is_simulated,
+  );
+  const freshCompaniesCount = portfolioCompanies.filter(
+    (c) =>
+      c.latest_quote != null &&
+      !isQuoteFreshnessUnknown(c.latest_quote) &&
+      c.latest_quote.is_fresh &&
+      !c.latest_quote.is_simulated,
+  ).length;
+
+  // (a) Browser-to-backend transport status (SSE / WS / polling)
+  const browserTransportStatus =
+    portfolioStatus === "error"
+      ? "disconnected"
+      : liveStream.state === "connected"
+        ? liveStream.transport
+        : "polling";
+
+  // (b) Broker/provider feed health (connected, last quote time, freshness, gaps)
+  const brokerProviderName = workerStatus?.provider || "unknown";
+  const providerConnected =
+    workerStatus?.state === "running" &&
+    (workerStatus?.connection_status === "connected" ||
+      workerStatus?.connection_status === "polling") &&
+    workerStatus?.feed_ready === true;
+  const brokerFeedLive =
     portfolioStatus === "ready" &&
-    workerStatus?.state !== "error" &&
-    staleCompanies.length === 0;
+    providerConnected &&
+    freshCompaniesCount > 0 &&
+    staleCompanies.length === 0 &&
+    freshnessUnknownCompanies.length === 0 &&
+    !workerStatus?.lag_detected;
+
+  const headerShortStatusLabel =
+    portfolioStatus === "error"
+      ? "API Down"
+      : brokerFeedLive
+        ? "Live"
+        : freshnessUnknownCompanies.length > 0
+          ? "Unknown Time"
+          : staleCompanies.length > 0
+            ? "Stale"
+            : workerStatus?.state === "running"
+              ? "Awaiting Quotes"
+              : "Feed Offline";
 
   return (
     <div
@@ -397,18 +466,22 @@ export default function App() {
               </kbd>
             </label>
             <div className="top-divider" />
-            <div className={`connection ${feedHealthy ? "connected" : "disconnected"}`}>
+            <div
+              className={`connection ${brokerFeedLive ? "connected" : "disconnected"}`}
+              title={`Broker Feed: ${brokerProviderName} (${workerStatus?.connection_status ?? "stopped"}) · UI Transport: ${browserTransportStatus.toUpperCase()}`}
+            >
               <span className="status-dot" />
+              <span className="connection-mobile-label">{headerShortStatusLabel}</span>
               <span className="connection-label">
                 {portfolioStatus === "error"
                   ? "Backend Disconnected"
-                  : staleCompanies.length > 0
-                    ? `${staleCompanies.length} Stale Quote(s)`
-                    : `Feed ${workerStatus?.provider ?? "shoonya"} · ${
-                        liveStream.state === "connected"
-                          ? `Live ${liveStream.transport.toUpperCase()}`
-                          : (workerStatus?.state ?? "ready")
-                      }`}
+                  : brokerFeedLive
+                    ? `Live · Provider ${brokerProviderName} (${freshCompaniesCount} fresh) · UI ${browserTransportStatus.toUpperCase()}`
+                    : freshnessUnknownCompanies.length > 0
+                      ? `Provider ${brokerProviderName} · ${freshnessUnknownCompanies.length} Freshness Unknown · UI ${browserTransportStatus.toUpperCase()}`
+                      : staleCompanies.length > 0
+                        ? `Provider ${brokerProviderName} · ${staleCompanies.length} Stale Quote(s) · UI ${browserTransportStatus.toUpperCase()}`
+                        : `Provider ${brokerProviderName} · Worker ${workerStatus?.state ?? "stopped"} (Not Ready) · UI ${browserTransportStatus.toUpperCase()}`}
               </span>
             </div>
             <button
@@ -477,6 +550,12 @@ export default function App() {
                 notify("Restored earlier approved target version");
                 reloadAll();
               }}
+              onResetWorkspace={async () => {
+                await resetWorkspaceData();
+                setSelectedCompany(null);
+                notify("All workspace data cleared");
+                reloadAll();
+              }}
               search={query}
             />
           )}
@@ -539,7 +618,12 @@ export default function App() {
             />
           )}
 
-          {page === "Upload Excel" && <BackendUploadPage onCompleted={reloadAll} />}
+          {page === "Upload Excel" && (
+            <BackendUploadPage
+              onCompleted={reloadAll}
+              onNavigatePortfolio={() => pickPage("Portfolio")}
+            />
+          )}
 
           {page === "Settings" && (
             <SettingsPage
@@ -769,6 +853,7 @@ function OverviewPage({
   onPollNow,
   isPollingNow,
   onRestoreVersion,
+  onResetWorkspace,
   search,
 }: {
   companies: PortfolioCompany[];
@@ -780,6 +865,7 @@ function OverviewPage({
   onPollNow: () => Promise<void>;
   isPollingNow: boolean;
   onRestoreVersion: (id: string) => Promise<void>;
+  onResetWorkspace: () => Promise<void>;
   search: string;
 }) {
   const activeMonitoringCount = companies.filter(
@@ -794,6 +880,35 @@ function OverviewPage({
   const pendingConfigCount =
     companies.filter((c) => c.alert_status === "pending_configuration").length +
     importHistory.filter((b) => b.status === "preview").length;
+  const freshQuotesCount = companies.filter(
+    (c) =>
+      c.latest_quote != null &&
+      !isQuoteFreshnessUnknown(c.latest_quote) &&
+      c.latest_quote.is_fresh &&
+      !c.latest_quote.is_simulated,
+  ).length;
+  const workerFeedReady =
+    workerStatus?.state === "running" &&
+    workerStatus?.feed_ready === true &&
+    freshQuotesCount > 0;
+  const workerTileValue =
+    workerStatus?.state === "error"
+      ? "FEED ERROR"
+      : workerFeedReady
+        ? (workerStatus?.provider ?? "unknown").toUpperCase()
+        : "NOT READY";
+  const workerTileTone =
+    workerStatus?.state === "error" ? "red" : workerFeedReady ? "green" : "amber";
+  const workerTileHint =
+    workerStatus?.state === "error"
+      ? workerStatus.last_error || "Background worker reported an error"
+      : workerFeedReady
+        ? workerStatus?.last_poll_at
+          ? `Last quote: ${new Date(workerStatus.last_poll_at).toLocaleTimeString("en-IN")}`
+          : `${freshQuotesCount} fresh live quotes`
+        : workerStatus?.state === "running"
+          ? "Worker running · No fresh quotes yet"
+          : "Worker stopped · No live quotes";
 
   const nearestCompanies = useMemo(() => {
     return [...companies]
@@ -810,10 +925,18 @@ function OverviewPage({
         description="Real-time NSE & BSE price monitoring, configurable Base/Bull target alerts, and feed telemetry."
         action={
           <div className="heading-actions">
+            {(companies.length > 0 || importHistory.length > 0) && (
+              <button
+                className="button secondary"
+                onClick={() => void onResetWorkspace()}
+              >
+                <RotateCcw size={14} /> Clear All Data
+              </button>
+            )}
             <button
               className="button secondary"
               onClick={() => void onPollNow()}
-              disabled={isPollingNow}
+              disabled={isPollingNow || companies.length === 0}
             >
               <RefreshCw size={14} /> {isPollingNow ? "Polling Quotes…" : "Poll Live Quotes"}
             </button>
@@ -851,15 +974,11 @@ function OverviewPage({
         />
         <MetricCard
           label="Pending / Feed Status"
-          value={workerStatus?.provider ? workerStatus.provider.toUpperCase() : "READY"}
+          value={workerTileValue}
           change={`${pendingConfigCount} pending config`}
           icon={Activity}
-          tone={workerStatus?.state === "error" ? "red" : "green"}
-          hint={
-            workerStatus?.last_poll_at
-              ? `Last poll: ${new Date(workerStatus.last_poll_at).toLocaleTimeString("en-IN")}`
-              : "Independent worker ready"
-          }
+          tone={workerTileTone}
+          hint={workerTileHint}
         />
       </div>
 
@@ -935,25 +1054,33 @@ function OverviewPage({
           <div className="worker-status-grid" style={{ padding: "8px 0" }}>
             <div>
               <small>Provider Connection</small>
-              <b>{workerStatus?.provider ?? "yfinance (NSE/BSE)"}</b>
-            </div>
-            <div>
-              <small>WebSocket / Transport</small>
-              <b>{workerStatus?.websocket_status ?? "Polling fallback active"}</b>
-            </div>
-            <div>
-              <small>Last Successful Update</small>
               <b>
-                {workerStatus?.last_poll_at
-                  ? new Date(workerStatus.last_poll_at).toLocaleString("en-IN")
-                  : "Awaiting poll"}
+                {workerStatus?.provider ?? "unknown"} (
+                {workerStatus?.connection_status ?? workerStatus?.state ?? "stopped"})
               </b>
             </div>
             <div>
-              <small>Stale / Failed Quotes</small>
+              <small>Feed Readiness & Backlog</small>
+              <b>
+                {workerStatus?.feed_ready ? "Ready" : "Not Ready"} · Queue:{" "}
+                {workerStatus?.backlog_state ?? "normal"} (
+                {workerStatus?.queue_overflow_drops ?? 0} drops)
+              </b>
+            </div>
+            <div>
+              <small>Last Quote Time</small>
+              <b>
+                {workerStatus?.last_poll_at
+                  ? new Date(workerStatus.last_poll_at).toLocaleString("en-IN")
+                  : "No live quotes recorded"}
+              </b>
+            </div>
+            <div>
+              <small>Freshness & Gaps</small>
               <b>
                 {workerStatus?.stale_symbols_count ?? 0} stale ·{" "}
-                {workerStatus?.last_poll_failed ?? 0} failed
+                {workerStatus?.freshness_unknown_symbols_count ?? 0} unknown ·{" "}
+                {workerStatus?.reconnect_gaps_count ?? 0} reconnect gap(s)
               </b>
             </div>
           </div>
@@ -1026,77 +1153,214 @@ function MonitoringTable({
     );
   }
   return (
-    <table className="portfolio-table">
-      <thead>
-        <tr>
-          <th>
-            {onSort ? (
-              <button onClick={() => onSort("name")}>
-                Company <ArrowDownUp size={11} />
-              </button>
-            ) : (
-              "Company"
-            )}
-          </th>
-          <th>
-            {onSort ? (
-              <button onClick={() => onSort("price")}>
-                Latest Price <ArrowDownUp size={11} />
-              </button>
-            ) : (
-              "Latest Price"
-            )}
-          </th>
-          <th>
-            {onSort ? (
-              <button onClick={() => onSort("base")}>
-                Base Target <ArrowDownUp size={11} />
-              </button>
-            ) : (
-              "Base Target"
-            )}
-          </th>
-          <th>
-            {onSort ? (
-              <button onClick={() => onSort("bull")}>
-                Bull Target <ArrowDownUp size={11} />
-              </button>
-            ) : (
-              "Bull Target"
-            )}
-          </th>
-          <th>Distance to Base</th>
-          <th>Distance to Bull</th>
-          <th>
-            {onSort ? (
-              <button onClick={() => onSort("nearest")}>
-                Alert Status <ArrowDownUp size={11} />
-              </button>
-            ) : (
-              "Alert Status"
-            )}
-          </th>
-          <th>Last Quote</th>
-        </tr>
-      </thead>
-      <tbody>
+    <>
+      <table className="portfolio-table">
+        <thead>
+          <tr>
+            <th>
+              {onSort ? (
+                <button onClick={() => onSort("name")}>
+                  Company <ArrowDownUp size={11} />
+                </button>
+              ) : (
+                "Company"
+              )}
+            </th>
+            <th>
+              {onSort ? (
+                <button onClick={() => onSort("price")}>
+                  Latest Price <ArrowDownUp size={11} />
+                </button>
+              ) : (
+                "Latest Price"
+              )}
+            </th>
+            <th>
+              {onSort ? (
+                <button onClick={() => onSort("base")}>
+                  Base Target <ArrowDownUp size={11} />
+                </button>
+              ) : (
+                "Base Target"
+              )}
+            </th>
+            <th>
+              {onSort ? (
+                <button onClick={() => onSort("bull")}>
+                  Bull Target <ArrowDownUp size={11} />
+                </button>
+              ) : (
+                "Bull Target"
+              )}
+            </th>
+            <th>Distance to Base</th>
+            <th>Distance to Bull</th>
+            <th>
+              {onSort ? (
+                <button onClick={() => onSort("nearest")}>
+                  Alert Status <ArrowDownUp size={11} />
+                </button>
+              ) : (
+                "Alert Status"
+              )}
+            </th>
+            <th>Last Quote</th>
+          </tr>
+        </thead>
+        <tbody>
+          {companies.map((company) => {
+            const quote = company.latest_quote;
+            const freshnessUnknown = isQuoteFreshnessUnknown(quote);
+            const isStale =
+              quote != null && !freshnessUnknown && !quote.is_fresh && !quote.is_simulated;
+            const vsSavedCmp =
+              quote && company.cmp && company.cmp > 0
+                ? ((quote.price - company.cmp) / company.cmp) * 100
+                : null;
+            return (
+              <tr
+                key={`${company.exchange}:${company.symbol}`}
+                onClick={() => onSelectCompany(company)}
+                style={{
+                  cursor: "pointer",
+                  background: isStale
+                    ? "rgba(239, 114, 123, 0.08)"
+                    : freshnessUnknown
+                      ? "rgba(231, 173, 90, 0.08)"
+                      : undefined,
+                }}
+              >
+                <td>
+                  <div className="company-name-cell">
+                    <div className="company-avatar">{company.symbol.slice(0, 2)}</div>
+                    <span>
+                      <b>{company.name}</b>
+                      <small>
+                        {company.symbol} ·{" "}
+                        <span
+                          className={`exchange-tag ${
+                            company.exchange === "BSE" ? "bse-tag" : ""
+                          }`}
+                        >
+                          {company.exchange}
+                        </span>{" "}
+                        · Ref CMP: {company.cmp == null ? "—" : money(company.cmp)}
+                      </small>
+                    </span>
+                  </div>
+                </td>
+                <td>
+                  {quote ? (
+                    <div>
+                      <b>{money(quote.price)}</b>{" "}
+                      {vsSavedCmp != null && (
+                        <span className={vsSavedCmp >= 0 ? "positive" : "negative"}>
+                          {vsSavedCmp >= 0 ? (
+                            <ArrowUpRight size={12} />
+                          ) : (
+                            <ArrowDownRight size={12} />
+                          )}
+                          {percent(vsSavedCmp)}
+                        </span>
+                      )}
+                      <small className="quote-freshness">
+                        {freshnessUnknown
+                          ? "⚠ Freshness unknown"
+                          : isStale
+                            ? "⚠ STALE QUOTE"
+                            : quote.is_simulated
+                              ? "Simulated"
+                              : "Live Validated"}
+                      </small>
+                    </div>
+                  ) : (
+                    <span className="quote-freshness">Awaiting live quote</span>
+                  )}
+                </td>
+                <td className="target-base-price">
+                  <div>
+                    <b>{company.base_target == null ? "—" : money(company.base_target)}</b>
+                  </div>
+                  <small className="cell-sub">
+                    {company.base_direction === "below"
+                      ? "Trigger ≤ Base"
+                      : company.base_direction === "above"
+                        ? "Trigger ≥ Base"
+                        : "Pending direction"}
+                  </small>
+                </td>
+                <td className="target-bull-price">
+                  <div>
+                    <b>{company.bull_target == null ? "—" : money(company.bull_target)}</b>
+                  </div>
+                  <small className="cell-sub">
+                    {company.bull_direction === "above"
+                      ? "Trigger ≥ Bull"
+                      : company.bull_direction === "below"
+                        ? "Trigger ≤ Bull"
+                        : "Pending direction"}
+                  </small>
+                </td>
+                <td>
+                  <span
+                    className={
+                      (company.distance_to_base_pct ?? 0) <= 0 ? "positive" : "text-muted"
+                    }
+                  >
+                    {formatDistance(company.distance_to_base_abs, company.distance_to_base_pct)}
+                  </span>
+                </td>
+                <td>
+                  <span
+                    className={
+                      (company.distance_to_bull_pct ?? 0) >= 0 ? "positive" : "text-muted"
+                    }
+                  >
+                    {formatDistance(company.distance_to_bull_abs, company.distance_to_bull_pct)}
+                  </span>
+                </td>
+                <td>{alertStatusBadge(company)}</td>
+                <td>
+                  {quote ? (
+                    <div>
+                      <div>
+                        {quote.quoted_at
+                          ? new Date(quote.quoted_at).toLocaleTimeString("en-IN")
+                          : "Freshness unknown"}
+                      </div>
+                      <small className="cell-sub">
+                        {quote.provider} ·{" "}
+                        {freshnessUnknown
+                          ? "No source timestamp"
+                          : isStale
+                            ? "STALE"
+                            : "Fresh"}
+                      </small>
+                    </div>
+                  ) : (
+                    <small className="cell-sub">No quote yet</small>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+
+      <div className="mobile-company-cards" aria-label="Monitored companies mobile cards">
         {companies.map((company) => {
           const quote = company.latest_quote;
-          const isStale = quote != null && !quote.is_fresh && !quote.is_simulated;
-          const vsSavedCmp =
-            quote && company.cmp && company.cmp > 0
-              ? ((quote.price - company.cmp) / company.cmp) * 100
-              : null;
+          const freshnessUnknown = isQuoteFreshnessUnknown(quote);
+          const isStale =
+            quote != null && !freshnessUnknown && !quote.is_fresh && !quote.is_simulated;
           return (
-            <tr
-              key={`${company.exchange}:${company.symbol}`}
+            <button
+              key={`mobile-${company.exchange}:${company.symbol}`}
+              type="button"
+              className="mobile-company-card"
               onClick={() => onSelectCompany(company)}
-              style={{
-                cursor: "pointer",
-                background: isStale ? "rgba(239, 114, 123, 0.08)" : undefined,
-              }}
             >
-              <td>
+              <div className="mobile-card-head">
                 <div className="company-name-cell">
                   <div className="company-avatar">{company.symbol.slice(0, 2)}</div>
                   <span>
@@ -1109,94 +1373,73 @@ function MonitoringTable({
                         }`}
                       >
                         {company.exchange}
-                      </span>{" "}
-                      · Ref CMP: {company.cmp == null ? "—" : money(company.cmp)}
+                      </span>
                     </small>
                   </span>
                 </div>
-              </td>
-              <td>
-                {quote ? (
-                  <div>
-                    <b>{money(quote.price)}</b>{" "}
-                    {vsSavedCmp != null && (
-                      <span className={vsSavedCmp >= 0 ? "positive" : "negative"}>
-                        {vsSavedCmp >= 0 ? (
-                          <ArrowUpRight size={12} />
-                        ) : (
-                          <ArrowDownRight size={12} />
-                        )}
-                        {percent(vsSavedCmp)}
-                      </span>
-                    )}
-                    <small className="quote-freshness">
-                      {isStale ? "⚠ STALE QUOTE" : quote.is_simulated ? "Simulated" : "Live Validated"}
-                    </small>
-                  </div>
-                ) : (
-                  <span className="quote-freshness">Awaiting live quote</span>
-                )}
-              </td>
-              <td className="target-base-price">
-                <div>
-                  <b>{company.base_target == null ? "—" : money(company.base_target)}</b>
+                {alertStatusBadge(company)}
+              </div>
+
+              <div className="mobile-card-grid">
+                <div className="mobile-card-metric">
+                  <small>Latest Price</small>
+                  <b>{quote ? money(quote.price) : "Awaiting quote"}</b>
+                  <span className="cell-sub">
+                    {quote
+                      ? freshnessUnknown
+                        ? "Freshness unknown"
+                        : isStale
+                          ? "STALE QUOTE"
+                          : quote.quoted_at
+                            ? new Date(quote.quoted_at).toLocaleTimeString("en-IN")
+                            : "Fresh"
+                      : `Ref CMP: ${company.cmp == null ? "—" : money(company.cmp)}`}
+                  </span>
                 </div>
-                <small className="cell-sub">
-                  {company.base_direction === "below"
-                    ? "Trigger ≤ Base"
-                    : company.base_direction === "above"
-                      ? "Trigger ≥ Base"
-                      : "Pending direction"}
-                </small>
-              </td>
-              <td className="target-bull-price">
-                <div>
-                  <b>{company.bull_target == null ? "—" : money(company.bull_target)}</b>
+
+                <div className="mobile-card-metric">
+                  <small>Base Target</small>
+                  <b className="target-base-price">
+                    {company.base_target == null ? "—" : money(company.base_target)}
+                  </b>
+                  <span className="cell-sub">
+                    {company.base_direction === "below"
+                      ? "Trigger ≤ Base"
+                      : company.base_direction === "above"
+                        ? "Trigger ≥ Base"
+                        : "Pending direction"}
+                  </span>
                 </div>
-                <small className="cell-sub">
-                  {company.bull_direction === "above"
-                    ? "Trigger ≥ Bull"
-                    : company.bull_direction === "below"
-                      ? "Trigger ≤ Bull"
-                      : "Pending direction"}
-                </small>
-              </td>
-              <td>
-                <span
-                  className={
-                    (company.distance_to_base_pct ?? 0) <= 0 ? "positive" : "text-muted"
-                  }
-                >
-                  {formatDistance(company.distance_to_base_abs, company.distance_to_base_pct)}
-                </span>
-              </td>
-              <td>
-                <span
-                  className={
-                    (company.distance_to_bull_pct ?? 0) >= 0 ? "positive" : "text-muted"
-                  }
-                >
-                  {formatDistance(company.distance_to_bull_abs, company.distance_to_bull_pct)}
-                </span>
-              </td>
-              <td>{alertStatusBadge(company)}</td>
-              <td>
-                {quote ? (
-                  <div>
-                    <div>{new Date(quote.quoted_at).toLocaleTimeString("en-IN")}</div>
-                    <small className="cell-sub">
-                      {quote.provider} · {isStale ? "STALE" : "Fresh"}
-                    </small>
-                  </div>
-                ) : (
-                  <small className="cell-sub">No quote yet</small>
-                )}
-              </td>
-            </tr>
+
+                <div className="mobile-card-metric">
+                  <small>Bull Target</small>
+                  <b className="target-bull-price">
+                    {company.bull_target == null ? "—" : money(company.bull_target)}
+                  </b>
+                  <span className="cell-sub">
+                    {company.bull_direction === "above"
+                      ? "Trigger ≥ Bull"
+                      : company.bull_direction === "below"
+                        ? "Trigger ≤ Bull"
+                        : "Pending direction"}
+                  </span>
+                </div>
+
+                <div className="mobile-card-metric">
+                  <small>Distance to Base / Bull</small>
+                  <b>
+                    Base: {formatDistance(company.distance_to_base_abs, company.distance_to_base_pct)}
+                  </b>
+                  <span className="cell-sub">
+                    Bull: {formatDistance(company.distance_to_bull_abs, company.distance_to_bull_pct)}
+                  </span>
+                </div>
+              </div>
+            </button>
           );
         })}
-      </tbody>
-    </table>
+      </div>
+    </>
   );
 }
 
@@ -1235,8 +1478,10 @@ function PortfolioPage({
           !term || `${c.name} ${c.symbol}`.toLowerCase().includes(term);
         const matchesExchange =
           exchange === "All exchanges" || c.exchange === exchange;
+        const freshnessUnknown = isQuoteFreshnessUnknown(c.latest_quote);
         const isStale =
           c.latest_quote != null &&
+          !freshnessUnknown &&
           !c.latest_quote.is_fresh &&
           !c.latest_quote.is_simulated;
         const matchesAlert =
@@ -1253,6 +1498,7 @@ function PortfolioPage({
               c.alert_status === "both_triggered")) ||
           (alertFilter === "Pending Config" &&
             c.alert_status === "pending_configuration") ||
+          (alertFilter === "Freshness Unknown" && freshnessUnknown) ||
           (alertFilter === "Stale Quote" && isStale) ||
           (alertFilter === "Monitoring" && c.alert_status === "monitoring");
         return matchesSearch && matchesExchange && matchesAlert;
@@ -1349,6 +1595,7 @@ function PortfolioPage({
               <option>Bull Triggered</option>
               <option>Monitoring</option>
               <option>Pending Config</option>
+              <option>Freshness Unknown</option>
               <option>Stale Quote</option>
             </select>
             <select
@@ -1424,9 +1671,12 @@ function AlertsPage({
       targetFilter === "All targets" ||
       (targetFilter === "Base" && a.target_kind === "base") ||
       (targetFilter === "Bull" && a.target_kind === "bull");
-    const st = a.lifecycle_status ?? "triggered";
+    const st = a.lifecycle_status ?? "active";
     const matchesLifecycle =
-      lifecycleFilter === "All states" || st === lifecycleFilter.toLowerCase();
+      lifecycleFilter === "All states" ||
+      (lifecycleFilter === "Triggered" && isAlertActive(a)) ||
+      (lifecycleFilter === "Resolved" && (st === "resolved" || st === "reset")) ||
+      st === lifecycleFilter.toLowerCase();
     const matchesQuery =
       !query ||
       `${a.company} ${a.symbol}`.toLowerCase().includes(query.toLowerCase());
@@ -1454,13 +1704,7 @@ function AlertsPage({
         <div className="alert-summary">
           <span className="summary-dot red" />
           <div>
-            <b>
-              {
-                apiAlerts.filter(
-                  (a) => (a.lifecycle_status ?? "triggered") === "triggered",
-                ).length
-              }
-            </b>
+            <b>{apiAlerts.filter(isAlertActive).length}</b>
             <small>Active Triggered</small>
           </div>
         </div>
@@ -1480,7 +1724,13 @@ function AlertsPage({
           <span className="summary-dot green" />
           <div>
             <b>
-              {apiAlerts.filter((a) => a.lifecycle_status === "resolved").length}
+              {
+                apiAlerts.filter(
+                  (a) =>
+                    a.lifecycle_status === "resolved" ||
+                    a.lifecycle_status === "reset",
+                ).length
+              }
             </b>
             <small>Resolved / Reset</small>
           </div>
@@ -1503,8 +1753,8 @@ function AlertsPage({
             <div>
               <b>Persisted Target Alert Events</b>
               <small>
-                Worker: {workerStatus?.state ?? "ready"} · Notification mode:{" "}
-                {workerStatus?.notification_mode ?? "live"}
+                Worker: {workerStatus?.state ?? "stopped"} · Notification mode:{" "}
+                {workerStatus?.notification_mode ?? "dry_run"}
               </small>
             </div>
           </div>
@@ -1565,7 +1815,8 @@ function AlertsPage({
               </thead>
               <tbody>
                 {filtered.map((alert) => {
-                  const lifecycle = alert.lifecycle_status ?? "triggered";
+                  const lifecycle = alert.lifecycle_status ?? "active";
+                  const active = isAlertActive(alert);
                   return (
                     <tr key={alert.id}>
                       <td>
@@ -1617,13 +1868,13 @@ function AlertsPage({
                         )}
                       </td>
                       <td>
-                        <span className={`alert-state state-${lifecycle}`}>
+                        <span className={`alert-state state-${active ? "triggered" : lifecycle}`}>
                           {lifecycle.toUpperCase()}
                         </span>
                       </td>
                       <td>
                         <div className="row-actions">
-                          {lifecycle === "triggered" && (
+                          {active && (
                             <button
                               className="button secondary small"
                               onClick={() => void onAction(alert.id, "acknowledge")}
@@ -1631,7 +1882,7 @@ function AlertsPage({
                               Acknowledge
                             </button>
                           )}
-                          {lifecycle !== "resolved" && (
+                          {lifecycle !== "resolved" && lifecycle !== "reset" && (
                             <button
                               className="button secondary small"
                               onClick={() => void onAction(alert.id, "resolve")}
@@ -1817,9 +2068,13 @@ function MarketActivityPage({
   isPollingNow: boolean;
   onSelectCompany: (c: PortfolioCompany) => void;
 }) {
+  const freshnessUnknownList = companies.filter((c) =>
+    isQuoteFreshnessUnknown(c.latest_quote),
+  );
   const staleList = companies.filter(
     (c) =>
       c.latest_quote != null &&
+      !isQuoteFreshnessUnknown(c.latest_quote) &&
       !c.latest_quote.is_fresh &&
       !c.latest_quote.is_simulated,
   );
@@ -1846,45 +2101,44 @@ function MarketActivityPage({
       <div className="market-stat-grid">
         <div className="card market-stat">
           <small>Feed Provider</small>
-          <b>{workerStatus?.provider ?? "yfinance"}</b>
+          <b>{workerStatus?.provider ?? "unknown"}</b>
           <small className="market-uptime">
             <i className="status-dot" /> Exchange Calendar:{" "}
-            {workerStatus?.exchange_calendar ?? "NSE/BSE IST"}
+            {workerStatus?.exchange_calendar ?? "unknown"}
           </small>
         </div>
         <div className="card market-stat">
-          <small>WebSocket / Polling Mode</small>
-          <b>{workerStatus?.websocket_status ?? "Polling Fallback"}</b>
-          <small className="market-uptime">
-            Last poll:{" "}
-            {workerStatus?.last_poll_at
-              ? new Date(workerStatus.last_poll_at).toLocaleTimeString("en-IN")
-              : "On-demand ready"}
-          </small>
-        </div>
-        <div className="card market-stat">
-          <small>NSE Symbols Monitored</small>
+          <small>Provider Connection & Queue</small>
           <b>
-            {companies.filter((c) => c.exchange === "NSE").length}{" "}
-            <span className="market-stat-sub">companies</span>
+            {workerStatus?.connection_status ?? workerStatus?.state ?? "stopped"} (
+            {workerStatus?.feed_ready ? "Ready" : "Not Ready"})
           </b>
           <small className="market-uptime">
-            {
-              companies.filter(
-                (c) => c.exchange === "NSE" && c.latest_quote?.is_fresh,
-              ).length
-            }{" "}
-            fresh quotes
+            Backlog: {workerStatus?.backlog_state ?? "normal"} (
+            {workerStatus?.queue_overflow_drops ?? 0} overflow drops)
           </small>
         </div>
         <div className="card market-stat">
-          <small>BSE Symbols Monitored</small>
+          <small>Protocol & Reconnect Gaps</small>
           <b>
-            {companies.filter((c) => c.exchange === "BSE").length}{" "}
-            <span className="market-stat-sub">companies</span>
+            {workerStatus?.reconnect_gaps_count ?? 0}{" "}
+            <span className="market-stat-sub">reconnect gap(s)</span>
           </b>
           <small className="market-uptime">
-            {staleList.length} stale · {workerStatus?.last_poll_failed ?? 0} failed
+            Seq gap check: {workerStatus?.protocol_gap_detection ?? "disabled"} (
+            {workerStatus?.protocol_sequence_gaps ?? 0} gaps)
+          </small>
+        </div>
+        <div className="card market-stat">
+          <small>Quote Freshness Summary</small>
+          <b>
+            {workerStatus?.fresh_symbols_count ??
+              companies.filter((c) => c.latest_quote?.is_fresh).length}{" "}
+            <span className="market-stat-sub">fresh quotes</span>
+          </b>
+          <small className="market-uptime">
+            {staleList.length} stale · {freshnessUnknownList.length} freshness unknown ·{" "}
+            {workerStatus?.last_poll_failed ?? 0} failed
           </small>
         </div>
       </div>
@@ -1893,34 +2147,48 @@ function MarketActivityPage({
         <section className="card market-movers">
           <div className="section-head">
             <div>
-              <h2>Stale or Missing Quote Watchlist</h2>
+              <h2>Stale, Freshness-Unknown, or Missing Quote Watchlist</h2>
               <p>Symbols requiring fresh quote verification</p>
             </div>
           </div>
-          {staleList.length === 0 && missingQuoteList.length === 0 ? (
+          {staleList.length === 0 &&
+          freshnessUnknownList.length === 0 &&
+          missingQuoteList.length === 0 ? (
             <p className="empty-copy">
               All monitored symbols have fresh validated market quotes.
             </p>
           ) : (
             <div className="movers-list">
-              {[...staleList, ...missingQuoteList].slice(0, 15).map((c) => (
-                <button
-                  className="mover-row"
-                  key={`${c.exchange}:${c.symbol}`}
-                  onClick={() => onSelectCompany(c)}
-                >
-                  <div className="mover-company">
-                    <b>
-                      {c.symbol} ({c.exchange})
-                    </b>
-                    <small>{c.name}</small>
-                  </div>
-                  <span className="status-badge badge-sell">
-                    <i />
-                    {c.latest_quote ? "STALE" : "NO QUOTE"}
-                  </span>
-                </button>
-              ))}
+              {[...freshnessUnknownList, ...staleList, ...missingQuoteList]
+                .slice(0, 15)
+                .map((c) => (
+                  <button
+                    className="mover-row"
+                    key={`${c.exchange}:${c.symbol}`}
+                    onClick={() => onSelectCompany(c)}
+                  >
+                    <div className="mover-company">
+                      <b>
+                        {c.symbol} ({c.exchange})
+                      </b>
+                      <small>{c.name}</small>
+                    </div>
+                    <span
+                      className={`status-badge ${
+                        isQuoteFreshnessUnknown(c.latest_quote)
+                          ? "badge-approaching"
+                          : "badge-sell"
+                      }`}
+                    >
+                      <i />
+                      {isQuoteFreshnessUnknown(c.latest_quote)
+                        ? "FRESHNESS UNKNOWN"
+                        : c.latest_quote
+                          ? "STALE"
+                          : "NO QUOTE"}
+                    </span>
+                  </button>
+                ))}
             </div>
           )}
         </section>
@@ -2253,11 +2521,11 @@ function SettingsPage({
             )}
             {row(
               "Background Monitoring Service",
-              `Provider: ${workerStatus?.provider ?? "yfinance"} · Calendar: ${
-                workerStatus?.exchange_calendar ?? "nse_bse"
+              `Provider: ${workerStatus?.provider ?? "unknown"} · Calendar: ${
+                workerStatus?.exchange_calendar ?? "unknown"
               }`,
               <span className="local-only-tag">
-                {workerStatus?.state?.toUpperCase() ?? "READY"}
+                {workerStatus?.state?.toUpperCase() ?? "STOPPED"}
               </span>,
             )}
           </section>
@@ -2285,9 +2553,7 @@ function NotificationDrawer({
   onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
 }) {
   const [unreadOnly, setUnreadOnly] = useState(false);
-  const unreadAlerts = alerts.filter(
-    (a) => (a.lifecycle_status ?? "triggered") === "triggered",
-  );
+  const unreadAlerts = alerts.filter(isAlertActive);
   const visibleAlerts = unreadOnly ? unreadAlerts : alerts;
 
   return (
@@ -2345,7 +2611,7 @@ function NotificationDrawer({
         <div className="drawer-content">
           {visibleAlerts.length ? (
             visibleAlerts.map((a) => {
-              const isNew = (a.lifecycle_status ?? "triggered") === "triggered";
+              const isNew = isAlertActive(a);
               return (
                 <div
                   className={`drawer-alert ${isNew ? "drawer-alert-new" : ""}`}
@@ -2427,16 +2693,20 @@ function DetailPanel({
   }, [company.exchange, company.symbol, company.version]);
 
   const quote = company.latest_quote;
+  const alertList = details?.alerts ?? details?.alert_history ?? [];
+  const revisionList = details?.revisions ?? details?.target_revisions ?? [];
   const chartSeries = useMemo(() => {
-    const hist = details?.price_history ?? [];
+    const hist = details?.price_history ?? details?.quote_history ?? [];
     if (hist.length > 0) {
       return [...hist]
         .reverse()
         .map((q) => ({
-          label: new Date(q.quoted_at).toLocaleTimeString("en-IN", {
-            hour: "2-digit",
-            minute: "2-digit",
-          }),
+          label: q.quoted_at
+            ? new Date(q.quoted_at).toLocaleTimeString("en-IN", {
+                hour: "2-digit",
+                minute: "2-digit",
+              })
+            : "Unknown time",
           price: q.price,
         }));
     }
@@ -2500,8 +2770,16 @@ function DetailPanel({
           <small>
             {quote
               ? `Provider: ${quote.provider} · ${
-                  quote.is_fresh ? "Fresh" : "STALE"
-                } · Quoted ${new Date(quote.quoted_at).toLocaleString("en-IN")}`
+                  isQuoteFreshnessUnknown(quote)
+                    ? "Freshness unknown (no source timestamp)"
+                    : quote.is_fresh
+                      ? "Fresh"
+                      : "STALE"
+                } · ${
+                  quote.quoted_at
+                    ? `Quoted ${new Date(quote.quoted_at).toLocaleString("en-IN")}`
+                    : `Received ${new Date(quote.received_at).toLocaleString("en-IN")} (diagnostic)`
+                }`
               : "Poll live quotes to record current market price"}{" "}
             · Saved Reference CMP: {company.cmp == null ? "—" : money(company.cmp)}
           </small>
@@ -2653,8 +2931,8 @@ function DetailPanel({
           </div>
           {loading ? (
             <div className="detail-empty">Loading company alert history…</div>
-          ) : details && details.alerts.length > 0 ? (
-            details.alerts.map((a) => (
+          ) : alertList.length > 0 ? (
+            alertList.map((a) => (
               <div className="detail-alert" key={a.id}>
                 <span
                   className={`alert-type-icon ${
@@ -2669,7 +2947,7 @@ function DetailPanel({
                   </b>
                   <small>
                     {new Date(a.triggered_at).toLocaleString("en-IN")} ·{" "}
-                    {a.lifecycle_status ?? "triggered"}
+                    {a.lifecycle_status ?? "active"}
                   </small>
                 </div>
                 <button
@@ -2692,8 +2970,8 @@ function DetailPanel({
               <p>Audit trail of approved target changes</p>
             </div>
           </div>
-          {details && details.revisions.length > 0 ? (
-            details.revisions.slice(0, 5).map((rev) => (
+          {revisionList.length > 0 ? (
+            revisionList.slice(0, 5).map((rev) => (
               <div className="detail-alert" key={rev.id}>
                 <div>
                   <b>

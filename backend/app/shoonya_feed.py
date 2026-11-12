@@ -37,15 +37,20 @@ from .prices import (
     RateLimitError,
     normalize_utc,
     record_quote,
+    reset_symbol_cross_baselines,
 )
 
 logger = logging.getLogger("portfolio.shoonya_feed")
 
+UNVERIFIED_AUTH_ERROR_MESSAGE = "Shoonya auth flow unverified against current official docs"
+
+# UNVERIFIED: Default Shoonya REST and WebSocket endpoints from legacy NorenRestApiPy examples.
+# Must be verified against current official Finvasia Shoonya API documentation before production use.
 DEFAULT_SHOONYA_HOST = "https://api.shoonya.com/NorenWClientTP/"
 DEFAULT_SHOONYA_WS = "wss://api.shoonya.com/NorenWSTP/"
 
-# Pre-verified NSE/BSE scrip tokens for common portfolio companies;
-# additional or unmapped symbols are resolved dynamically via api.searchscrip().
+# UNVERIFIED: Static NSE/BSE scrip token mapping for simulated/offline tests only.
+# Must be replaced from the real login / official scrip-master response after the auth flow is confirmed.
 DEFAULT_SHOONYA_TOKENS: dict[tuple[str, str], str] = {
     ("NSE", "BHEL"): "438",
     ("NSE", "TEGA"): "7529",
@@ -168,7 +173,15 @@ def generate_totp(secret: str, *, for_time: int | None = None, interval: int = 3
 
 @dataclass(frozen=True)
 class ShoonyaConfig:
-    """Configuration and credential mapping for Finvasia Shoonya API."""
+    """Configuration and credential mapping for Finvasia Shoonya API.
+
+    NOTE (UNVERIFIED AUTH FLOW):
+    The direct `NorenRestApiPy` login flow (`userid` + `password` + `twoFA` + `vendor_code`
+    + `api_secret` + `imei`) and the `NorenWClientTP` / `NorenWSTP` endpoints are UNVERIFIED
+    against current official Shoonya documentation.
+    The Shoonya provider is shipped disabled by default (`allow_unverified_auth=False`)
+    and fails fast unless explicitly opted in.
+    """
 
     user_id: str
     password: str
@@ -184,11 +197,20 @@ class ShoonyaConfig:
     reconnect_max_seconds: float = 60.0
     max_reconnect_attempts: int = 0
     subscription_batch_size: int = 50
+    tick_queue_maxsize: int = 256
+    allow_unverified_auth: bool = False
     custom_token_map: dict[tuple[str, str], str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> ShoonyaConfig:
         """Load Shoonya credentials and connection settings from environment variables."""
+        allow_unverified = (
+            os.environ.get("SHOONYA_ALLOW_UNVERIFIED_AUTH", "false").strip().lower()
+            in {"1", "true", "yes"}
+        )
+        if not allow_unverified:
+            raise ShoonyaAuthError(UNVERIFIED_AUTH_ERROR_MESSAGE)
+
         user_id = (
             os.environ.get("SHOONYA_USER_ID")
             or os.environ.get("SHOONYA_UID")
@@ -228,6 +250,7 @@ class ShoonyaConfig:
         reconnect_base = float(os.environ.get("SHOONYA_RECONNECT_BASE_SECONDS", "2.0"))
         reconnect_max = float(os.environ.get("SHOONYA_RECONNECT_MAX_SECONDS", "60.0"))
         max_attempts = int(os.environ.get("SHOONYA_MAX_RECONNECT_ATTEMPTS", "0"))
+        queue_maxsize = int(os.environ.get("SHOONYA_TICK_QUEUE_MAXSIZE", "256"))
 
         custom_tokens: dict[tuple[str, str], str] = {}
         raw_map = (os.environ.get("SHOONYA_TOKEN_MAP_JSON") or "").strip()
@@ -272,6 +295,8 @@ class ShoonyaConfig:
             reconnect_base_seconds=max(0.5, reconnect_base),
             reconnect_max_seconds=max(reconnect_base, reconnect_max),
             max_reconnect_attempts=max(0, max_attempts),
+            tick_queue_maxsize=max(1, queue_maxsize),
+            allow_unverified_auth=allow_unverified,
             custom_token_map=custom_tokens,
         )
 
@@ -415,6 +440,71 @@ class ShoonyaTokenResolver:
         return f"{exchange.strip().upper()}|{token}"
 
 
+_LATEST_FEED_HEALTH_LOCK = threading.RLock()
+_LATEST_FEED_HEALTH: dict[str, Any] = {
+    "connected": False,
+    "feed_ready": False,
+    "awaiting_snapshot": True,
+    "backlog_state": "normal",
+    "lag_detected": False,
+    "queue_maxsize": 256,
+    "queue_depth": 0,
+    "queue_overflow_drops": 0,
+    "protocol_gap_detection": "disabled",
+    "protocol_gap_reason": (
+        "Shoonya touchline messages do not provide a protocol sequence field; "
+        "protocol sequence gap detection stays disabled unless sequence fields are present."
+    ),
+    "protocol_sequence_gaps": 0,
+    "reconnect_count": 0,
+    "reconnect_gaps_count": 0,
+    "gap_history": [],
+}
+
+
+def get_latest_feed_health() -> dict[str, Any]:
+    with _LATEST_FEED_HEALTH_LOCK:
+        return {
+            ** _LATEST_FEED_HEALTH,
+            "gap_history": list(_LATEST_FEED_HEALTH.get("gap_history", [])),
+        }
+
+
+def _extract_protocol_sequence(payload: dict[str, Any]) -> int | None:
+    """Extract a protocol sequence number ONLY if the source message explicitly carries one."""
+    for key in ("seq", "seqno", "sequence", "sq"):
+        raw_val = payload.get(key)
+        if raw_val is not None and str(raw_val).strip() != "":
+            try:
+                return int(str(raw_val).strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _parse_source_timestamp(payload: dict[str, Any], now_utc: datetime) -> datetime | None:
+    """Parse tick timestamp strictly from source message timestamp fields ('ft', 'lut', 'ltt').
+
+    Never fabricates or falls back to local receive time if the source timestamp is missing
+    or unparseable.
+    """
+    for key in ("ft", "lut", "ltt"):
+        raw_val = payload.get(key)
+        if raw_val is None:
+            continue
+        text = str(raw_val).strip()
+        if not text:
+            continue
+        try:
+            epoch_val = int(float(text))
+            if epoch_val > 0:
+                candidate = datetime.fromtimestamp(epoch_val, tz=timezone.utc)
+                return min(candidate, now_utc)
+        except (ValueError, OSError, OverflowError):
+            pass
+    return None
+
+
 def parse_shoonya_tick(
     payload: dict[str, Any],
     resolver: ShoonyaTokenResolver,
@@ -425,6 +515,8 @@ def parse_shoonya_tick(
     """Parse a Shoonya WebSocket touchline ('tk' or 'tf') or REST quote payload into a ProviderQuote.
 
     Returns None for heartbeat/connection messages or ticks that do not carry a last traded price ('lp').
+    UNVERIFIED: Shoonya field mapping ('t', 'e', 'tk', 'lp', 'ft', 'lut', 'ltt') is unverified against
+    current official docs and used only in gated or simulated test flows.
     """
     if not isinstance(payload, dict):
         return None
@@ -462,17 +554,9 @@ def parse_shoonya_tick(
         raise ProviderError(f"Shoonya returned non-positive price {price} for {exchange}:{symbol}.")
 
     now_utc = normalize_utc(fallback_now or datetime.now(timezone.utc))
-    raw_ft = payload.get("ft") or payload.get("lut") or payload.get("ltt")
-    quoted_at = now_utc
-    if raw_ft is not None:
-        try:
-            epoch_val = int(float(str(raw_ft).strip()))
-            if epoch_val > 0:
-                candidate = datetime.fromtimestamp(epoch_val, tz=timezone.utc)
-                # Guard against slight broker clock drift into the future
-                quoted_at = min(candidate, now_utc)
-        except (ValueError, OSError, OverflowError):
-            quoted_at = now_utc
+    quoted_at = _parse_source_timestamp(payload, now_utc)
+    freshness_unknown = quoted_at is None
+    sequence_number = _extract_protocol_sequence(payload)
 
     return ProviderQuote(
         exchange=exchange,
@@ -484,6 +568,8 @@ def parse_shoonya_tick(
         is_simulated=False,
         quote_type="last_trade",
         freshness_seconds=freshness_seconds,
+        freshness_unknown=freshness_unknown,
+        sequence_number=sequence_number,
     )
 
 
@@ -501,18 +587,23 @@ class ShoonyaPriceProvider:
         resolver: ShoonyaTokenResolver | None = None,
     ) -> None:
         self.config = config or ShoonyaConfig.from_env()
+        if not self.config.allow_unverified_auth:
+            raise ShoonyaAuthError(UNVERIFIED_AUTH_ERROR_MESSAGE)
         self.sdk = sdk or _create_noren_sdk_client(self.config.host, self.config.ws_endpoint)
         self.resolver = resolver or ShoonyaTokenResolver(custom_tokens=self.config.custom_token_map)
         self._authenticated = False
         self._lock = threading.Lock()
 
     def ensure_authenticated(self) -> None:
+        if not self.config.allow_unverified_auth:
+            raise ShoonyaAuthError(UNVERIFIED_AUTH_ERROR_MESSAGE)
         with self._lock:
             if self._authenticated:
                 return
             self._login_locked()
 
     def _login_locked(self) -> None:
+        # UNVERIFIED: Direct NorenRestApiPy SDK login parameters and response structure.
         two_fa = self.config.current_two_fa()
         try:
             res = self.sdk.login(
@@ -564,7 +655,9 @@ class ShoonyaPriceProvider:
 
 
 class ShoonyaWebSocketService:
-    """Persistent Shoonya WebSocket streaming service with automatic reconnection and target-alert evaluation."""
+    """Persistent Shoonya WebSocket streaming service with bounded queue, gap detection,
+    reconnect cross-baseline resets, and target-alert evaluation.
+    """
 
     def __init__(
         self,
@@ -577,6 +670,8 @@ class ShoonyaWebSocketService:
         sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config or ShoonyaConfig.from_env()
+        if not self.config.allow_unverified_auth:
+            raise ShoonyaAuthError(UNVERIFIED_AUTH_ERROR_MESSAGE)
         self._sdk_factory = sdk_factory
         self.sdk: NorenSdkProtocol = self._sdk_factory(self.config.host, self.config.ws_endpoint)
         self.resolver = resolver or ShoonyaTokenResolver(custom_tokens=self.config.custom_token_map)
@@ -592,22 +687,133 @@ class ShoonyaWebSocketService:
         self._started_at = datetime.now(timezone.utc)
         self._subscribed_keys: set[str] = set()
         self._reconnect_count = 0
+        self._reconnect_gaps_count = 0
         self._failed_count = 0
         self._ticks_recorded = 0
         self._last_tick_at: datetime | None = None
         self._last_error: str | None = None
+        self._feed_ready = False
+        self._awaiting_snapshot = True
+        self._had_prior_session = False
+
+        # Bounded queue & gap telemetry
+        self._queue_overflow_drops = 0
+        self._backlog_state = "normal"
+        self._lag_detected = False
+        self._protocol_gap_detection = "disabled"
+        self._protocol_gap_reason = (
+            "Shoonya touchline messages do not provide a protocol sequence field; "
+            "protocol sequence gap detection stays disabled unless sequence fields are present."
+        )
+        self._protocol_sequence_gaps = 0
+        self._last_seq_by_symbol: dict[tuple[str, str], int] = {}
+        self._gap_history: list[dict[str, Any]] = []
+
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_queue: asyncio.Queue[ProviderQuote | None] | None = None
+        self._publish_health()
 
     def attach_async_queue(
         self,
         loop: asyncio.AbstractEventLoop,
         queue: asyncio.Queue[ProviderQuote | None],
     ) -> None:
-        """Forward parsed ProviderQuote ticks directly to an asyncio.Queue for async worker consumption."""
+        """Forward parsed ProviderQuote ticks directly to a bounded asyncio.Queue for async worker consumption."""
         with self._state_lock:
             self._async_loop = loop
             self._async_queue = queue
+        self._publish_health()
+
+    def create_bounded_queue(self) -> asyncio.Queue[ProviderQuote | None]:
+        """Create a bounded asyncio.Queue configured with tick_queue_maxsize."""
+        return asyncio.Queue(maxsize=max(1, self.config.tick_queue_maxsize))
+
+    def _enqueue_tick_nonblocking(self, quote: ProviderQuote | None) -> bool:
+        """Attempt to enqueue a tick into the bounded queue; on overflow, drop with explicit counter and lag state."""
+        with self._state_lock:
+            queue = self._async_queue
+        if queue is None:
+            return False
+        if quote is None:
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+            return True
+
+        try:
+            queue.put_nowait(quote)
+            with self._state_lock:
+                if self._queue_overflow_drops == 0:
+                    self._backlog_state = "normal"
+            self._publish_health()
+            return True
+        except asyncio.QueueFull:
+            now = datetime.now(timezone.utc)
+            with self._state_lock:
+                self._queue_overflow_drops += 1
+                self._backlog_state = "overflow"
+                self._lag_detected = True
+                drops = self._queue_overflow_drops
+                self._gap_history.append(
+                    {
+                        "kind": "local_queue_overflow",
+                        "exchange": quote.exchange,
+                        "symbol": quote.symbol,
+                        "at": now.isoformat(),
+                        "queue_overflow_drops": drops,
+                        "queue_maxsize": queue.maxsize,
+                    }
+                )
+            logger.warning(
+                "Local tick queue overflow (maxsize=%d): dropped tick for %s:%s (total_overflow_drops=%d).",
+                queue.maxsize,
+                quote.exchange,
+                quote.symbol,
+                drops,
+            )
+            self._publish_health()
+            return False
+
+    def get_health_snapshot(self) -> dict[str, Any]:
+        with self._state_lock:
+            queue_depth = self._async_queue.qsize() if self._async_queue is not None else 0
+            queue_maxsize = (
+                self._async_queue.maxsize
+                if self._async_queue is not None and self._async_queue.maxsize > 0
+                else self.config.tick_queue_maxsize
+            )
+            return {
+                "connected": self._ws_connected.is_set(),
+                "feed_ready": self._ws_connected.is_set() and self._feed_ready and not self._awaiting_snapshot,
+                "awaiting_snapshot": self._awaiting_snapshot,
+                "backlog_state": self._backlog_state,
+                "lag_detected": self._lag_detected,
+                "queue_maxsize": queue_maxsize,
+                "queue_depth": queue_depth,
+                "queue_overflow_drops": self._queue_overflow_drops,
+                "protocol_gap_detection": self._protocol_gap_detection,
+                "protocol_gap_reason": self._protocol_gap_reason,
+                "protocol_sequence_gaps": self._protocol_sequence_gaps,
+                "reconnect_count": self._reconnect_count,
+                "reconnect_gaps_count": self._reconnect_gaps_count,
+                "gap_history": list(self._gap_history),
+                "last_tick_at": self._last_tick_at.isoformat() if self._last_tick_at else None,
+                "last_error": self._last_error,
+            }
+
+    def _publish_health(self) -> None:
+        snap = self.get_health_snapshot()
+        with _LATEST_FEED_HEALTH_LOCK:
+            _LATEST_FEED_HEALTH.clear()
+            _LATEST_FEED_HEALTH.update(snap)
 
     @property
     def is_connected(self) -> bool:
@@ -620,6 +826,9 @@ class ShoonyaWebSocketService:
 
     def authenticate(self) -> dict[str, Any]:
         """Authenticate with Shoonya using user_id, password, dynamic TOTP 2FA, vendor_code, and api_secret."""
+        if not self.config.allow_unverified_auth:
+            raise ShoonyaAuthError(UNVERIFIED_AUTH_ERROR_MESSAGE)
+        # UNVERIFIED: Direct NorenRestApiPy SDK login call.
         two_fa = self.config.current_two_fa()
         try:
             response = self.sdk.login(
@@ -699,15 +908,61 @@ class ShoonyaWebSocketService:
         logger.info("Subscribed to %d Shoonya instrument token(s).", len(subscribed))
         return subscribed
 
+    def record_reconnect_gap(
+        self,
+        *,
+        reason: str = "websocket_reconnect",
+        symbols: list[tuple[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Record a feed disconnect/reconnect gap, mark feed as awaiting a fresh snapshot,
+        and reset each affected symbol's cross baseline so no crossing is inferred across the gap.
+        """
+        now = datetime.now(timezone.utc)
+        with self.session_factory() as session:
+            affected_count = reset_symbol_cross_baselines(
+                session,
+                symbols,
+                reason=reason,
+                now=now,
+            )
+            session.commit()
+
+        with self._state_lock:
+            self._reconnect_count += 1
+            self._reconnect_gaps_count += 1
+            self._feed_ready = False
+            self._awaiting_snapshot = True
+            gap_entry = {
+                "kind": "reconnect_gap",
+                "reason": reason,
+                "at": now.isoformat(),
+                "reconnect_gaps_count": self._reconnect_gaps_count,
+                "affected_symbols_count": affected_count,
+            }
+            self._gap_history.append(gap_entry)
+        logger.warning(
+            "Reconnect gap recorded (%s): awaiting fresh snapshot and reset cross baselines for %d symbol(s).",
+            reason,
+            affected_count,
+        )
+        self._publish_health()
+        return gap_entry
+
     def _on_socket_open(self) -> None:
         logger.info("Shoonya WebSocket connection opened.")
         self._ws_connected.set()
         with self._state_lock:
+            was_reconnecting = self._had_prior_session
+            self._had_prior_session = True
             self._last_error = None
+            if was_reconnecting:
+                self._feed_ready = False
+                self._awaiting_snapshot = True
         try:
             self.subscribe_all()
         except Exception:
             logger.exception("Error subscribing instruments on WebSocket open.")
+        self._publish_health()
         self._sync_heartbeat(connection_status="connected", websocket_status="connected")
 
     def _on_socket_close(self) -> None:
@@ -715,50 +970,122 @@ class ShoonyaWebSocketService:
         self._ws_connected.clear()
         with self._state_lock:
             self._subscribed_keys.clear()
+            self._feed_ready = False
+            self._awaiting_snapshot = True
         if not self._stop_event.is_set():
+            self.record_reconnect_gap(reason="websocket_closed")
             self._sync_heartbeat(
                 connection_status="reconnecting",
                 websocket_status="reconnecting",
                 last_error=self._last_error or "Shoonya WebSocket closed unexpectedly; reconnecting.",
             )
+        else:
+            self._publish_health()
 
     def _on_socket_error(self, error: Any) -> None:
         err_msg = str(error)[:1000] if error is not None else "Unknown Shoonya WebSocket error"
         logger.error("Shoonya WebSocket error: %s", err_msg)
         self._ws_connected.clear()
+        with self._state_lock:
+            self._feed_ready = False
+            self._awaiting_snapshot = True
         self._record_failure(err_msg)
+        self._publish_health()
         self._sync_heartbeat(
             connection_status="error",
             websocket_status="reconnecting",
             last_error=err_msg,
         )
 
+    def _check_protocol_sequence(self, quote: ProviderQuote, now: datetime) -> None:
+        """Detect protocol sequence gaps ONLY when the source message carries a sequence field."""
+        if quote.sequence_number is None:
+            return
+        identity = (quote.exchange.upper(), quote.symbol.upper())
+        gap_detected = False
+        expected_seq = 0
+        with self._state_lock:
+            self._protocol_gap_detection = "enabled"
+            self._protocol_gap_reason = (
+                "Source messages carry a protocol sequence field; sequence gap detection is active."
+            )
+            prev_seq = self._last_seq_by_symbol.get(identity)
+            self._last_seq_by_symbol[identity] = quote.sequence_number
+            if prev_seq is not None and quote.sequence_number > prev_seq + 1:
+                gap_detected = True
+                expected_seq = prev_seq + 1
+                self._protocol_sequence_gaps += 1
+                self._feed_ready = False
+                self._awaiting_snapshot = True
+                self._gap_history.append(
+                    {
+                        "kind": "protocol_sequence_gap",
+                        "exchange": identity[0],
+                        "symbol": identity[1],
+                        "expected_seq": expected_seq,
+                        "actual_seq": quote.sequence_number,
+                        "at": now.isoformat(),
+                    }
+                )
+        if gap_detected:
+            logger.warning(
+                "Protocol sequence gap detected for %s:%s (expected=%d, actual=%d); resetting cross baseline.",
+                identity[0],
+                identity[1],
+                expected_seq,
+                quote.sequence_number,
+            )
+            with self.session_factory() as session:
+                reset_symbol_cross_baselines(
+                    session,
+                    [identity],
+                    reason=f"protocol_sequence_gap({expected_seq}->{quote.sequence_number})",
+                    now=now,
+                )
+                session.commit()
+            self._publish_health()
+
     def _on_tick(self, message: dict[str, Any]) -> None:
         """Handle incoming Shoonya WebSocket tick ('tk' or 'tf').
 
         If an asyncio queue is attached (used by the async worker in app/worker.py),
-        enqueues the normalized ProviderQuote immediately without blocking the socket thread.
+        enqueues the normalized ProviderQuote into the bounded queue without blocking the socket thread.
         Otherwise persists and evaluates target alerts inline.
         """
         try:
+            now = datetime.now(timezone.utc)
             quote = parse_shoonya_tick(
                 message,
                 self.resolver,
                 freshness_seconds=self.config.quote_freshness_seconds,
+                fallback_now=now,
             )
             if quote is None:
                 return
 
-            now = datetime.now(timezone.utc)
+            self._check_protocol_sequence(quote, now)
+
+            quote_is_fresh = (
+                not quote.freshness_unknown
+                and quote.quoted_at is not None
+                and (now - normalize_utc(quote.quoted_at)).total_seconds() <= quote.freshness_seconds
+            )
+
             with self._state_lock:
                 self._ticks_recorded += 1
                 self._last_tick_at = now
                 self._last_error = None
+                if quote_is_fresh:
+                    self._feed_ready = True
+                    self._awaiting_snapshot = False
                 async_loop = self._async_loop
                 async_queue = self._async_queue
 
             if async_loop is not None and async_queue is not None:
-                async_loop.call_soon_threadsafe(async_queue.put_nowait, quote)
+                if async_loop.is_running():
+                    async_loop.call_soon_threadsafe(self._enqueue_tick_nonblocking, quote)
+                else:
+                    self._enqueue_tick_nonblocking(quote)
                 return
 
             alerts_enabled = os.environ.get("ALERT_RULES_ENABLED", "true").lower() == "true"
@@ -772,12 +1099,18 @@ class ShoonyaWebSocketService:
                     fixture_alerts_enabled=False,
                 )
 
+            with self._state_lock:
+                if stored.status == "fresh":
+                    self._feed_ready = True
+                    self._awaiting_snapshot = False
+
             drain_outbox(self._notifier, session_factory=self.session_factory, now=now)
 
+            self._publish_health()
             self._sync_heartbeat(
                 connection_status="connected",
                 websocket_status="connected",
-                last_quote_at=now,
+                last_quote_at=now if stored.status == "fresh" else None,
             )
             logger.debug(
                 "Processed Shoonya WebSocket tick %s:%s price=%s status=%s.",
@@ -790,6 +1123,7 @@ class ShoonyaWebSocketService:
             err_msg = f"Tick processing error: {exc}"[:1000]
             logger.exception("Failed to process Shoonya tick: %s", message)
             self._record_failure(err_msg)
+            self._publish_health()
 
     async def stream_quotes(
         self,
@@ -797,10 +1131,10 @@ class ShoonyaWebSocketService:
         health_check_interval: float = 5.0,
     ) -> AsyncIterator[ProviderQuote]:
         """Start the Shoonya WebSocket connection manager in a background daemon thread
-        and yield normalized ProviderQuote ticks asynchronously as they arrive.
+        and yield normalized ProviderQuote ticks asynchronously from a bounded queue.
         """
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[ProviderQuote | None] = asyncio.Queue()
+        queue = self.create_bounded_queue()
         self.attach_async_queue(loop, queue)
 
         runner_thread = threading.Thread(
@@ -825,9 +1159,8 @@ class ShoonyaWebSocketService:
         finally:
             with self._state_lock:
                 loop = self._async_loop
-                queue = self._async_queue
-            if loop is not None and queue is not None and not loop.is_closed():
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(self._enqueue_tick_nonblocking, None)
 
     def connect_once(self) -> None:
         """Authenticate (if needed) and open the Shoonya WebSocket stream."""
@@ -851,8 +1184,8 @@ class ShoonyaWebSocketService:
         while not self._stop_event.is_set():
             try:
                 if attempt > 0:
+                    self.record_reconnect_gap(reason=f"reconnect_attempt_{attempt}")
                     with self._state_lock:
-                        self._reconnect_count += 1
                         self._authenticated = False
                     self.sdk = self._sdk_factory(self.config.host, self.config.ws_endpoint)
 
@@ -873,6 +1206,7 @@ class ShoonyaWebSocketService:
                 attempt += 1
                 err_msg = str(exc)[:1000]
                 self._record_failure(err_msg)
+                self._publish_health()
                 self._sync_heartbeat(
                     connection_status="reconnecting",
                     websocket_status="reconnecting",

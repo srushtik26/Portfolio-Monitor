@@ -132,7 +132,10 @@ def _compute_stale_and_monitored(session: Session, now: datetime) -> tuple[int, 
             func.row_number()
             .over(
                 partition_by=(PriceQuote.exchange, PriceQuote.symbol),
-                order_by=(PriceQuote.quoted_at.desc(), PriceQuote.id.desc()),
+                order_by=(
+                    func.coalesce(PriceQuote.quoted_at, PriceQuote.received_at).desc(),
+                    PriceQuote.id.desc(),
+                ),
             )
             .label("position"),
         )
@@ -151,6 +154,7 @@ def _compute_stale_and_monitored(session: Session, now: datetime) -> tuple[int, 
             continue
         is_fresh = (
             q.status == "fresh"
+            and q.quoted_at is not None
             and timedelta(0) <= now - normalize_utc(q.quoted_at) <= timedelta(seconds=q.freshness_seconds)
         )
         if not is_fresh and not q.is_simulated:
@@ -243,7 +247,7 @@ def process_incoming_tick(
         stored.price,
         stored.status,
         len(outcome.triggered_alerts),
-        stored.quoted_at.isoformat(),
+        stored.quoted_at.isoformat() if stored.quoted_at is not None else "unknown",
         stored.provider,
     )
     return stored
@@ -534,7 +538,7 @@ def poll_once(
                 stored.status,
                 stored.exchange,
                 stored.symbol,
-                stored.quoted_at.isoformat(),
+                stored.quoted_at.isoformat() if stored.quoted_at is not None else "unknown",
                 stored.provider,
             )
     if provider.is_simulated:

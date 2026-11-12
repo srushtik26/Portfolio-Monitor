@@ -212,6 +212,32 @@ class SmtpEmailNotifier:
             raise RetryableSendError(f"SMTP delivery error: {error}") from error
 
 
+def is_smtp_complete() -> tuple[bool, list[str]]:
+    """Return whether complete SMTP settings (or a test mail spool directory) are configured."""
+    if os.environ.get("SMTP_SPOOL_DIR", "").strip():
+        return True, []
+    required = ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")
+    missing = [key for key in required if not os.environ.get(key, "").strip()]
+    return len(missing) == 0, missing
+
+
+def check_live_notification_gate() -> tuple[bool, str]:
+    """Require BOTH NOTIFICATION_MODE=live AND complete SMTP settings before any real send."""
+    raw_mode = os.environ.get("NOTIFICATION_MODE", "dry_run").strip().lower() or "dry_run"
+    if raw_mode != "live":
+        return (
+            False,
+            f"NOTIFICATION_MODE is '{raw_mode}' (must be 'live'); staying in dry_run.",
+        )
+    smtp_ok, missing = is_smtp_complete()
+    if not smtp_ok:
+        return (
+            False,
+            f"NOTIFICATION_MODE=live but SMTP settings are incomplete (missing {', '.join(missing)}); staying in dry_run.",
+        )
+    return True, "NOTIFICATION_MODE=live and SMTP settings complete."
+
+
 class MultiChannelNotifier:
     """Dispatches outbox items to Dashboard, Email (SMTP), or DryRun notifiers based on channel & mode."""
 
@@ -230,6 +256,10 @@ class MultiChannelNotifier:
 
     def send(self, message: NotificationMessage, idempotency_key: str) -> SendReceipt:
         if message.is_simulated or message.channel == "dry-run":
+            return self.dry_run.send(message, idempotency_key)
+        live_ready, reason = check_live_notification_gate()
+        if not live_ready:
+            logger.warning("Notification send staying in dry-run: %s", reason)
             return self.dry_run.send(message, idempotency_key)
         if message.channel == "dashboard":
             return self.dashboard.send(message, idempotency_key)
@@ -549,20 +579,19 @@ def queue_alert_notifications(
     """Queue notifications for a triggered alert in the active SQLAlchemy transaction.
 
     Simulated alerts always use the dry-run channel.
-    Live alerts check NotificationPreference (or NOTIFICATION_MODE=live):
-    if live channels are configured in NotificationPreference or environment, queues
-    dashboard and/or email notifications; otherwise defaults to dry-run for backward compatibility
-    when no live notification preference has been configured.
+    Live alerts require BOTH NOTIFICATION_MODE=live AND complete SMTP settings
+    before queuing live sends; otherwise they stay in dry-run and log why.
     """
     created_at = now or datetime.now(timezone.utc)
     if target_alert.is_simulated:
         return [create_dry_run_outbox(session, target_alert, now=created_at)]
 
-    pref = preference if preference is not None else session.get(NotificationPreference, "default")
-    live_mode_env = os.environ.get("NOTIFICATION_MODE", "").strip().lower() == "live"
-    if pref is None and not live_mode_env:
+    live_ready, gate_reason = check_live_notification_gate()
+    if not live_ready:
+        logger.warning("Alert %s notification staying in dry-run: %s", target_alert.id, gate_reason)
         return [create_dry_run_outbox(session, target_alert, now=created_at)]
 
+    pref = preference if preference is not None else session.get(NotificationPreference, "default")
     if pref is None:
         pref = get_or_create_preferences(session)
 

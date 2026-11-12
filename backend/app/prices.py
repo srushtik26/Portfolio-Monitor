@@ -41,10 +41,12 @@ class ProviderQuote:
     price: Decimal
     currency: str
     provider: str
-    quoted_at: datetime
+    quoted_at: datetime | None
     is_simulated: bool
     quote_type: str = "last_trade"
     freshness_seconds: int = DEFAULT_QUOTE_FRESHNESS_SECONDS
+    freshness_unknown: bool = False
+    sequence_number: int | None = None
 
 
 class RateLimitError(Exception):
@@ -621,10 +623,14 @@ def normalize_utc(value: datetime) -> datetime:
 
 def serialize_quote(quote: PriceQuote, now: datetime | None = None) -> dict[str, object]:
     current_time = normalize_utc(now or datetime.now(timezone.utc))
+    freshness_unknown = quote.quoted_at is None or quote.status == "freshness_unknown"
+    quoted_at_utc = normalize_utc(quote.quoted_at) if quote.quoted_at is not None else None
     is_fresh = (
-        quote.status == "fresh"
+        not freshness_unknown
+        and quote.status == "fresh"
+        and quoted_at_utc is not None
         and timedelta(0)
-        <= current_time - normalize_utc(quote.quoted_at)
+        <= current_time - quoted_at_utc
         <= timedelta(seconds=quote.freshness_seconds)
     )
     return {
@@ -635,12 +641,13 @@ def serialize_quote(quote: PriceQuote, now: datetime | None = None) -> dict[str,
         "currency": quote.currency,
         "provider": quote.provider,
         "quote_type": quote.quote_type,
-        "quoted_at": normalize_utc(quote.quoted_at),
+        "quoted_at": quoted_at_utc,
         "received_at": normalize_utc(quote.received_at),
         "is_simulated": quote.is_simulated,
         "freshness_seconds": quote.freshness_seconds,
         "status": quote.status,
         "is_fresh": is_fresh,
+        "freshness_unknown": freshness_unknown,
     }
 
 
@@ -748,6 +755,10 @@ def enrich_company_dict(
         alert_status = "base_triggered"
     elif bull_state_dict["state"] == "triggered":
         alert_status = "bull_triggered"
+    elif quote_data is not None and (
+        quote_data.get("status") == "freshness_unknown" or quote_data.get("freshness_unknown")
+    ):
+        alert_status = "freshness_unknown"
     elif quote_data is not None and not quote_data.get("is_fresh") and not quote_data.get("is_simulated"):
         alert_status = "stale_quote"
     elif nearest_pct is not None and nearest_pct <= 2.0:
@@ -940,6 +951,66 @@ def query_uploaded_excel_rules(
     )
 
 
+_POST_GAP_BASELINE_LOCK = RLock()
+_POST_GAP_BASELINE_PENDING: set[tuple[str, str, str]] = set()
+
+
+def reset_symbol_cross_baselines(
+    session: Session,
+    symbols: list[tuple[str, str]] | None = None,
+    *,
+    reason: str = "reconnect_gap",
+    now: datetime | None = None,
+) -> int:
+    """Explicitly reset each affected symbol's cross baseline on reconnect or sequence gap
+    so no crossing is inferred across the gap.
+
+    The next fresh snapshot quote for each symbol establishes the new post-gap baseline
+    without inferring a target crossing across the blind interval.
+    """
+    current_time = normalize_utc(now or datetime.now(timezone.utc))
+    if symbols is None:
+        companies = list(
+            session.scalars(
+                select(Company).where(
+                    Company.is_approved.is_(True),
+                    Company.monitoring_active.is_(True),
+                )
+            )
+        )
+        target_identities = [(c.exchange.upper(), c.symbol.upper()) for c in companies]
+    else:
+        target_identities = [(exch.upper(), sym.upper()) for exch, sym in symbols]
+
+    reset_count = 0
+    for exch, sym in target_identities:
+        states = list(
+            session.scalars(
+                select(TargetAlertState).where(
+                    TargetAlertState.exchange == exch,
+                    TargetAlertState.symbol == sym,
+                )
+            )
+        )
+        for st in states:
+            st.last_evaluated_price = None
+            st.last_evaluated_at = None
+            st.last_condition_met = False
+            st.reset_at = current_time
+            reset_count += 1
+        with _POST_GAP_BASELINE_LOCK:
+            _POST_GAP_BASELINE_PENDING.add((exch, sym, "base"))
+            _POST_GAP_BASELINE_PENDING.add((exch, sym, "bull"))
+    session.flush()
+    logger.warning(
+        "Reset cross baselines for %d symbol(s) (%d state rows) due to %s.",
+        len(target_identities),
+        reset_count,
+        reason,
+    )
+    return len(target_identities)
+
+
 def _evaluate_company_target(
     session: Session,
     *,
@@ -1015,7 +1086,17 @@ def _evaluate_company_target(
         state_row.last_evaluated_at = current_time
         return None
 
-    if trigger_mode == "crosses":
+    gap_key = (company.exchange.upper(), company.symbol.upper(), kind)
+    with _POST_GAP_BASELINE_LOCK:
+        is_post_gap_snapshot = gap_key in _POST_GAP_BASELINE_PENDING
+        if is_post_gap_snapshot:
+            _POST_GAP_BASELINE_PENDING.discard(gap_key)
+
+    if is_post_gap_snapshot:
+        # First fresh snapshot after a reconnect/sequence gap establishes the new cross baseline
+        # without inferring a target crossing across the gap.
+        qualifies = False
+    elif trigger_mode == "crosses":
         qualifies = crossed
     else:
         qualifies = condition_met
@@ -1180,28 +1261,37 @@ def record_quote(
     if not isinstance(quote.freshness_seconds, int) or quote.freshness_seconds < 1:
         raise ValueError("Quote freshness threshold must be a positive number of seconds.")
     price = _validated_price(quote.price)
-    if quote.quoted_at.tzinfo is None or quote.quoted_at.utcoffset() is None:
-        raise ValueError("Provider quote time must include a timezone.")
-    quoted_at = normalize_utc(quote.quoted_at)
-    if quoted_at > current_time:
-        raise ValueError("Provider quote time must not be in the future.")
+    if quote.quoted_at is None or getattr(quote, "freshness_unknown", False):
+        quoted_at: datetime | None = None
+        status = "freshness_unknown"
+    else:
+        if quote.quoted_at.tzinfo is None or quote.quoted_at.utcoffset() is None:
+            raise ValueError("Provider quote time must include a timezone.")
+        quoted_at = normalize_utc(quote.quoted_at)
+        if quoted_at > current_time:
+            raise ValueError("Provider quote time must not be in the future.")
 
-    last_quote = session.scalar(
-        select(PriceQuote)
-        .where(
-            PriceQuote.exchange == identity[0],
-            PriceQuote.symbol == identity[1],
+        last_quote = session.scalar(
+            select(PriceQuote)
+            .where(
+                PriceQuote.exchange == identity[0],
+                PriceQuote.symbol == identity[1],
+                PriceQuote.quoted_at.is_not(None),
+            )
+            .order_by(PriceQuote.quoted_at.desc(), PriceQuote.id.desc())
+            .limit(1)
         )
-        .order_by(PriceQuote.quoted_at.desc(), PriceQuote.id.desc())
-        .limit(1)
-    )
-    status = "fresh"
-    if current_time - quoted_at > timedelta(seconds=quote.freshness_seconds):
-        status = "stale"
-    elif last_quote is not None and quoted_at <= normalize_utc(last_quote.quoted_at):
-        status = "out_of_order"
-    elif quote.is_simulated:
-        status = "simulated"
+        status = "fresh"
+        if current_time - quoted_at > timedelta(seconds=quote.freshness_seconds):
+            status = "stale"
+        elif (
+            last_quote is not None
+            and last_quote.quoted_at is not None
+            and quoted_at <= normalize_utc(last_quote.quoted_at)
+        ):
+            status = "out_of_order"
+        elif quote.is_simulated:
+            status = "simulated"
 
     recorded = PriceQuote(
         exchange=identity[0],

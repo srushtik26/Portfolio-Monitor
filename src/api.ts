@@ -103,9 +103,9 @@ export async function inspectImport(file: File, headerRow: number): Promise<Impo
 export interface ImportMapping {
   sheet_name: string;
   header_row: number;
-  exchange_column: string;
-  symbol_column: string;
-  name_column: string;
+  exchange_column?: string;
+  symbol_column?: string;
+  name_column?: string;
   base_target_column?: string;
   bull_target_column?: string;
   cmp_column?: string;
@@ -117,9 +117,20 @@ export async function previewImport(file: File, mapping: ImportMapping): Promise
   const form = new FormData();
   form.append("file", file);
   Object.entries(mapping).forEach(([key, value]) => {
-    if (value !== undefined) form.append(key, String(value));
+    if (value !== undefined && value !== "") form.append(key, String(value));
   });
   return expectJson(await fetch(`${apiBaseUrl}/api/imports/preview`, { method: "POST", body: form }));
+}
+
+export async function resetWorkspaceData(): Promise<{
+  status: string;
+  deleted_companies: number;
+}> {
+  return expectJson(
+    await fetch(`${apiBaseUrl}/api/workspace/reset`, {
+      method: "POST",
+    }),
+  );
 }
 
 export async function updateImportPreviewRow(
@@ -285,10 +296,12 @@ export function computeDistanceMetrics(
       : null;
 
   const distBullAbs =
-    bullTarget != null && livePrice > 0 ? Number((bullTarget - livePrice).toFixed(2)) : null;
+    bullTarget != null && bullTarget > 0 && livePrice > 0
+      ? Number((livePrice - bullTarget).toFixed(2))
+      : null;
   const distBullPct =
-    bullTarget != null && livePrice > 0
-      ? Number((((bullTarget - livePrice) / livePrice) * 100).toFixed(2))
+    bullTarget != null && bullTarget > 0 && livePrice > 0
+      ? Number((((livePrice - bullTarget) / bullTarget) * 100).toFixed(2))
       : null;
 
   const candidatePcts = [distBasePct, distBullPct]
@@ -316,6 +329,34 @@ export function computeDistanceMetrics(
       distance_to_bull_pct: distBullPct,
       nearest_target_pct: nearestTargetPct,
       alert_status: "pending_configuration",
+    };
+  }
+
+  const quote = company.latest_quote;
+  if (
+    quote != null &&
+    (quote.status === "freshness_unknown" ||
+      quote.freshness_unknown === true ||
+      quote.quoted_at == null)
+  ) {
+    return {
+      distance_to_base_abs: distBaseAbs,
+      distance_to_base_pct: distBasePct,
+      distance_to_bull_abs: distBullAbs,
+      distance_to_bull_pct: distBullPct,
+      nearest_target_pct: nearestTargetPct,
+      alert_status: "freshness_unknown",
+    };
+  }
+
+  if (quote != null && !quote.is_fresh && !quote.is_simulated) {
+    return {
+      distance_to_base_abs: distBaseAbs,
+      distance_to_base_pct: distBasePct,
+      distance_to_bull_abs: distBullAbs,
+      distance_to_bull_pct: distBullPct,
+      nearest_target_pct: nearestTargetPct,
+      alert_status: "stale_quote",
     };
   }
 

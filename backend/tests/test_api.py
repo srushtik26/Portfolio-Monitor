@@ -1429,7 +1429,7 @@ def test_multi_channel_notification_delivery_and_formatted_email_spool(
 ) -> None:
     spool_dir = tmp_path / "email_spool"
     monkeypatch.setenv("SMTP_SPOOL_DIR", str(spool_dir))
-    monkeypatch.setenv("NOTIFICATION_DELIVERY_MODE", "live")
+    monkeypatch.setenv("NOTIFICATION_MODE", "live")
 
     # Enable email notifications with recipient
     pref_res = client.put(
@@ -1501,6 +1501,94 @@ def test_multi_channel_notification_delivery_and_formatted_email_spool(
     assert "Target Price: ₹426.91" in email_text
     assert "Current Price: ₹426.85" in email_text
     assert "Price Direction: Downward" in email_text
+
+
+def test_live_notification_mode_with_incomplete_smtp_stays_dry_run_and_logs_why(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("NOTIFICATION_MODE", "live")
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    for key in ("SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM", "SMTP_SPOOL_DIR"):
+        monkeypatch.delenv(key, raising=False)
+
+    pref_res = client.put(
+        "/api/notifications/preferences",
+        json={
+            "dashboard_enabled": True,
+            "email_enabled": True,
+            "email_recipients": "alerts@plutuswealth.com",
+            "notify_on_base": True,
+            "notify_on_bull": True,
+            "notify_on_stale": True,
+        },
+    )
+    assert pref_res.status_code == 200
+    assert pref_res.json()["smtp_configured"] is False
+
+    with caplog.at_level("WARNING"):
+        with TestSession() as session:
+            company = Company(
+                exchange="NSE",
+                symbol="BHEL",
+                name="BHEL",
+                base_target=Decimal("426.91"),
+                bull_target=Decimal("561.09"),
+                base_direction="below",
+                bull_direction="above",
+            )
+            session.add(company)
+            session.flush()
+            session.add(
+                TargetRevision(
+                    exchange="NSE",
+                    symbol="BHEL",
+                    version=1,
+                    base_target=company.base_target,
+                    bull_target=company.bull_target,
+                    base_direction="below",
+                    bull_direction="above",
+                    source="import",
+                    changed_at=datetime(2026, 11, 3, 9, tzinfo=timezone.utc),
+                )
+            )
+            session.commit()
+
+            now = datetime(2026, 11, 3, 9, 30, tzinfo=timezone.utc)
+            record_quote(
+                session,
+                ProviderQuote(
+                    exchange="NSE",
+                    symbol="BHEL",
+                    price=Decimal("426.85"),
+                    currency="INR",
+                    provider="yfinance",
+                    quoted_at=now,
+                    is_simulated=False,
+                ),
+                now=now,
+                alerts_enabled=True,
+            )
+
+    assert "SMTP settings are incomplete" in caplog.text
+
+    with TestSession() as session:
+        outbox_rows = list(session.scalars(select(NotificationOutbox)))
+        assert len(outbox_rows) == 1
+        assert outbox_rows[0].delivery_mode == "dry_run"
+        assert outbox_rows[0].channel == "dry-run"
+
+    drain_res = client.post("/api/notifications/drain")
+    assert drain_res.status_code == 200
+    assert drain_res.json()["sent"] == 1
+
+    with TestSession() as session:
+        outbox = session.scalar(select(NotificationOutbox))
+        assert outbox is not None
+        assert outbox.delivery_mode == "dry_run"
+        assert outbox.provider_message_id is not None
+        assert outbox.provider_message_id.startswith("dry-run:")
 
 
 def test_scale_40_companies_monitoring_and_nse_bse_calendar(

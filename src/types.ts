@@ -41,7 +41,18 @@ export interface PortfolioCompany {
   distance_to_bull_abs?: number | null;
   distance_to_bull_pct?: number | null;
   nearest_target_pct?: number | null;
-  alert_status?: "monitoring" | "base_triggered" | "bull_triggered" | "both_triggered" | "pending_configuration" | "inactive";
+  alert_status?:
+    | "monitoring"
+    | "base_triggered"
+    | "bull_triggered"
+    | "both_triggered"
+    | "pending_configuration"
+    | "inactive"
+    | "freshness_unknown"
+    | "stale_quote"
+    | "approaching"
+    | "paused"
+    | "pending_approval";
   base_alert_state?: TargetAlertStateInfo | null;
   bull_alert_state?: TargetAlertStateInfo | null;
 }
@@ -54,12 +65,13 @@ export interface PriceQuote {
   currency: string;
   provider: string;
   quote_type: "last_trade" | "candle_close" | "fixture" | "provider_quote" | "websocket_tick";
-  quoted_at: string;
+  quoted_at: string | null;
   received_at: string;
   is_simulated: boolean;
   freshness_seconds: number;
-  status: "fresh" | "stale" | "out_of_order" | "simulated";
+  status: "fresh" | "stale" | "out_of_order" | "simulated" | "freshness_unknown";
   is_fresh: boolean;
+  freshness_unknown?: boolean;
 }
 
 export interface PriceHistory {
@@ -78,16 +90,17 @@ export interface ApiAlert {
   price: number;
   comparison_direction?: "below" | "above";
   price_direction?: "Upward" | "Downward";
-  lifecycle_status?: "triggered" | "acknowledged" | "resolved";
+  lifecycle_status?: "active" | "triggered" | "acknowledged" | "resolved" | "reset";
   acknowledged_at?: string | null;
   acknowledged_by?: string | null;
   resolved_at?: string | null;
   resolved_by?: string | null;
+  reset_at?: string | null;
   triggered_at: string;
   target_revision_id: number;
   is_simulated: boolean;
   event_type: "fixture" | "live";
-  quote_status: "fresh" | "stale" | "out_of_order" | "simulated";
+  quote_status: "fresh" | "stale" | "out_of_order" | "simulated" | "freshness_unknown";
   quote_is_fresh: boolean;
   provider: string;
   delivery_status: "not_queued" | "queued" | "retry" | "sending" | "sent" | "failed";
@@ -111,12 +124,28 @@ export interface WorkerStatus {
   last_poll_attempted?: number;
   last_poll_recorded?: number;
   last_poll_failed?: number;
+  fresh_symbols_count?: number;
   stale_symbols_count?: number;
+  freshness_unknown_symbols_count?: number;
+  freshness_unknown_symbols?: string[];
   websocket_status?: string;
+  connection_status?: string;
+  feed_ready?: boolean;
+  awaiting_snapshot?: boolean;
+  backlog_state?: "normal" | "overflow";
+  lag_detected?: boolean;
+  queue_overflow_drops?: number;
+  protocol_gap_detection?: "disabled" | "enabled";
+  protocol_gap_reason?: string;
+  protocol_sequence_gaps?: number;
+  reconnect_count?: number;
+  reconnect_gaps_count?: number;
+  gap_history?: Array<Record<string, unknown>>;
   live_provider_configured: boolean;
   authoritative_calendar_configured: boolean;
   live_alerts_enabled: boolean;
-  notification_mode: "dry_run_only" | "live" | "dry_run";
+  notification_mode: "dry_run_only" | "live_channels" | "live" | "dry_run";
+  notification_gate_reason?: string;
   note: string;
 }
 
@@ -133,6 +162,7 @@ export interface ImportSheet {
 export interface ImportInspection {
   file_type: "csv" | "xlsx";
   header_row: number;
+  suggested_header_row?: number;
   sheets: ImportSheet[];
 }
 
@@ -201,28 +231,34 @@ export interface ImportBatchHistoryItem {
 export interface NotificationPreference {
   dashboard_enabled: boolean;
   email_enabled: boolean;
-  email_recipients: string;
+  email_recipients: string | string[];
   notify_on_base: boolean;
   notify_on_bull: boolean;
   notify_on_stale: boolean;
   updated_at: string | null;
 }
 
+export type CompanyRevisionItem = {
+  id: number;
+  version: number;
+  base_target: number | null;
+  bull_target: number | null;
+  base_direction: TargetDirection;
+  bull_direction: TargetDirection;
+  source: string;
+  import_batch_id?: string | null;
+  import_id?: string | null;
+  changed_at: string | null;
+};
+
 export interface CompanyDetailsResponse {
   company: PortfolioCompany;
-  revisions: Array<{
-    id: number;
-    version: number;
-    base_target: number | null;
-    bull_target: number | null;
-    base_direction: TargetDirection;
-    bull_direction: TargetDirection;
-    source: string;
-    import_batch_id: string | null;
-    changed_at: string | null;
-  }>;
-  alerts: ApiAlert[];
-  price_history: PriceQuote[];
+  revisions?: CompanyRevisionItem[];
+  target_revisions?: CompanyRevisionItem[];
+  alerts?: ApiAlert[];
+  alert_history?: ApiAlert[];
+  price_history?: PriceQuote[];
+  quote_history?: PriceQuote[];
 }
 
 export interface LivePriceTickEvent {

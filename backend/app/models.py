@@ -154,7 +154,7 @@ class PriceQuote(Base):
             "exchange IN ('NSE', 'BSE')", name="ck_price_quotes_exchange"
         ),
         CheckConstraint(
-            "status IN ('fresh', 'stale', 'out_of_order', 'simulated')",
+            "status IN ('fresh', 'stale', 'out_of_order', 'simulated', 'freshness_unknown')",
             name="ck_price_quotes_status",
         ),
         ForeignKeyConstraint(
@@ -173,10 +173,10 @@ class PriceQuote(Base):
     provider: Mapped[str] = mapped_column(String(100), nullable=False)
     quote_type: Mapped[str] = mapped_column(String(24), nullable=False, default="last_trade")
     freshness_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=900)
-    quoted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    quoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     is_simulated: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
 
 
 class TargetAlertState(Base):

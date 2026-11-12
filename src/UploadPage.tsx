@@ -45,8 +45,8 @@ const emptyMapping: MappingFields = {
 };
 
 const mappingFields: Array<{ key: keyof MappingFields; label: string; required: boolean }> = [
-  { key: "exchange_column", label: "Exchange", required: true },
-  { key: "symbol_column", label: "Symbol", required: true },
+  { key: "exchange_column", label: "Exchange (defaults to NSE)", required: false },
+  { key: "symbol_column", label: "Symbol / Ticker", required: true },
   { key: "name_column", label: "Company name", required: true },
   { key: "base_target_column", label: "Base target", required: false },
   { key: "bull_target_column", label: "Bull target", required: false },
@@ -57,13 +57,19 @@ const mappingFields: Array<{ key: keyof MappingFields; label: string; required: 
 const money = (value: number) =>
   `₹${value.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-export default function UploadPage({ onCompleted }: { onCompleted: () => void }) {
+export default function UploadPage({
+  onCompleted,
+  onNavigatePortfolio,
+}: {
+  onCompleted: () => void;
+  onNavigatePortfolio?: () => void;
+}) {
   const [file, setFile] = useState<File | null>(null);
   const [inspection, setInspection] = useState<ImportInspection | null>(null);
   const [sheetName, setSheetName] = useState("");
   const [headerRow, setHeaderRow] = useState(1);
   const [mapping, setMapping] = useState<MappingFields>(emptyMapping);
-  const [uploadedBy, setUploadedBy] = useState("Portfolio Admin");
+  const [uploadedBy, setUploadedBy] = useState("Srushti Kadam");
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [editingRowNumber, setEditingRowNumber] = useState<number | null>(null);
   const [rowDraft, setRowDraft] = useState<{
@@ -76,7 +82,7 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
     base_direction: TargetDirection;
     bull_direction: TargetDirection;
   } | null>(null);
-  const [reviewedCachedTargets, setReviewedCachedTargets] = useState(false);
+  const [reviewedCachedTargets, setReviewedCachedTargets] = useState(true);
   const [isInspecting, setIsInspecting] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
   const [isConfirming, setIsConfirming] = useState(false);
@@ -103,45 +109,160 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
     setPreview(null);
     setEditingRowNumber(null);
     setRowDraft(null);
-    setReviewedCachedTargets(false);
+    setReviewedCachedTargets(true);
     setError("");
   };
 
-  const autoDetectMapping = (headers: Array<{ column: string; header: string | null }>) => {
+  const computeDetectedMapping = (
+    headers: Array<{ column: string; header: string | null }>,
+  ): MappingFields => {
     const next: MappingFields = { ...emptyMapping };
     for (const h of headers) {
-      const label = (h.header || "").toLowerCase();
-      if (!next.exchange_column && (label.includes("exchange") || label === "exch")) {
+      const label = (h.header || "").trim().toLowerCase();
+      if (!label) continue;
+      if (
+        !next.exchange_column &&
+        (label.includes("exchange") || label === "exch" || label === "market")
+      ) {
         next.exchange_column = h.column;
-      } else if (!next.symbol_column && (label.includes("symbol") || label.includes("ticker") || label.includes("scrip"))) {
+      } else if (
+        !next.symbol_column &&
+        (label.includes("symbol") ||
+          label.includes("ticker") ||
+          label.includes("scrip") ||
+          label === "code" ||
+          label === "nse" ||
+          label === "bse")
+      ) {
         next.symbol_column = h.column;
-      } else if (!next.name_column && (label.includes("company") || label.includes("name"))) {
+      } else if (
+        !next.name_column &&
+        (label.includes("company") ||
+          label.includes("name") ||
+          label.includes("stock") ||
+          label.includes("security") ||
+          label.includes("particulars"))
+      ) {
         next.name_column = h.column;
-      } else if (!next.cmp_column && (label.includes("cmp") || label.includes("saved price"))) {
+      } else if (
+        !next.cmp_column &&
+        (label.includes("cmp") ||
+          label.includes("ltp") ||
+          label.includes("saved price") ||
+          label.includes("current price") ||
+          label.includes("market price"))
+      ) {
         next.cmp_column = h.column;
-      } else if (!next.base_target_column && label.includes("base")) {
+      } else if (
+        !next.base_target_column &&
+        (label.includes("base") ||
+          label.includes("downside") ||
+          label.includes("buy target") ||
+          label.includes("target 1") ||
+          label === "t1" ||
+          label.includes("bear"))
+      ) {
         next.base_target_column = h.column;
-      } else if (!next.bull_target_column && label.includes("bull")) {
+      } else if (
+        !next.bull_target_column &&
+        (label.includes("bull") ||
+          label.includes("upside") ||
+          label.includes("sell target") ||
+          label.includes("target 2") ||
+          label === "t2")
+      ) {
         next.bull_target_column = h.column;
-      } else if (!next.sector_column && label.includes("sector")) {
+      } else if (
+        !next.sector_column &&
+        (label.includes("sector") || label.includes("industry"))
+      ) {
         next.sector_column = h.column;
       }
     }
-    setMapping(next);
+    // Fallback if a generic "target" column exists and neither base nor bull was matched
+    if (!next.base_target_column && !next.bull_target_column) {
+      const genericTarget = headers.find((h) =>
+        (h.header || "").toLowerCase().includes("target"),
+      );
+      if (genericTarget) {
+        next.base_target_column = genericTarget.column;
+      }
+    }
+    // If the sheet has only Symbol or only Company Name, share it so preview works out of the box
+    if (next.symbol_column && !next.name_column) {
+      next.name_column = next.symbol_column;
+    } else if (next.name_column && !next.symbol_column) {
+      next.symbol_column = next.name_column;
+    }
+    return next;
   };
 
-  const inspectFile = async (selectedFile: File, row: number) => {
+  const runPreviewWithMapping = async (
+    selectedFile: File,
+    selectedSheet: string,
+    selectedRow: number,
+    activeMapping: MappingFields,
+  ) => {
+    resetPreview();
+    setIsPreviewing(true);
+    const requestMapping: ImportMapping = {
+      sheet_name: selectedSheet,
+      header_row: selectedRow,
+      uploaded_by: uploadedBy || "Srushti Kadam",
+      ...(activeMapping.exchange_column ? { exchange_column: activeMapping.exchange_column } : {}),
+      ...(activeMapping.symbol_column ? { symbol_column: activeMapping.symbol_column } : {}),
+      ...(activeMapping.name_column ? { name_column: activeMapping.name_column } : {}),
+      ...(activeMapping.base_target_column
+        ? { base_target_column: activeMapping.base_target_column }
+        : {}),
+      ...(activeMapping.bull_target_column
+        ? { bull_target_column: activeMapping.bull_target_column }
+        : {}),
+      ...(activeMapping.cmp_column ? { cmp_column: activeMapping.cmp_column } : {}),
+      ...(activeMapping.sector_column ? { sector_column: activeMapping.sector_column } : {}),
+    };
+    try {
+      const previewResult = await previewImport(selectedFile, requestMapping);
+      setPreview(previewResult);
+      setReviewedCachedTargets(true);
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "Could not preview this file.",
+      );
+    } finally {
+      setIsPreviewing(false);
+    }
+  };
+
+  const inspectFile = async (selectedFile: File, row: number, allowAutoRow = false) => {
     setIsInspecting(true);
     setError("");
     try {
-      const result = await inspectImport(selectedFile, row);
+      let result = await inspectImport(selectedFile, row);
+      let effectiveRow = row;
+      if (
+        allowAutoRow &&
+        result.suggested_header_row &&
+        result.suggested_header_row !== row
+      ) {
+        effectiveRow = result.suggested_header_row;
+        setHeaderRow(effectiveRow);
+        result = await inspectImport(selectedFile, effectiveRow);
+      }
       setInspection(result);
       const selectedSheet = result.sheets.some((sheet) => sheet.name === sheetName)
         ? sheetName
         : result.sheets[0]?.name ?? "";
       setSheetName(selectedSheet);
       const sheetHeaders = result.sheets.find((s) => s.name === selectedSheet)?.headers ?? [];
-      autoDetectMapping(sheetHeaders);
+      const detected = computeDetectedMapping(sheetHeaders);
+      setMapping(detected);
+
+      const hasIdentity = Boolean(detected.symbol_column || detected.name_column);
+      const hasTarget = Boolean(detected.base_target_column || detected.bull_target_column);
+      if (selectedSheet && hasIdentity && hasTarget) {
+        await runPreviewWithMapping(selectedFile, selectedSheet, effectiveRow, detected);
+      }
     } catch (requestError) {
       setInspection(null);
       setError(requestError instanceof Error ? requestError.message : "Could not inspect this file.");
@@ -166,7 +287,7 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
     setHeaderRow(1);
     setMapping(emptyMapping);
     resetPreview();
-    void inspectFile(selectedFile, 1);
+    void inspectFile(selectedFile, 1, true);
   };
 
   const onDrop = (event: DragEvent<HTMLDivElement>) => {
@@ -178,33 +299,13 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
   const loadHeaderRow = () => {
     if (!file) return;
     resetPreview();
-    void inspectFile(file, headerRow);
+    void inspectFile(file, headerRow, false);
   };
 
   const headers = inspection?.sheets.find((sheet) => sheet.name === sheetName)?.headers ?? [];
   const previewImportFile = async () => {
     if (!file || !inspection) return;
-    resetPreview();
-    setIsPreviewing(true);
-    const requestMapping: ImportMapping = {
-      sheet_name: sheetName,
-      header_row: headerRow,
-      exchange_column: mapping.exchange_column,
-      symbol_column: mapping.symbol_column,
-      name_column: mapping.name_column,
-      uploaded_by: uploadedBy || "Portfolio Admin",
-      ...(mapping.base_target_column ? { base_target_column: mapping.base_target_column } : {}),
-      ...(mapping.bull_target_column ? { bull_target_column: mapping.bull_target_column } : {}),
-      ...(mapping.cmp_column ? { cmp_column: mapping.cmp_column } : {}),
-      ...(mapping.sector_column ? { sector_column: mapping.sector_column } : {}),
-    };
-    try {
-      setPreview(await previewImport(file, requestMapping));
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Could not preview this file.");
-    } finally {
-      setIsPreviewing(false);
-    }
+    await runPreviewWithMapping(file, sheetName, headerRow, mapping);
   };
 
   const startEditingRow = (row: ImportPreviewRow) => {
@@ -317,10 +418,16 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
     file &&
       inspection &&
       sheetName &&
-      mapping.exchange_column &&
-      mapping.symbol_column &&
-      mapping.name_column &&
+      (mapping.symbol_column || mapping.name_column) &&
       (mapping.base_target_column || mapping.bull_target_column),
+  );
+  const canApprove = Boolean(
+    preview &&
+      preview.status === "preview" &&
+      !isConfirming &&
+      activeRows.length > 0 &&
+      errorCount === 0 &&
+      (!preview.formula_review_required || reviewedCachedTargets),
   );
 
   return (
@@ -330,11 +437,11 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
           <div className="eyebrow">DATA MANAGEMENT · VERSION-CONTROLLED WORKFLOW</div>
           <h1>Upload → Parse → Preview → Validate → Approve → Monitor</h1>
           <p>
-            Inspect an Excel workbook or CSV, review extracted cell references, edit or reject individual records, and create a new versioned target revision.
+            Upload an Excel (.xlsx) or CSV sheet to add stocks and target rules. Only approved Excel uploads add companies to the dashboard.
           </p>
         </div>
         <div className="heading-actions">
-          <button className="button secondary" onClick={downloadTemplate}>
+          <button className="button secondary" type="button" onClick={downloadTemplate}>
             <Download size={14} /> Download sample template
           </button>
         </div>
@@ -353,6 +460,16 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
 
             <div
               className={`dropzone ${dragging ? "dropzone-active" : ""}`}
+              style={{ cursor: "pointer" }}
+              role="button"
+              tabIndex={0}
+              onClick={() => inputRef.current?.click()}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  inputRef.current?.click();
+                }
+              }}
               onDragOver={(event) => {
                 event.preventDefault();
                 setDragging(true);
@@ -364,17 +481,29 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
                 ref={inputRef}
                 type="file"
                 accept=".xlsx,.csv"
-                hidden
-                onChange={(event: ChangeEvent<HTMLInputElement>) => chooseFile(event.target.files?.[0])}
+                style={{ display: "none" }}
+                onChange={(event: ChangeEvent<HTMLInputElement>) => {
+                  const picked = event.target.files?.[0];
+                  event.target.value = "";
+                  chooseFile(picked);
+                }}
               />
               <div className="upload-icon">
                 <CloudDownload size={21} />
               </div>
               <b>
                 Drop your Excel (.xlsx) or CSV here, or{" "}
-                <button onClick={() => inputRef.current?.click()}>browse</button>
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    inputRef.current?.click();
+                  }}
+                >
+                  browse from computer
+                </button>
               </b>
-              <small>Supports ~40+ NSE/BSE companies with cell-reference tracking</small>
+              <small>Supports .xlsx and .csv workbooks · Auto-detects headers, symbols, CMP, and Base/Bull targets</small>
             </div>
 
             {file && (
@@ -388,13 +517,18 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
                     {(file.size / 1024).toFixed(1)} KB ·{" "}
                     {isInspecting
                       ? "Reading sheet headers…"
-                      : inspection
-                        ? "Ready for column mapping"
-                        : "Inspection failed"}
+                      : isPreviewing
+                        ? "Parsing & validating rows…"
+                        : preview
+                          ? `Parsed ${preview.rows.length} row(s) — ready to approve below`
+                          : inspection
+                            ? "Ready for column mapping"
+                            : "Inspection failed"}
                   </small>
                 </div>
                 <button
                   className="icon-button"
+                  type="button"
                   aria-label="Remove file"
                   onClick={() => {
                     setFile(null);
@@ -425,11 +559,21 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
                       <select
                         value={sheetName}
                         onChange={(event) => {
-                          setSheetName(event.target.value);
+                          const nextSheet = event.target.value;
+                          setSheetName(nextSheet);
                           const sh =
-                            inspection.sheets.find((s) => s.name === event.target.value)?.headers ?? [];
-                          autoDetectMapping(sh);
+                            inspection.sheets.find((s) => s.name === nextSheet)?.headers ?? [];
+                          const detected = computeDetectedMapping(sh);
+                          setMapping(detected);
                           resetPreview();
+                          if (
+                            file &&
+                            nextSheet &&
+                            (detected.symbol_column || detected.name_column) &&
+                            (detected.base_target_column || detected.bull_target_column)
+                          ) {
+                            void runPreviewWithMapping(file, nextSheet, headerRow, detected);
+                          }
                         }}
                       >
                         <option value="">Select worksheet</option>
@@ -461,7 +605,12 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
                       onChange={(event) => setUploadedBy(event.target.value)}
                     />
                   </label>
-                  <button className="button secondary" onClick={loadHeaderRow} disabled={isInspecting}>
+                  <button
+                    className="button secondary"
+                    type="button"
+                    onClick={loadHeaderRow}
+                    disabled={isInspecting}
+                  >
                     {isInspecting ? "Reading…" : "Load headers"}
                   </button>
                 </div>
@@ -483,7 +632,9 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
                           resetPreview();
                         }}
                       >
-                        <option value="">Select column</option>
+                        <option value="">
+                          {field.key === "exchange_column" ? "Default (NSE)" : "Select column"}
+                        </option>
                         {headers.map((header) => (
                           <option key={header.column} value={header.column}>
                             {header.column} — {header.header || "(blank header)"}
@@ -494,21 +645,33 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
                   ))}
                 </div>
 
-                <button
-                  className="button primary"
-                  onClick={previewImportFile}
-                  disabled={!canMap || isPreviewing || isInspecting}
-                >
-                  {isPreviewing ? (
-                    <>
-                      <RefreshCw size={14} /> Parsing & Validating…
-                    </>
-                  ) : (
-                    <>
-                      <ShieldCheck size={14} /> Parse & Preview Import
-                    </>
-                  )}
-                </button>
+                {!canMap && (
+                  <div className="preview-note">
+                    <CircleHelp size={14} /> Select at least a{" "}
+                    <b>Symbol / Company Name</b> column and a{" "}
+                    <b>Base Target</b> or <b>Bull Target</b> column above, then click{" "}
+                    <b>Parse &amp; Preview Import</b>.
+                  </div>
+                )}
+
+                <div className="upload-actions">
+                  <button
+                    className="button primary"
+                    type="button"
+                    onClick={() => void previewImportFile()}
+                    disabled={!canMap || isPreviewing || isInspecting}
+                  >
+                    {isPreviewing ? (
+                      <>
+                        <RefreshCw size={14} /> Parsing & Validating…
+                      </>
+                    ) : (
+                      <>
+                        <ShieldCheck size={14} /> {preview ? "Re-Parse & Refresh Preview" : "Parse & Preview Import"}
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
             )}
           </section>
@@ -520,18 +683,33 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
                   <h2>2. Preview, Edit & Approve Extracted Records</h2>
                   <p>
                     {preview.filename} · {activeRows.length} active rows ({preview.rows.length} total) ·
-                    Only approved rows will participate in live price monitoring.
+                    Only approved rows will be added to live monitoring.
                   </p>
                 </div>
-                <span className={errorCount ? "validation-errors" : "validation-ok"}>
-                  {errorCount ? (
-                    `${errorCount} validation error(s) in active rows`
-                  ) : (
-                    <>
-                      <Check size={12} /> Validated & ready for approval
-                    </>
+                <div className="row-actions">
+                  <span className={errorCount ? "validation-errors" : "validation-ok"}>
+                    {errorCount ? (
+                      `${errorCount} validation error(s) in active rows`
+                    ) : (
+                      <>
+                        <Check size={12} /> Validated & ready for approval
+                      </>
+                    )}
+                  </span>
+                  {preview.status === "preview" && (
+                    <button
+                      className="button primary small"
+                      type="button"
+                      disabled={!canApprove}
+                      onClick={() => void confirm()}
+                    >
+                      <Check size={13} />{" "}
+                      {isConfirming
+                        ? "Approving…"
+                        : `Approve & Add ${activeRows.length} Stock(s)`}
+                    </button>
                   )}
-                </span>
+                </div>
               </div>
 
               <div className="table-scroll">
@@ -804,23 +982,30 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
 
               {preview.result && (
                 <div className="preview-note" role="status">
-                  Import Version v{preview.result.version_number ?? preview.version_number ?? 1} Approved:{" "}
-                  {preview.result.created} created, {preview.result.updated} targets updated,{" "}
-                  {preview.result.unchanged} unchanged. Active monitoring has started for all approved companies.
+                  <span>
+                    Import Version v{preview.result.version_number ?? preview.version_number ?? 1} Approved:{" "}
+                    <b>{preview.result.created} created</b>, <b>{preview.result.updated} updated</b>,{" "}
+                    {preview.result.unchanged} unchanged. Active monitoring has started for all approved companies.
+                  </span>
+                  {onNavigatePortfolio && (
+                    <button
+                      className="button primary small"
+                      type="button"
+                      onClick={onNavigatePortfolio}
+                      style={{ marginLeft: "auto" }}
+                    >
+                      Open Portfolio Table →
+                    </button>
+                  )}
                 </div>
               )}
 
               <div className="upload-actions">
                 <button
                   className="button primary"
-                  disabled={
-                    isConfirming ||
-                    preview.status !== "preview" ||
-                    activeRows.length === 0 ||
-                    errorCount > 0 ||
-                    (preview.formula_review_required && !reviewedCachedTargets)
-                  }
-                  onClick={confirm}
+                  type="button"
+                  disabled={!canApprove}
+                  onClick={() => void confirm()}
                 >
                   {isConfirming ? (
                     "Approving…"
@@ -831,7 +1016,11 @@ export default function UploadPage({ onCompleted }: { onCompleted: () => void })
                   )}
                 </button>
                 {preview.status === "preview" && (
-                  <button className="button secondary" onClick={() => void handleRejectBatch()}>
+                  <button
+                    className="button secondary"
+                    type="button"
+                    onClick={() => void handleRejectBatch()}
+                  >
                     <X size={14} /> Reject Entire Upload
                   </button>
                 )}

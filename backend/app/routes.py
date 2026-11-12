@@ -20,7 +20,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.orm.exc import StaleDataError
@@ -39,6 +39,7 @@ from .models import (
     AuditLog,
     Company,
     ImportBatch,
+    ImportRow,
     NotificationOutbox,
     NotificationPreference,
     PriceQuote,
@@ -47,7 +48,13 @@ from .models import (
     TargetRevision,
     WorkerHeartbeat,
 )
-from .notifications import MultiChannelNotifier, drain_outbox, get_or_create_preferences
+from .notifications import (
+    MultiChannelNotifier,
+    check_live_notification_gate,
+    drain_outbox,
+    get_or_create_preferences,
+    is_smtp_complete,
+)
 from .prices import (
     NseBseExchangeCalendar,
     ProviderError,
@@ -98,7 +105,10 @@ def _load_quotes_and_states(
             func.row_number()
             .over(
                 partition_by=(PriceQuote.exchange, PriceQuote.symbol),
-                order_by=(PriceQuote.quoted_at.desc(), PriceQuote.id.desc()),
+                order_by=(
+                    func.coalesce(PriceQuote.quoted_at, PriceQuote.received_at).desc(),
+                    PriceQuote.id.desc(),
+                ),
             )
             .label("position"),
         )
@@ -157,7 +167,10 @@ def get_company_details(
             PriceQuote.exchange == identity[0],
             PriceQuote.symbol == identity[1],
         )
-        .order_by(PriceQuote.quoted_at.desc(), PriceQuote.id.desc())
+        .order_by(
+            func.coalesce(PriceQuote.quoted_at, PriceQuote.received_at).desc(),
+            PriceQuote.id.desc(),
+        )
         .limit(100)
     )
     revisions = session.scalars(
@@ -232,11 +245,15 @@ def get_company_details(
         for r in revisions
     ]
 
+    serialized_quotes = [serialize_quote(q) for q in quotes]
     return {
         "company": company_read.model_dump(),
-        "quote_history": [serialize_quote(q) for q in quotes],
+        "quote_history": serialized_quotes,
+        "price_history": serialized_quotes,
         "alert_history": alerts_serialized,
+        "alerts": alerts_serialized,
         "target_revisions": revisions_serialized,
+        "revisions": revisions_serialized,
         "excel_source": company.source_metadata,
     }
 
@@ -272,6 +289,8 @@ def price_feed_status(session: DbSession) -> dict[str, object]:
 
 @router.get("/worker/status")
 def worker_status(session: DbSession) -> dict[str, object]:
+    from .shoonya_feed import get_latest_feed_health
+
     heartbeat = session.get(WorkerHeartbeat, "price")
     now = datetime.now(timezone.utc)
     last_poll = normalize_utc(heartbeat.last_poll_at) if heartbeat and heartbeat.last_poll_at else None
@@ -279,25 +298,55 @@ def worker_status(session: DbSession) -> dict[str, object]:
     live_provider = bool(heartbeat and heartbeat.provider and heartbeat.provider != "fixture")
     auth_calendar = bool(heartbeat and heartbeat.exchange_calendar and heartbeat.exchange_calendar != "fixture")
     pref = session.get(NotificationPreference, "default")
+    live_notif_ready, notif_gate_reason = check_live_notification_gate()
     notif_mode = (
         "live_channels"
-        if (pref and (pref.dashboard_enabled or (pref.email_enabled and pref.email_recipients)))
+        if (
+            live_notif_ready
+            and pref
+            and (pref.dashboard_enabled or (pref.email_enabled and pref.email_recipients))
+        )
         else "dry_run_only"
     )
 
     quote_by_company, _ = _load_quotes_and_states(session)
     companies = list(session.scalars(select(Company).where(Company.is_approved.is_(True), Company.monitoring_active.is_(True))))
-    stale_symbols = []
+    stale_symbols: list[str] = []
+    freshness_unknown_symbols: list[str] = []
+    fresh_symbols_count = 0
     for c in companies:
         q = quote_by_company.get((c.exchange, c.symbol))
-        if q is not None and not q.get("is_fresh") and not q.get("is_simulated"):
+        if q is None:
+            continue
+        if q.get("status") == "freshness_unknown" or q.get("freshness_unknown"):
+            freshness_unknown_symbols.append(f"{c.exchange}:{c.symbol}")
             stale_symbols.append(f"{c.exchange}:{c.symbol}")
+        elif not q.get("is_fresh") and not q.get("is_simulated"):
+            stale_symbols.append(f"{c.exchange}:{c.symbol}")
+        elif q.get("is_fresh") and not q.get("is_simulated"):
+            fresh_symbols_count += 1
 
     calendar = NseBseExchangeCalendar()
     market_open = calendar.is_open("NSE", now)
+    feed_health = get_latest_feed_health()
+    state = "error" if heartbeat and heartbeat.last_error else "running" if heartbeat_fresh else "stopped"
+    connection_status = (
+        heartbeat.connection_status
+        if (heartbeat and state == "running")
+        else "disconnected"
+    )
+    awaiting_snapshot = bool(feed_health.get("awaiting_snapshot", False)) if heartbeat and heartbeat.provider == "shoonya" else False
+    feed_ready = bool(
+        state == "running"
+        and connection_status in {"connected", "polling"}
+        and live_provider
+        and fresh_symbols_count > 0
+        and len(stale_symbols) == 0
+        and not awaiting_snapshot
+    )
 
     return {
-        "state": "error" if heartbeat and heartbeat.last_error else "running" if heartbeat_fresh else "stopped",
+        "state": state,
         "provider": heartbeat.provider if heartbeat else None,
         "exchange_calendar": heartbeat.exchange_calendar if heartbeat else None,
         "last_started_at": normalize_utc(heartbeat.started_at) if heartbeat else None,
@@ -309,18 +358,37 @@ def worker_status(session: DbSession) -> dict[str, object]:
         if heartbeat and heartbeat.last_failed_at
         else None,
         "last_error": heartbeat.last_error if heartbeat else None,
-        "connection_status": heartbeat.connection_status if heartbeat else "disconnected",
+        "connection_status": connection_status,
         "websocket_status": heartbeat.websocket_status if heartbeat else "unavailable",
         "failed_requests_count": heartbeat.failed_requests_count if heartbeat else 0,
-        "reconnect_count": heartbeat.reconnect_count if heartbeat else 0,
+        "reconnect_count": max(
+            heartbeat.reconnect_count if heartbeat else 0,
+            int(feed_health.get("reconnect_count", 0)),
+        ),
         "monitored_symbols_count": len(companies),
+        "fresh_symbols_count": fresh_symbols_count,
         "stale_symbols_count": len(stale_symbols),
         "stale_symbols": stale_symbols,
+        "freshness_unknown_symbols_count": len(freshness_unknown_symbols),
+        "freshness_unknown_symbols": freshness_unknown_symbols,
+        "feed_ready": feed_ready,
+        "awaiting_snapshot": awaiting_snapshot,
+        "backlog_state": feed_health.get("backlog_state", "normal"),
+        "lag_detected": bool(feed_health.get("lag_detected", False)),
+        "queue_maxsize": int(feed_health.get("queue_maxsize", 256)),
+        "queue_depth": int(feed_health.get("queue_depth", 0)),
+        "queue_overflow_drops": int(feed_health.get("queue_overflow_drops", 0)),
+        "protocol_gap_detection": feed_health.get("protocol_gap_detection", "disabled"),
+        "protocol_gap_reason": feed_health.get("protocol_gap_reason"),
+        "protocol_sequence_gaps": int(feed_health.get("protocol_sequence_gaps", 0)),
+        "reconnect_gaps_count": int(feed_health.get("reconnect_gaps_count", 0)),
+        "gap_history": feed_health.get("gap_history", []),
         "market_open": market_open,
         "live_provider_configured": live_provider,
         "authoritative_calendar_configured": auth_calendar,
         "live_alerts_enabled": live_provider and auth_calendar,
         "notification_mode": notif_mode,
+        "notification_gate_reason": notif_gate_reason,
         "note": (
             "Live NSE/BSE monitoring active."
             if (live_provider and auth_calendar)
@@ -343,9 +411,13 @@ def trigger_manual_poll(
     if use_shoonya:
         from .shoonya_feed import ShoonyaPriceProvider
 
-        provider = ShoonyaPriceProvider()
+        try:
+            provider = ShoonyaPriceProvider()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     else:
         provider = YFinanceProvider()
+    provider_name = getattr(provider, "name", "yfinance")
     now = datetime.now(timezone.utc)
     if exchange and symbol:
         identity = (exchange.upper(), symbol.upper())
@@ -379,7 +451,7 @@ def trigger_manual_poll(
                 fixture_alerts_enabled=False,
             )
             recorded += 1
-        except (ProviderError, ValueError) as exc:
+        except (ProviderError, ValueError, RuntimeError) as exc:
             failed += 1
             errors.append(f"{company.exchange}:{company.symbol}: {exc}")
 
@@ -388,7 +460,7 @@ def trigger_manual_poll(
     if heartbeat is None:
         heartbeat = WorkerHeartbeat(
             name="price",
-            provider="yfinance",
+            provider=provider_name,
             exchange_calendar="nse_bse",
             started_at=now,
             last_poll_at=now,
@@ -402,7 +474,7 @@ def trigger_manual_poll(
         )
         session.add(heartbeat)
     else:
-        heartbeat.provider = "yfinance"
+        heartbeat.provider = provider_name
         heartbeat.exchange_calendar = "nse_bse"
         heartbeat.last_poll_at = now
         heartbeat.last_error = errors[0][:1000] if errors and recorded == 0 else None
@@ -567,6 +639,7 @@ def trigger_outbox_drain(session: DbSession) -> dict[str, int]:
 def read_notification_preferences(session: DbSession) -> dict[str, Any]:
     pref = get_or_create_preferences(session)
     session.commit()
+    smtp_ok, _ = is_smtp_complete()
     return {
         "id": pref.id,
         "dashboard_enabled": pref.dashboard_enabled,
@@ -575,7 +648,7 @@ def read_notification_preferences(session: DbSession) -> dict[str, Any]:
         "notify_on_base": pref.notify_on_base,
         "notify_on_bull": pref.notify_on_bull,
         "notify_on_stale": pref.notify_on_stale,
-        "smtp_configured": bool(os.environ.get("SMTP_HOST") or os.environ.get("SMTP_SPOOL_DIR")),
+        "smtp_configured": smtp_ok,
         "updated_at": normalize_utc(pref.updated_at),
     }
 
@@ -625,6 +698,7 @@ def update_notification_preferences(
         )
     )
     session.commit()
+    smtp_ok, _ = is_smtp_complete()
     return {
         "id": pref.id,
         "dashboard_enabled": pref.dashboard_enabled,
@@ -633,7 +707,7 @@ def update_notification_preferences(
         "notify_on_base": pref.notify_on_base,
         "notify_on_bull": pref.notify_on_bull,
         "notify_on_stale": pref.notify_on_stale,
-        "smtp_configured": bool(os.environ.get("SMTP_HOST") or os.environ.get("SMTP_SPOOL_DIR")),
+        "smtp_configured": smtp_ok,
         "updated_at": normalize_utc(pref.updated_at),
     }
 
@@ -656,7 +730,10 @@ def company_price_history(
             PriceQuote.exchange == identity[0],
             PriceQuote.symbol == identity[1],
         )
-        .order_by(PriceQuote.quoted_at.desc(), PriceQuote.id.desc())
+        .order_by(
+            func.coalesce(PriceQuote.quoted_at, PriceQuote.received_at).desc(),
+            PriceQuote.id.desc(),
+        )
         .limit(limit)
     )
     return {
@@ -990,6 +1067,8 @@ def confirm_import(
                 created += 1
             else:
                 company.is_approved = True
+                if row.name:
+                    company.name = row.name
 
             if row.update_sector:
                 company.sector = row.sector
@@ -1138,6 +1217,28 @@ def list_audit_logs(
     ]
 
 
+@router.post("/workspace/reset")
+@router.delete("/workspace/reset")
+def reset_workspace_data(session: DbSession) -> dict[str, Any]:
+    """Clear all companies, import batches, quotes, alerts, target revisions, and audit logs."""
+    deleted_companies = session.scalar(select(func.count()).select_from(Company)) or 0
+    session.execute(delete(NotificationOutbox))
+    session.execute(delete(TargetAlert))
+    session.execute(delete(TargetAlertState))
+    session.execute(delete(TargetRevision))
+    session.execute(delete(PriceQuote))
+    session.execute(delete(ImportRow))
+    session.execute(delete(ImportBatch))
+    session.execute(delete(Company))
+    session.execute(delete(AuditLog))
+    session.execute(delete(WorkerHeartbeat))
+    session.commit()
+    return {
+        "status": "cleared",
+        "deleted_companies": int(deleted_companies),
+    }
+
+
 def _serialize_single_outbox_alert(
     outbox: NotificationOutbox,
     alert: TargetAlert,
@@ -1251,7 +1352,9 @@ def _poll_stream_delta(
                     "company_name": company.name,
                     "quote": {
                         **quote_data,
-                        "quoted_at": normalize_utc(quote.quoted_at).isoformat(),
+                        "quoted_at": normalize_utc(quote.quoted_at).isoformat()
+                        if quote.quoted_at is not None
+                        else None,
                         "received_at": normalize_utc(quote.received_at).isoformat(),
                     },
                     "base_target": float(company.base_target) if company.base_target is not None else None,
