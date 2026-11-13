@@ -22,7 +22,6 @@ import {
   LayoutDashboard,
   LineChart,
   Menu,
-  Moon,
   MoreHorizontal,
   PanelLeftClose,
   RefreshCw,
@@ -139,7 +138,7 @@ function alertStatusBadge(company: PortfolioCompany) {
   }
   const isStale = quote != null && !quote.is_fresh && !quote.is_simulated;
   if (isStale) {
-    return <span className="status-badge badge-sell"><i />STALE QUOTE</span>;
+    return <span className="status-badge badge-approaching"><i />STALE QUOTE</span>;
   }
   const st = company.alert_status ?? "monitoring";
   if (st === "both_triggered") {
@@ -197,7 +196,6 @@ export default function App() {
   const [workerStatus, setWorkerStatus] = useState<WorkerStatus | null>(null);
   const [importHistory, setImportHistory] = useState<ImportBatchHistoryItem[]>([]);
 
-  const [dark, setDark] = useState(true);
   const [collapsed, setCollapsed] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
   const [drawer, setDrawer] = useState(false);
@@ -416,9 +414,7 @@ export default function App() {
 
   return (
     <div
-      className={`app-shell min-h-screen ${dark ? "theme-dark" : "theme-light"} ${
-        compactTables ? "compact-tables" : ""
-      }`}
+      className={`app-shell min-h-screen ${compactTables ? "compact-tables" : ""}`}
     >
       <aside
         className={`sidebar ${collapsed ? "sidebar-collapsed" : ""} ${
@@ -575,8 +571,7 @@ export default function App() {
 
         <main className="content-area">
           {(portfolioStatus === "error" ||
-            workerStatus?.state === "error" ||
-            staleCompanies.length > 0) && (
+            workerStatus?.state === "error") && (
             <div className="feed-banner feed-error" role="alert">
               <div className="feed-main-icon">
                 <AlertTriangle size={18} />
@@ -585,12 +580,10 @@ export default function App() {
                 <b>
                   {portfolioStatus === "error"
                     ? "Market Monitoring API Disconnected"
-                    : workerStatus?.state === "error"
-                      ? `Market Feed Warning: ${workerStatus.last_error}`
-                      : `${staleCompanies.length} Symbol(s) Have Stale Quotes`}
+                    : `Market Feed Warning: ${workerStatus?.last_error}`}
                 </b>
                 <small>
-                  Never treat stale or reference CMP values as live market prices. Click "Poll Live Quotes" to refresh from the market data provider.
+                  Check the feed connection and worker status before relying on live market data.
                 </small>
               </div>
               <div className="feed-banner-right">
@@ -704,8 +697,6 @@ export default function App() {
 
           {page === "Settings" && (
             <SettingsPage
-              dark={dark}
-              setDark={setDark}
               compactTables={compactTables}
               setCompactTables={setCompactTables}
               soundEnabled={soundEnabled}
@@ -1345,7 +1336,7 @@ function MonitoringTable({
                 style={{
                   cursor: "pointer",
                   background: isStale
-                    ? "rgba(239, 114, 123, 0.08)"
+                    ? "rgba(180, 83, 9, 0.06)"
                     : freshnessUnknown
                       ? "rgba(231, 173, 90, 0.08)"
                       : undefined,
@@ -1384,7 +1375,11 @@ function MonitoringTable({
                           {percent(vsSavedCmp)}
                         </span>
                       )}
-                      <small className="quote-freshness">
+                      <small
+                        className={`quote-freshness ${
+                          freshnessUnknown || isStale ? "quote-warning" : ""
+                        }`}
+                      >
                         {freshnessUnknown
                           ? "⚠ Freshness unknown"
                           : isStale
@@ -1423,20 +1418,12 @@ function MonitoringTable({
                   </small>
                 </td>
                 <td>
-                  <span
-                    className={
-                      (company.distance_to_base_pct ?? 0) <= 0 ? "positive" : "text-muted"
-                    }
-                  >
+                  <span className="text-muted">
                     {formatDistance(company.distance_to_base_abs, company.distance_to_base_pct)}
                   </span>
                 </td>
                 <td>
-                  <span
-                    className={
-                      (company.distance_to_bull_pct ?? 0) >= 0 ? "positive" : "text-muted"
-                    }
-                  >
+                  <span className="text-muted">
                     {formatDistance(company.distance_to_bull_abs, company.distance_to_bull_pct)}
                   </span>
                 </td>
@@ -1505,7 +1492,11 @@ function MonitoringTable({
                 <div className="mobile-card-metric">
                   <small>Latest Price</small>
                   <b>{quote ? money(quote.price) : "Awaiting quote"}</b>
-                  <span className="cell-sub">
+                  <span
+                    className={`cell-sub ${
+                      freshnessUnknown || isStale ? "quote-warning" : ""
+                    }`}
+                  >
                     {quote
                       ? freshnessUnknown
                         ? "Freshness unknown"
@@ -2545,7 +2536,6 @@ function ReportsPage({
           <select
             value={exchange}
             onChange={(e) => setExchange(e.target.value)}
-            style={{ marginTop: 6 }}
           >
             <option>All exchanges</option>
             <option>NSE</option>
@@ -2564,8 +2554,6 @@ function ReportsPage({
 }
 
 function SettingsPage({
-  dark,
-  setDark,
   compactTables,
   setCompactTables,
   soundEnabled,
@@ -2574,8 +2562,6 @@ function SettingsPage({
   notify,
   onPreviewTestEmail,
 }: {
-  dark: boolean;
-  setDark: (v: boolean) => void;
   compactTables: boolean;
   setCompactTables: (v: boolean) => void;
   soundEnabled: boolean;
@@ -2740,27 +2726,9 @@ function SettingsPage({
               </div>
               <div>
                 <h2>Appearance & Worker Telemetry</h2>
-                <p>Customize visual layout and inspect worker status.</p>
+                <p>Configure table density and inspect worker status.</p>
               </div>
             </div>
-            {row(
-              "Color theme",
-              "Choose Light or Dark appearance.",
-              <div className="theme-options">
-                <button
-                  className={!dark ? "theme-option selected" : "theme-option"}
-                  onClick={() => setDark(false)}
-                >
-                  <Sun size={14} /> Light
-                </button>
-                <button
-                  className={dark ? "theme-option selected" : "theme-option"}
-                  onClick={() => setDark(true)}
-                >
-                  <Moon size={14} /> Dark
-                </button>
-              </div>,
-            )}
             {row(
               "Compact data tables",
               "Information-dense rows for monitoring 40+ companies.",
