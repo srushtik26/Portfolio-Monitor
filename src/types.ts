@@ -175,6 +175,7 @@ export interface WorkerStatus {
   freshness_unknown_symbols?: string[];
   websocket_status?: string;
   connection_status?: string;
+  market_open?: boolean;
   feed_ready?: boolean;
   awaiting_snapshot?: boolean;
   backlog_state?: "normal" | "overflow";
@@ -359,4 +360,3 @@ export interface LiveUiAlertNotification {
   channel: string;
   createdAt: string;
 }
-

@@ -391,6 +391,7 @@ export default function App() {
     (workerStatus?.connection_status === "connected" ||
       workerStatus?.connection_status === "polling") &&
     workerStatus?.feed_ready === true;
+  const marketClosed = portfolioStatus !== "error" && workerStatus?.market_open === false;
   const brokerFeedLive =
     portfolioStatus === "ready" &&
     providerConnected &&
@@ -402,15 +403,17 @@ export default function App() {
   const headerShortStatusLabel =
     portfolioStatus === "error"
       ? "API Down"
-      : brokerFeedLive
-        ? "Live"
-        : freshnessUnknownCompanies.length > 0
-          ? "Unknown Time"
-          : staleCompanies.length > 0
-            ? "Stale"
-            : workerStatus?.state === "running"
-              ? "Awaiting Quotes"
-              : "Feed Offline";
+      : marketClosed
+        ? "Market Closed"
+        : brokerFeedLive
+          ? "Live"
+          : freshnessUnknownCompanies.length > 0
+            ? "Unknown Time"
+            : staleCompanies.length > 0
+              ? "Stale"
+              : workerStatus?.state === "running"
+                ? "Awaiting Quotes"
+                : "Feed Offline";
 
   return (
     <div
@@ -533,21 +536,23 @@ export default function App() {
             </label>
             <div className="top-divider" />
             <div
-              className={`connection ${brokerFeedLive ? "connected" : "disconnected"}`}
-              title={`Broker Feed: ${brokerProviderName} (${workerStatus?.connection_status ?? "stopped"}) · UI Transport: ${browserTransportStatus.toUpperCase()}`}
+              className={`connection ${brokerFeedLive ? "connected" : "disconnected"} ${marketClosed ? "connection-closed" : ""}`}
+              title={`Market session: ${marketClosed ? "closed" : workerStatus?.market_open === true ? "open" : "unknown"} · Broker Feed: ${brokerProviderName} (${workerStatus?.connection_status ?? "stopped"}) · UI Transport: ${browserTransportStatus.toUpperCase()}`}
             >
               <span className="status-dot" />
               <span className="connection-mobile-label">{headerShortStatusLabel}</span>
               <span className="connection-label">
                 {portfolioStatus === "error"
                   ? "Backend Disconnected"
-                  : brokerFeedLive
-                    ? `Live · Provider ${brokerProviderName} (${freshCompaniesCount} fresh) · UI ${browserTransportStatus.toUpperCase()}`
-                    : freshnessUnknownCompanies.length > 0
-                      ? `Provider ${brokerProviderName} · ${freshnessUnknownCompanies.length} Freshness Unknown · UI ${browserTransportStatus.toUpperCase()}`
-                      : staleCompanies.length > 0
-                        ? `Provider ${brokerProviderName} · ${staleCompanies.length} Stale Quote(s) · UI ${browserTransportStatus.toUpperCase()}`
-                        : `Provider ${brokerProviderName} · Worker ${workerStatus?.state ?? "stopped"} (Not Ready) · UI ${browserTransportStatus.toUpperCase()}`}
+                  : marketClosed
+                    ? `Market Closed · Last quote ${workerStatus?.last_poll_at ? new Date(workerStatus.last_poll_at).toLocaleTimeString("en-IN") : "unavailable"} · UI ${browserTransportStatus.toUpperCase()}`
+                    : brokerFeedLive
+                      ? `Live · Provider ${brokerProviderName} (${freshCompaniesCount} fresh) · UI ${browserTransportStatus.toUpperCase()}`
+                      : freshnessUnknownCompanies.length > 0
+                        ? `Provider ${brokerProviderName} · ${freshnessUnknownCompanies.length} Freshness Unknown · UI ${browserTransportStatus.toUpperCase()}`
+                        : staleCompanies.length > 0
+                          ? `Provider ${brokerProviderName} · ${staleCompanies.length} Stale Quote(s) · UI ${browserTransportStatus.toUpperCase()}`
+                          : `Provider ${brokerProviderName} · Worker ${workerStatus?.state ?? "stopped"} (Not Ready) · UI ${browserTransportStatus.toUpperCase()}`}
               </span>
             </div>
             <button
@@ -1180,12 +1185,24 @@ function OverviewPage({
               </b>
             </div>
             <div>
-              <small>Last Quote Time</small>
-              <b>
+              <small>Market Session</small>
+              <b
+                className={
+                  workerStatus?.market_open === false ? "market-session-closed" : ""
+                }
+              >
+                {workerStatus?.market_open === false
+                  ? "Closed"
+                  : workerStatus?.market_open === true
+                    ? "Open"
+                    : "Status unavailable"}
+              </b>
+              <small className="market-health-last-quote">
+                Last quote:{" "}
                 {workerStatus?.last_poll_at
                   ? new Date(workerStatus.last_poll_at).toLocaleString("en-IN")
                   : "No live quotes recorded"}
-              </b>
+              </small>
             </div>
             <div>
               <small>Freshness & Gaps</small>

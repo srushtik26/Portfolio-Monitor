@@ -580,6 +580,17 @@ select:focus-visible {
   box-shadow: 0 0 8px var(--amber);
 }
 
+.connection-closed {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: #FECACA;
+}
+
+.connection-closed .status-dot {
+  background: var(--red);
+  box-shadow: none;
+}
+
 .icon-button {
   border: 1px solid transparent;
   background: transparent;
@@ -3512,6 +3523,7 @@ option {
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
+  background: #EFF6FF;
 }
 
 .detail-top {
@@ -3526,7 +3538,7 @@ option {
   z-index: 4;
   margin: 0 -20px;
   padding: 0 20px;
-  background: var(--surface);
+  background: #EFF6FF;
 }
 
 .back-link {
@@ -3595,7 +3607,7 @@ option {
   flex-wrap: wrap;
   padding: 15px 16px;
   margin-bottom: 12px;
-  background: var(--surface-raised);
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 12px;
 }
@@ -3635,7 +3647,7 @@ option {
   padding: 15px 16px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: var(--surface-raised);
+  background: var(--surface);
 }
 
 .detail-target span {
@@ -5066,7 +5078,7 @@ option {
   background: var(--surface-raised);
 }
 
-.connection {
+.connection:not(.connection-closed) {
   min-height: 34px;
   background: var(--surface-raised);
   border-color: var(--border-soft);
@@ -5342,6 +5354,16 @@ option {
 .market-health-card .worker-status-grid b {
   font-size: 12px;
   line-height: 1.5;
+}
+
+.market-health-card .worker-status-grid .market-session-closed {
+  color: var(--blue);
+}
+
+.market-health-card .worker-status-grid .market-health-last-quote {
+  font-size: 10.5px;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .import-history-card .activity-list {
