@@ -1,10 +1,37 @@
 import os
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+
+def load_dotenv_if_present() -> None:
+    """Load key=value pairs from .env when not running inside pytest."""
+    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in os.sys.modules:
+        return
+    repo_root = Path(__file__).resolve().parents[2]
+    backend_root = Path(__file__).resolve().parents[1]
+    for env_path in (backend_root / ".env", repo_root / ".env"):
+        if not env_path.is_file():
+            continue
+        try:
+            for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                k = key.strip()
+                v = val.strip().strip("'").strip('"').strip()
+                if k:
+                    os.environ.setdefault(k, v)
+        except OSError:
+            pass
+
+
+load_dotenv_if_present()
 
 
 def get_database_url() -> str:

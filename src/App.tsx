@@ -55,15 +55,19 @@ import {
   fetchNotificationPreferences,
   fetchWorkerStatus,
   performAlertAction,
+  previewTestAlertEmail,
+  resendAlertNotification,
   resetWorkspaceData,
   restoreImportVersion,
   triggerOnDemandPoll,
+  triggerOutboxDrain,
   updateCompanyTargets,
   updateNotificationPreferences,
 } from "./api";
 import BackendUploadPage from "./UploadPage";
 import { useLiveMarketStream } from "./useLiveMarketStream";
 import type {
+  AlertEmailPreviewResponse,
   ApiAlert,
   CompanyDetailsResponse,
   ImportBatchHistoryItem,
@@ -158,6 +162,27 @@ function alertStatusBadge(company: PortfolioCompany) {
   return <span className="status-badge badge-neutral"><i />Monitoring</span>;
 }
 
+function playAlertChime(isBull: boolean) {
+  try {
+    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(isBull ? 660 : 528, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(isBull ? 880 : 660, ctx.currentTime + 0.16);
+    gain.gain.setValueAtTime(0.08, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.28);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.3);
+  } catch {
+    // ignore audio restrictions
+  }
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("Overview");
   const [portfolioCompanies, setPortfolioCompanies] = useState<PortfolioCompany[]>([]);
@@ -177,6 +202,8 @@ export default function App() {
   const [drawer, setDrawer] = useState(false);
   const [selectedCompany, setSelectedCompany] = useState<PortfolioCompany | null>(null);
   const [editing, setEditing] = useState<PortfolioCompany | null>(null);
+  const [emailPreviewItem, setEmailPreviewItem] = useState<ApiAlert | AlertEmailPreviewResponse | null>(null);
+  const [soundEnabled, setSoundEnabled] = useState(true);
   const [toast, setToast] = useState("");
   const [query, setQuery] = useState("");
   const [compactTables, setCompactTables] = useState(true);
@@ -192,6 +219,9 @@ export default function App() {
     setApiAlerts,
     onOutboxAlert: (outboxNotif) => {
       const targetLabel = outboxNotif.alert.target_kind === "base" ? "Base Target" : "Bull Target";
+      if (soundEnabled) {
+        playAlertChime(outboxNotif.alert.target_kind === "bull");
+      }
       notify(
         `Live Alert: ${outboxNotif.alert.symbol} reached ${targetLabel} (${money(
           outboxNotif.alert.price,
@@ -240,19 +270,29 @@ export default function App() {
     return () => controller.abort();
   }, [portfolioRequest]);
 
-  // Periodic background refresh of dashboard view every 30s
+  // Periodic background refresh of dashboard view (and automatic yfinance backup poll when companies are present)
   useEffect(() => {
     const timer = window.setInterval(() => {
-      void Promise.all([fetchCompanies(), fetchAlerts(), fetchWorkerStatus()])
-        .then(([c, a, w]) => {
+      void (async () => {
+        try {
+          if (portfolioCompanies.length > 0 && workerStatus?.provider !== "shoonya") {
+            await triggerOnDemandPoll().catch(() => null);
+          }
+          const [c, a, w] = await Promise.all([
+            fetchCompanies(),
+            fetchAlerts(),
+            fetchWorkerStatus(),
+          ]);
           setPortfolioCompanies(c);
           setApiAlerts(a);
           setWorkerStatus(w);
-        })
-        .catch(() => null);
+        } catch {
+          // ignore background refresh error
+        }
+      })();
     }, 30000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [portfolioCompanies.length, workerStatus?.provider]);
 
   useEffect(() => {
     if (selectedCompany) {
@@ -286,6 +326,35 @@ export default function App() {
       reloadAll();
     } catch (err) {
       notify(err instanceof Error ? err.message : "Could not update alert");
+    }
+  };
+
+  const handleDrainOutbox = async () => {
+    try {
+      const res = await triggerOutboxDrain();
+      notify(`Outbox drained: ${res.sent} sent, ${res.retried} retried, ${res.failed} failed`);
+      reloadAll();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "Could not drain outbox");
+    }
+  };
+
+  const handleResendAlert = async (alertId: number) => {
+    try {
+      const res = await resendAlertNotification(alertId);
+      notify(`Re-dispatched alert #${alertId}: ${res.sent} sent, ${res.retried} retried`);
+      reloadAll();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "Could not resend alert");
+    }
+  };
+
+  const handleOpenTestPreview = async (targetKind: "base" | "bull" = "base") => {
+    try {
+      const preview = await previewTestAlertEmail({ targetKind });
+      setEmailPreviewItem(preview);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "Could not generate email preview");
     }
   };
 
@@ -583,6 +652,10 @@ export default function App() {
               workerStatus={workerStatus}
               onRefresh={reloadAll}
               onAction={handleAlertLifecycle}
+              onDrainOutbox={handleDrainOutbox}
+              onResendAlert={handleResendAlert}
+              onPreviewEmail={(item) => setEmailPreviewItem(item)}
+              onPreviewTestEmail={handleOpenTestPreview}
             />
           )}
 
@@ -620,7 +693,10 @@ export default function App() {
 
           {page === "Upload Excel" && (
             <BackendUploadPage
-              onCompleted={reloadAll}
+              onCompleted={() => {
+                reloadAll();
+                void handlePollNow();
+              }}
               onNavigatePortfolio={() => pickPage("Portfolio")}
             />
           )}
@@ -631,8 +707,11 @@ export default function App() {
               setDark={setDark}
               compactTables={compactTables}
               setCompactTables={setCompactTables}
+              soundEnabled={soundEnabled}
+              setSoundEnabled={setSoundEnabled}
               workerStatus={workerStatus}
               notify={notify}
+              onPreviewTestEmail={handleOpenTestPreview}
             />
           )}
         </main>
@@ -653,6 +732,27 @@ export default function App() {
             alerts={apiAlerts}
             onClose={() => setDrawer(false)}
             onAction={handleAlertLifecycle}
+            onPreviewEmail={(item) => setEmailPreviewItem(item)}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {emailPreviewItem && (
+          <EmailPreviewModal
+            item={emailPreviewItem}
+            onClose={() => setEmailPreviewItem(null)}
+            onResend={
+              "id" in emailPreviewItem && emailPreviewItem.id > 0
+                ? () => void handleResendAlert(emailPreviewItem.id)
+                : undefined
+            }
+            onSwitchSample={
+              !("id" in emailPreviewItem)
+                ? (kind) => void handleOpenTestPreview(kind)
+                : undefined
+            }
+            notify={notify}
           />
         )}
       </AnimatePresence>
@@ -690,6 +790,14 @@ export default function App() {
           <div className="live-outbox-toast-stack" role="region" aria-label="Live Target Alerts">
             {liveStream.liveNotifications.map((item) => {
               const isBase = item.alert.target_kind === "base";
+              const breachAbs =
+                item.alert.breach_abs ??
+                (item.alert.target != null ? item.alert.price - item.alert.target : null);
+              const breachPct =
+                item.alert.breach_pct ??
+                (item.alert.target != null && item.alert.target > 0
+                  ? ((item.alert.price - item.alert.target) / item.alert.target) * 100
+                  : null);
               return (
                 <motion.div
                   key={item.outboxId}
@@ -721,10 +829,22 @@ export default function App() {
                       <strong>
                         {item.alert.target != null ? money(item.alert.target) : "—"}
                       </strong>{" "}
-                      ({item.alert.price_direction ?? (isBase ? "Downward" : "Upward")})
+                      {breachAbs != null && breachPct != null && (
+                        <span className={isBase ? "positive" : "negative"}>
+                          ({formatDistance(breachAbs, breachPct)})
+                        </span>
+                      )}
                     </p>
                   </div>
                   <div className="live-outbox-toast-actions">
+                    <button
+                      className="button secondary small"
+                      onClick={() => {
+                        setEmailPreviewItem(item.alert);
+                      }}
+                    >
+                      View Email
+                    </button>
                     <button
                       className="button secondary small"
                       onClick={() => {
@@ -1654,6 +1774,10 @@ function AlertsPage({
   workerStatus,
   onRefresh,
   onAction,
+  onDrainOutbox,
+  onResendAlert,
+  onPreviewEmail,
+  onPreviewTestEmail,
 }: {
   apiAlerts: ApiAlert[];
   apiStatus: "loading" | "ready" | "error";
@@ -1661,10 +1785,18 @@ function AlertsPage({
   workerStatus: WorkerStatus | null;
   onRefresh: () => void;
   onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
+  onDrainOutbox: () => Promise<void>;
+  onResendAlert: (id: number) => Promise<void>;
+  onPreviewEmail: (alert: ApiAlert) => void;
+  onPreviewTestEmail: (kind: "base" | "bull") => Promise<void>;
 }) {
   const [targetFilter, setTargetFilter] = useState("All targets");
   const [lifecycleFilter, setLifecycleFilter] = useState("All states");
+  const [deliveryFilter, setDeliveryFilter] = useState("All deliveries");
   const [query, setQuery] = useState("");
+  const [draining, setDraining] = useState(false);
+
+  const activeAlerts = apiAlerts.filter(isAlertActive);
 
   const filtered = apiAlerts.filter((a) => {
     const matchesTarget =
@@ -1677,26 +1809,67 @@ function AlertsPage({
       (lifecycleFilter === "Triggered" && isAlertActive(a)) ||
       (lifecycleFilter === "Resolved" && (st === "resolved" || st === "reset")) ||
       st === lifecycleFilter.toLowerCase();
+    const matchesDelivery =
+      deliveryFilter === "All deliveries" ||
+      (deliveryFilter === "Delivered" && a.delivery_status === "sent") ||
+      (deliveryFilter === "Dry Run" && a.delivery_mode === "dry_run") ||
+      (deliveryFilter === "Queued / Retry" &&
+        (a.delivery_status === "queued" || a.delivery_status === "retry")) ||
+      (deliveryFilter === "Failed" && a.delivery_status === "failed");
     const matchesQuery =
       !query ||
       `${a.company} ${a.symbol}`.toLowerCase().includes(query.toLowerCase());
-    return matchesTarget && matchesLifecycle && matchesQuery;
+    return matchesTarget && matchesLifecycle && matchesDelivery && matchesQuery;
   });
+
+  const handleDrain = async () => {
+    setDraining(true);
+    try {
+      await onDrainOutbox();
+    } finally {
+      setDraining(false);
+    }
+  };
 
   return (
     <>
       <PageHeading
         eyebrow="ALERT ENGINE & NOTIFICATION OUTBOX"
         title="Price Target Alerts"
-        description="Triggered Base and Bull target events with exact trigger prices, directions, delivery tracking, and re-arm controls."
+        description="Triggered Base and Bull target events with exact trigger prices, breach variance, formatted email previews, and re-arm controls."
         action={
-          <button
-            className="button secondary"
-            onClick={onRefresh}
-            disabled={apiStatus === "loading"}
-          >
-            <RefreshCw size={14} /> Refresh Alerts
-          </button>
+          <div className="heading-actions">
+            <button
+              className="button secondary"
+              onClick={() => void onPreviewTestEmail("base")}
+            >
+              <Bell size={14} /> Preview Alert Email
+            </button>
+            {activeAlerts.length > 0 && (
+              <button
+                className="button secondary"
+                onClick={() => {
+                  activeAlerts.forEach((a) => void onAction(a.id, "acknowledge"));
+                }}
+              >
+                <CheckCheck size={14} /> Acknowledge All ({activeAlerts.length})
+              </button>
+            )}
+            <button
+              className="button secondary"
+              onClick={() => void handleDrain()}
+              disabled={draining}
+            >
+              <Zap size={14} /> {draining ? "Draining Outbox…" : "Drain / Retry Outbox"}
+            </button>
+            <button
+              className="button primary"
+              onClick={onRefresh}
+              disabled={apiStatus === "loading"}
+            >
+              <RefreshCw size={14} /> Refresh Alerts
+            </button>
+          </div>
         }
       />
 
@@ -1704,7 +1877,7 @@ function AlertsPage({
         <div className="alert-summary">
           <span className="summary-dot red" />
           <div>
-            <b>{apiAlerts.filter(isAlertActive).length}</b>
+            <b>{activeAlerts.length}</b>
             <small>Active Triggered</small>
           </div>
         </div>
@@ -1739,7 +1912,7 @@ function AlertsPage({
           <span className="summary-dot amber" />
           <div>
             <b>{apiAlerts.filter((a) => a.delivery_status === "sent").length}</b>
-            <small>Notifications Delivered</small>
+            <small>Notifications Processed</small>
           </div>
         </div>
       </div>
@@ -1751,7 +1924,7 @@ function AlertsPage({
               <Bell size={15} />
             </div>
             <div>
-              <b>Persisted Target Alert Events</b>
+              <b>Persisted Target Alert Events & Mail Outbox</b>
               <small>
                 Worker: {workerStatus?.state ?? "stopped"} · Notification mode:{" "}
                 {workerStatus?.notification_mode ?? "dry_run"}
@@ -1784,6 +1957,16 @@ function AlertsPage({
               <option>Acknowledged</option>
               <option>Resolved</option>
             </select>
+            <select
+              value={deliveryFilter}
+              onChange={(e) => setDeliveryFilter(e.target.value)}
+            >
+              <option>All deliveries</option>
+              <option>Delivered</option>
+              <option>Dry Run</option>
+              <option>Queued / Retry</option>
+              <option>Failed</option>
+            </select>
           </div>
         </div>
 
@@ -1805,10 +1988,10 @@ function AlertsPage({
                 <tr>
                   <th>Alert Type</th>
                   <th>Company</th>
-                  <th>Trigger Price / Target</th>
+                  <th>Trigger Price / Target & Variance</th>
                   <th>Direction</th>
                   <th>Trigger Time</th>
-                  <th>Notification Delivery</th>
+                  <th>Mail & Dashboard Delivery</th>
                   <th>Lifecycle Status</th>
                   <th>Actions</th>
                 </tr>
@@ -1817,27 +2000,43 @@ function AlertsPage({
                 {filtered.map((alert) => {
                   const lifecycle = alert.lifecycle_status ?? "active";
                   const active = isAlertActive(alert);
+                  const isBase = alert.target_kind === "base";
+                  const breachAbs =
+                    alert.breach_abs ??
+                    (alert.target != null ? alert.price - alert.target : null);
+                  const breachPct =
+                    alert.breach_pct ??
+                    (alert.target != null && alert.target > 0
+                      ? ((alert.price - alert.target) / alert.target) * 100
+                      : null);
                   return (
                     <tr key={alert.id}>
                       <td>
-                        <b>
-                          {alert.target_kind === "base"
-                            ? "Base Target Alert"
-                            : "Bull Target Alert"}
-                        </b>
-                        <small className="cell-sub">
-                          {alert.is_simulated ? "SIMULATED" : "LIVE MARKET"}
+                        <span className={`status-badge ${isBase ? "badge-buy" : "badge-sell"}`}>
+                          <i />
+                          {isBase ? "Base Target Alert" : "Bull Target Alert"}
+                        </span>
+                        <small className="cell-sub" style={{ display: "block", marginTop: 4 }}>
+                          {alert.is_simulated ? "SIMULATED" : "LIVE MARKET"} · Cycle #{alert.trigger_cycle ?? 1}
                         </small>
                       </td>
                       <td>
                         <b>{alert.company}</b>
                         <small className="cell-sub">
                           {alert.exchange}:{alert.symbol}
+                          {alert.saved_cmp != null ? ` · Ref CMP: ${money(alert.saved_cmp)}` : ""}
                         </small>
                       </td>
                       <td>
-                        <b>{money(alert.price)}</b> /{" "}
-                        {alert.target == null ? "—" : money(alert.target)}
+                        <div>
+                          <b>{money(alert.price)}</b> /{" "}
+                          {alert.target == null ? "—" : money(alert.target)}
+                        </div>
+                        {breachAbs != null && breachPct != null && (
+                          <small className={isBase ? "positive" : "negative"}>
+                            Breach: {formatDistance(breachAbs, breachPct)}
+                          </small>
+                        )}
                       </td>
                       <td>
                         <span className="direction-pill">
@@ -1863,6 +2062,11 @@ function AlertsPage({
                           <i />
                           {alert.delivery_label} ({alert.attempts}/{alert.max_attempts})
                         </span>
+                        {alert.recipients && alert.recipients.length > 0 && (
+                          <small className="cell-sub" style={{ display: "block", marginTop: 3 }}>
+                            To: {alert.recipients.join(", ")}
+                          </small>
+                        )}
                         {alert.last_error && (
                           <small className="worker-error">{alert.last_error}</small>
                         )}
@@ -1874,6 +2078,19 @@ function AlertsPage({
                       </td>
                       <td>
                         <div className="row-actions">
+                          <button
+                            className="button secondary small"
+                            onClick={() => onPreviewEmail(alert)}
+                          >
+                            View Email
+                          </button>
+                          <button
+                            className="button secondary small"
+                            title="Re-dispatch notification via configured channels"
+                            onClick={() => void onResendAlert(alert.id)}
+                          >
+                            Resend
+                          </button>
                           {active && (
                             <button
                               className="button secondary small"
@@ -1908,7 +2125,9 @@ function AlertsPage({
               <div className="empty-state">
                 <Bell size={22} />
                 <b>No alerts match your filters</b>
-                <span>Triggered Base and Bull alerts will appear here automatically.</span>
+                <span>
+                  Triggered Base and Bull alerts will appear here automatically. Click &ldquo;Preview Alert Email&rdquo; above to inspect the formatted email template.
+                </span>
               </div>
             )}
           </div>
@@ -2348,15 +2567,21 @@ function SettingsPage({
   setDark,
   compactTables,
   setCompactTables,
+  soundEnabled,
+  setSoundEnabled,
   workerStatus,
   notify,
+  onPreviewTestEmail,
 }: {
   dark: boolean;
   setDark: (v: boolean) => void;
   compactTables: boolean;
   setCompactTables: (v: boolean) => void;
+  soundEnabled: boolean;
+  setSoundEnabled: (v: boolean) => void;
   workerStatus: WorkerStatus | null;
   notify: (message: string) => void;
+  onPreviewTestEmail: (kind: "base" | "bull") => Promise<void>;
 }) {
   const [prefs, setPrefs] = useState<NotificationPreference>({
     dashboard_enabled: true,
@@ -2422,7 +2647,23 @@ function SettingsPage({
       <PageHeading
         eyebrow="SYSTEM CONFIGURATION"
         title="Notification & Display Preferences"
-        description="Configure dashboard and email alert delivery channels, recipients, and table density."
+        description="Configure dashboard and email alert delivery channels, recipients, audio chimes, and table density."
+        action={
+          <div className="heading-actions">
+            <button
+              className="button secondary"
+              onClick={() => void onPreviewTestEmail("base")}
+            >
+              <Bell size={14} /> Preview Base Email Template
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void onPreviewTestEmail("bull")}
+            >
+              <Zap size={14} /> Preview Bull Email Template
+            </button>
+          </div>
+        }
       />
       <div className="settings-layout">
         <div className="settings-main">
@@ -2432,20 +2673,25 @@ function SettingsPage({
                 <Bell size={16} />
               </div>
               <div>
-                <h2>Alert Notification Channels</h2>
+                <h2>Alert Notification Channels (Mail & Dashboard)</h2>
                 <p>Persisted in the backend notification outbox with automatic retry backoff.</p>
               </div>
             </div>
             {row(
               "Dashboard notifications",
-              "Deliver instant alerts to the dashboard notification center.",
+              "Deliver instant alerts to the dashboard notification center & live banner.",
               toggle(prefs.dashboard_enabled, (v) =>
                 setPrefs({ ...prefs, dashboard_enabled: v }),
               ),
             )}
             {row(
+              "Audio chime on live target trigger",
+              "Play a subtle chime when a new Base or Bull target alert arrives.",
+              toggle(soundEnabled, setSoundEnabled),
+            )}
+            {row(
               "Email notifications",
-              "Send formatted price target alert emails via SMTP / spool.",
+              "Send formatted HTML & plain-text price target alert emails via SMTP / spool.",
               toggle(prefs.email_enabled, (v) =>
                 setPrefs({ ...prefs, email_enabled: v }),
               ),
@@ -2547,10 +2793,12 @@ function NotificationDrawer({
   alerts,
   onClose,
   onAction,
+  onPreviewEmail,
 }: {
   alerts: ApiAlert[];
   onClose: () => void;
   onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
+  onPreviewEmail: (alert: ApiAlert) => void;
 }) {
   const [unreadOnly, setUnreadOnly] = useState(false);
   const unreadAlerts = alerts.filter(isAlertActive);
@@ -2612,6 +2860,15 @@ function NotificationDrawer({
           {visibleAlerts.length ? (
             visibleAlerts.map((a) => {
               const isNew = isAlertActive(a);
+              const isBase = a.target_kind === "base";
+              const breachAbs =
+                a.breach_abs ??
+                (a.target != null ? a.price - a.target : null);
+              const breachPct =
+                a.breach_pct ??
+                (a.target != null && a.target > 0
+                  ? ((a.price - a.target) / a.target) * 100
+                  : null);
               return (
                 <div
                   className={`drawer-alert ${isNew ? "drawer-alert-new" : ""}`}
@@ -2639,10 +2896,18 @@ function NotificationDrawer({
                       <span>
                         Target: {a.target == null ? "—" : money(a.target)}
                       </span>
+                      {breachAbs != null && breachPct != null && (
+                        <span className={isBase ? "positive" : "negative"}>
+                          Breach: {formatDistance(breachAbs, breachPct)}
+                        </span>
+                      )}
                     </div>
                     <div className="drawer-alert-time">
                       {new Date(a.triggered_at).toLocaleString("en-IN")} ·{" "}
                       {a.delivery_label}
+                      <button onClick={() => onPreviewEmail(a)}>
+                        View Email
+                      </button>
                       {isNew && (
                         <button onClick={() => void onAction(a.id, "acknowledge")}>
                           Acknowledge
@@ -2662,6 +2927,247 @@ function NotificationDrawer({
           )}
         </div>
       </motion.aside>
+    </>
+  );
+}
+
+function EmailPreviewModal({
+  item,
+  onClose,
+  onResend,
+  onSwitchSample,
+  notify,
+}: {
+  item: ApiAlert | AlertEmailPreviewResponse;
+  onClose: () => void;
+  onResend?: () => void;
+  onSwitchSample?: (kind: "base" | "bull") => void;
+  notify: (msg: string) => void;
+}) {
+  const [viewMode, setViewMode] = useState<"rendered" | "plain">("rendered");
+  const isBase = item.target_kind === "base";
+  const subject =
+    item.email_subject ||
+    `Price Target Alert – ${item.symbol} (${isBase ? "Base" : "Bull"} Target Reached)`;
+  const bodyText = item.email_body || "";
+  const recipients =
+    item.recipients && item.recipients.length > 0
+      ? item.recipients.join(", ")
+      : "alerts@plutuswealth.local (Default)";
+  const breachAbs =
+    item.breach_abs ??
+    (item.target != null ? item.price - item.target : null);
+  const breachPct =
+    item.breach_pct ??
+    (item.target != null && item.target > 0
+      ? ((item.price - item.target) / item.target) * 100
+      : null);
+
+  const copyEmail = async () => {
+    try {
+      await navigator.clipboard.writeText(`Subject: ${subject}\nTo: ${recipients}\n\n${bodyText}`);
+      notify("Formatted email copied to clipboard");
+    } catch {
+      notify("Could not copy email to clipboard");
+    }
+  };
+
+  return (
+    <>
+      <motion.button
+        className="modal-backdrop"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onClick={onClose}
+        aria-label="Close email preview"
+      />
+      <motion.div
+        className="edit-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="email-preview-title"
+        style={{ width: "min(680px, calc(100vw - 28px))" }}
+        initial={{ opacity: 0, scale: 0.96, y: 12 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.96, y: 12 }}
+      >
+        <div className="modal-head">
+          <div>
+            <div className="eyebrow">
+              EMAIL & DASHBOARD NOTIFICATION PREVIEW · {item.exchange}:{item.symbol}
+            </div>
+            <h2 id="email-preview-title">{subject}</h2>
+            <p>
+              To: <strong>{recipients}</strong> · Triggered{" "}
+              {new Date(item.triggered_at).toLocaleString("en-IN")}
+            </p>
+          </div>
+          <button
+            className="icon-button"
+            aria-label="Close email preview"
+            onClick={onClose}
+          >
+            <X size={17} />
+          </button>
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 10,
+            marginBottom: 14,
+            flexWrap: "wrap",
+          }}
+        >
+          <div className="theme-options">
+            <button
+              className={viewMode === "rendered" ? "theme-option selected" : "theme-option"}
+              onClick={() => setViewMode("rendered")}
+            >
+              Rendered Email Card
+            </button>
+            <button
+              className={viewMode === "plain" ? "theme-option selected" : "theme-option"}
+              onClick={() => setViewMode("plain")}
+            >
+              Plain-Text Email (.eml)
+            </button>
+          </div>
+          {onSwitchSample && (
+            <div className="row-actions">
+              <button
+                className={`button secondary small ${isBase ? "primary" : ""}`}
+                onClick={() => onSwitchSample("base")}
+              >
+                Sample Base Alert
+              </button>
+              <button
+                className={`button secondary small ${!isBase ? "primary" : ""}`}
+                onClick={() => onSwitchSample("bull")}
+              >
+                Sample Bull Alert
+              </button>
+            </div>
+          )}
+        </div>
+
+        {viewMode === "rendered" ? (
+          <div
+            style={{
+              borderRadius: 12,
+              border: "1px solid var(--border)",
+              background: "var(--surface-2)",
+              overflow: "hidden",
+              marginBottom: 14,
+            }}
+          >
+            <div
+              style={{
+                padding: "16px 20px",
+                borderBottom: "1px solid var(--border)",
+                background: isBase
+                  ? "rgba(43, 212, 143, 0.1)"
+                  : "rgba(244, 91, 105, 0.1)",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <span className={`status-badge ${isBase ? "badge-buy" : "badge-sell"}`}>
+                  <i />
+                  {isBase ? "BASE TARGET ALERT" : "BULL TARGET ALERT"}
+                </span>
+                <h3 style={{ margin: "8px 0 2px", fontSize: "1.05rem" }}>
+                  {item.company} ({item.exchange}:{item.symbol})
+                </h3>
+                <small style={{ color: "var(--muted)" }}>
+                  {item.company} has reached its configured {isBase ? "Base" : "Bull"} Target Price.
+                </small>
+              </div>
+              <div style={{ textAlign: "right" }}>
+                <small style={{ color: "var(--muted)", display: "block", fontSize: "0.72rem" }}>
+                  CURRENT MARKET PRICE
+                </small>
+                <b style={{ fontSize: "1.35rem", fontFamily: "var(--mono)" }}>
+                  {money(item.price)}
+                </b>
+              </div>
+            </div>
+
+            <div className="movement-grid" style={{ padding: "14px 20px", margin: 0 }}>
+              <div>
+                <small>CONFIGURED TARGET</small>
+                <b>{item.target != null ? money(item.target) : "—"}</b>
+              </div>
+              <div>
+                <small>BREACH / VARIANCE</small>
+                <b className={isBase ? "positive" : "negative"}>
+                  {breachAbs != null && breachPct != null
+                    ? formatDistance(breachAbs, breachPct)
+                    : "At Target"}
+                </b>
+              </div>
+              <div>
+                <small>SAVED REF CMP</small>
+                <b>{item.saved_cmp != null ? money(item.saved_cmp) : "—"}</b>
+              </div>
+              <div>
+                <small>DIRECTION RULE</small>
+                <b>
+                  {item.comparison_direction === "below"
+                    ? "Downward (CMP ≤ Base)"
+                    : "Upward (CMP ≥ Bull)"}
+                </b>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <pre
+            style={{
+              padding: "14px 16px",
+              borderRadius: 10,
+              border: "1px solid var(--border)",
+              background: "var(--surface-2)",
+              color: "var(--text-secondary)",
+              fontFamily: "var(--mono)",
+              fontSize: "0.78rem",
+              lineHeight: 1.55,
+              whiteSpace: "pre-wrap",
+              maxHeight: 310,
+              overflowY: "auto",
+              marginBottom: 14,
+            }}
+          >
+            {bodyText}
+          </pre>
+        )}
+
+        {"delivery_gate_reason" in item && (
+          <div className="modal-note" style={{ marginBottom: 12 }}>
+            <ShieldCheck size={14} /> Delivery Status: {item.delivery_gate_reason}
+          </div>
+        )}
+
+        <div className="modal-actions">
+          <button className="button secondary" onClick={() => void copyEmail()}>
+            Copy Email Text
+          </button>
+          {onResend && (
+            <button className="button secondary" onClick={onResend}>
+              <RefreshCw size={14} /> Re-send / Drain Outbox
+            </button>
+          )}
+          <button className="button primary" onClick={onClose}>
+            Done
+          </button>
+        </div>
+      </motion.div>
     </>
   );
 }

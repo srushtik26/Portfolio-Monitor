@@ -1,4 +1,5 @@
 import type {
+  AlertEmailPreviewResponse,
   ApiAlert,
   CompanyDetailsResponse,
   ImportBatchHistoryItem,
@@ -76,6 +77,40 @@ export async function performAlertAction(
     body: JSON.stringify({ action, actor }),
   });
   return expectJson<ApiAlert>(response);
+}
+
+export async function triggerOutboxDrain(): Promise<{
+  sent: number;
+  retried: number;
+  failed: number;
+}> {
+  const response = await fetch(`${apiBaseUrl}/api/notifications/drain`, {
+    method: "POST",
+  });
+  return expectJson(response);
+}
+
+export async function resendAlertNotification(alertId: number): Promise<{
+  alert_id: number;
+  sent: number;
+  retried: number;
+  failed: number;
+}> {
+  const response = await fetch(`${apiBaseUrl}/api/alerts/${alertId}/resend`, {
+    method: "POST",
+  });
+  return expectJson(response);
+}
+
+export async function previewTestAlertEmail(params?: {
+  symbol?: string;
+  targetKind?: "base" | "bull";
+}): Promise<AlertEmailPreviewResponse> {
+  const url = new URL(`${apiBaseUrl}/api/notifications/test-preview`);
+  if (params?.symbol) url.searchParams.set("symbol", params.symbol);
+  if (params?.targetKind) url.searchParams.set("target_kind", params.targetKind);
+  const response = await fetch(url.toString(), { method: "POST" });
+  return expectJson<AlertEmailPreviewResponse>(response);
 }
 
 export async function fetchWorkerStatus(signal?: AbortSignal): Promise<WorkerStatus> {

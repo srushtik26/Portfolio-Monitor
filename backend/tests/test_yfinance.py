@@ -294,3 +294,76 @@ def test_price_worker_refuses_yfinance_without_authoritative_calendar() -> None:
             YFinanceProvider(history_fetcher=lambda _ticker: FakeHistory()),
             FixtureExchangeCalendar(),
         )
+
+
+def test_yfinance_acts_as_backup_when_shoonya_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.prices import NseBseExchangeCalendar
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionFactory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+    market_open_utc = datetime(2026, 11, 3, 4, 30, tzinfo=timezone.utc)
+    with SessionFactory() as session:
+        session.add(
+            Company(
+                exchange="NSE",
+                symbol="BHEL",
+                name="Bharat Heavy Electricals Ltd",
+                base_target=Decimal("400.00"),
+                bull_target=Decimal("500.00"),
+                is_approved=True,
+                monitoring_active=True,
+            )
+        )
+        session.commit()
+
+    class FailingShoonyaProvider:
+        name = "shoonya"
+        is_simulated = False
+
+        def fetch_quote(self, exchange: str, symbol: str):
+            raise ProviderError("Shoonya connection failed")
+
+    monkeypatch.setattr(
+        YFinanceProvider,
+        "_default_history_fetcher",
+        staticmethod(lambda _ticker: FakeHistory(435.50, market_open_utc - timedelta(seconds=30))),
+    )
+    monkeypatch.setattr(
+        YFinanceProvider,
+        "__init__",
+        lambda self, **kwargs: (
+            setattr(self, "_history_fetcher", YFinanceProvider._default_history_fetcher),
+            setattr(self, "_clock", lambda: market_open_utc),
+            setattr(self, "_sleep", lambda _d: None),
+            setattr(self, "cache_ttl_seconds", 60),
+            setattr(self, "stale_after_seconds", 300),
+            setattr(self, "_cache", {}),
+            setattr(self, "_cache_lock", __import__("threading").RLock()),
+        )
+        and None,
+    )
+
+    result = poll_once(
+        FailingShoonyaProvider(),
+        NseBseExchangeCalendar(),
+        now=market_open_utc,
+        session_factory=SessionFactory,
+    )
+    assert result.attempted == 1
+    assert result.recorded == 1
+    assert result.failed == 0
+    with SessionFactory() as session:
+        saved = session.scalar(select(PriceQuote))
+        assert saved is not None
+        assert saved.price == Decimal("435.500000")
+        assert "Yahoo Finance" in saved.provider
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()

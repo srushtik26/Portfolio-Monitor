@@ -1,6 +1,9 @@
+import json
 import logging
 import os
 import re
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -248,6 +251,145 @@ def _environment_integer(name: str, default: int, minimum: int, maximum: int) ->
     return parsed
 
 
+class _YahooChartHistory:
+    """Lightweight DataFrame-compatible history container for Yahoo Finance v8 chart responses."""
+
+    def __init__(
+        self,
+        rows: list[tuple[float | Decimal, datetime]],
+        currency: str = "INR",
+    ) -> None:
+        self.empty = len(rows) == 0
+        self.index = [ts for _, ts in rows]
+        self._rows = [{"Close": price} for price, _ in rows]
+        self.attrs: dict[str, Any] = {"currency": currency}
+        self.iloc = self
+
+    def __getitem__(self, position: int) -> dict[str, Any]:
+        return self._rows[position]
+
+
+def _resolve_yahoo_search_ticker(query: str, preferred_suffix: str = ".NS") -> str | None:
+    """Resolve a company name or non-standard symbol to an NSE/BSE Yahoo Finance ticker."""
+    clean_query = re.sub(r"\.(NS|BO)$", "", query, flags=re.IGNORECASE).replace("_", " ").strip()
+    if not clean_query:
+        return None
+    url = (
+        "https://query1.finance.yahoo.com/v1/finance/search?"
+        + urllib.parse.urlencode({"q": clean_query, "quotesCount": 8, "newsCount": 0})
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    quotes = payload.get("quotes") or []
+    for item in quotes:
+        sym = str(item.get("symbol") or "").upper()
+        if sym.endswith(preferred_suffix):
+            return sym
+    for item in quotes:
+        sym = str(item.get("symbol") or "").upper()
+        if sym.endswith((".NS", ".BO")):
+            return sym
+    return None
+
+
+def _fetch_yahoo_v8_chart_single(ticker: str) -> _YahooChartHistory | None:
+    """Query Yahoo Finance v8 chart JSON API directly for 1m/5d or 1d candles."""
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        for interval, range_str in (("1m", "5d"), ("5m", "5d"), ("1d", "1mo")):
+            url = (
+                f"https://{host}/v8/finance/chart/{urllib.parse.quote(ticker)}?"
+                + urllib.parse.urlencode({"interval": interval, "range": range_str})
+            )
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except Exception:
+                continue
+            results = (data.get("chart") or {}).get("result") or []
+            if not results:
+                continue
+            result = results[0] or {}
+            meta = result.get("meta") or {}
+            currency = str(
+                meta.get("currency")
+                or ("INR" if ticker.upper().endswith((".NS", ".BO")) else "USD")
+            ).upper()
+            timestamps = result.get("timestamp") or []
+            quotes_list = (result.get("indicators") or {}).get("quote") or [{}]
+            closes = (quotes_list[0] or {}).get("close") or [] if quotes_list else []
+            rows: list[tuple[float | Decimal, datetime]] = []
+            for ts_val, close_val in zip(timestamps, closes):
+                if ts_val is None or close_val is None:
+                    continue
+                try:
+                    dt = datetime.fromtimestamp(float(ts_val), tz=timezone.utc)
+                    rows.append((float(close_val), dt))
+                except (ValueError, TypeError, OSError):
+                    continue
+            if not rows:
+                reg_price = meta.get("regularMarketPrice")
+                reg_time = meta.get("regularMarketTime")
+                if reg_price is not None and reg_time is not None:
+                    try:
+                        dt = datetime.fromtimestamp(float(reg_time), tz=timezone.utc)
+                        rows.append((float(reg_price), dt))
+                    except (ValueError, TypeError, OSError):
+                        pass
+            if rows:
+                return _YahooChartHistory(rows, currency=currency)
+    return None
+
+
+def _fetch_yahoo_v8_chart_history(ticker: str) -> _YahooChartHistory:
+    """Fetch candle history via Yahoo Finance v8 chart endpoint with automatic ticker variant fallback."""
+    candidates: list[str] = [ticker]
+    upper = ticker.upper()
+    if "_" in ticker:
+        candidates.append(ticker.replace("_", ""))
+        candidates.append(ticker.replace("_", "-"))
+    if upper.endswith(".NS"):
+        base = ticker[:-3]
+        candidates.append(f"{base}.BO")
+    elif upper.endswith(".BO"):
+        base = ticker[:-3]
+        candidates.append(f"{base}.NS")
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        hist = _fetch_yahoo_v8_chart_single(candidate)
+        if hist is not None and not hist.empty:
+            return hist
+
+    preferred_suffix = ".BO" if upper.endswith(".BO") else ".NS"
+    resolved = _resolve_yahoo_search_ticker(ticker, preferred_suffix=preferred_suffix)
+    if resolved and resolved not in seen:
+        hist = _fetch_yahoo_v8_chart_single(resolved)
+        if hist is not None and not hist.empty:
+            return hist
+
+    return _YahooChartHistory([], currency="INR")
+
+
 class YFinanceProvider:
     """Yahoo Finance 1-minute candle-close adapter with batching, caching, and bounded retries."""
 
@@ -290,22 +432,12 @@ class YFinanceProvider:
 
     @staticmethod
     def _default_history_fetcher(ticker: str) -> object:
-        import yfinance as yf
+        try:
+            import yfinance as yf
 
-        yahoo_ticker = yf.Ticker(ticker)
-        history = yahoo_ticker.history(
-            period="1d",
-            interval="1m",
-            auto_adjust=False,
-            prepost=False,
-            actions=False,
-            repair=False,
-            keepna=False,
-            timeout=10,
-        )
-        if getattr(history, "empty", True):
+            yahoo_ticker = yf.Ticker(ticker)
             history = yahoo_ticker.history(
-                period="5d",
+                period="1d",
                 interval="1m",
                 auto_adjust=False,
                 prepost=False,
@@ -314,13 +446,31 @@ class YFinanceProvider:
                 keepna=False,
                 timeout=10,
             )
-        if getattr(history, "empty", True):
-            return history
-        metadata = yahoo_ticker.get_history_metadata()
-        currency = metadata.get("currency") if isinstance(metadata, dict) else None
-        if isinstance(currency, str):
-            history.attrs["currency"] = currency
-        return history
+            if getattr(history, "empty", True):
+                history = yahoo_ticker.history(
+                    period="5d",
+                    interval="1m",
+                    auto_adjust=False,
+                    prepost=False,
+                    actions=False,
+                    repair=False,
+                    keepna=False,
+                    timeout=10,
+                )
+            if not getattr(history, "empty", True):
+                try:
+                    metadata = yahoo_ticker.get_history_metadata()
+                except Exception:
+                    metadata = {}
+                currency = metadata.get("currency") if isinstance(metadata, dict) else None
+                if not isinstance(currency, str) and ticker.upper().endswith((".NS", ".BO")):
+                    currency = "INR"
+                if isinstance(currency, str):
+                    history.attrs["currency"] = currency
+                return history
+        except Exception:
+            pass
+        return _fetch_yahoo_v8_chart_history(ticker)
 
     def _cached(self, identity: tuple[str, str]) -> ProviderQuote | None:
         cached = self._cache.get(identity)

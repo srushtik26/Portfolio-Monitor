@@ -28,6 +28,8 @@ A production-ready React + TypeScript and FastAPI **price-monitoring and target-
 4. **Reliable Multi-Channel Notification System (`backend/app/notifications.py`)**:
    - Controlled by a single environment variable: `NOTIFICATION_MODE` (`dry_run` by default, or `live`).
    - Even if live channels are enabled in the Settings UI, the worker requires **BOTH** `NOTIFICATION_MODE=live` **AND** complete SMTP configuration (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`) before attempting any real delivery; otherwise it stays in `dry_run` mode and logs the reason.
+   - The backend API and worker load the repository-root `.env` file. Gmail uses `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_USER`, `SMTP_PASSWORD` (a Gmail App Password), and `SMTP_FROM`. Set `ALERT_EMAIL_RECIPIENTS` to seed recipients when notification preferences are first created; for an existing workspace, update and save recipients in **Settings**.
+   - Keep `NOTIFICATION_MODE=dry_run` while testing. To send real email, first enable email notifications in **Settings**, verify the recipient list, then explicitly set `NOTIFICATION_MODE=live` and restart the worker. Store credentials only in the ignored `.env` file; never commit them.
 
 ---
 

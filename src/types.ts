@@ -80,16 +80,33 @@ export interface PriceHistory {
   items: PriceQuote[];
 }
 
+export interface AlertChannelDelivery {
+  id: string;
+  channel: string;
+  destination: string | null;
+  delivery_mode: string;
+  status: string;
+  attempts: number;
+  max_attempts: number;
+  last_error: string | null;
+  sent_at: string | null;
+}
+
 export interface ApiAlert {
   id: number;
   exchange: Exchange;
   symbol: string;
   company: string;
+  sector?: string | null;
+  saved_cmp?: number | null;
   target_kind: "base" | "bull";
   target: number | null;
   price: number;
+  breach_abs?: number | null;
+  breach_pct?: number | null;
   comparison_direction?: "below" | "above";
   price_direction?: "Upward" | "Downward";
+  trigger_cycle?: number;
   lifecycle_status?: "active" | "triggered" | "acknowledged" | "resolved" | "reset";
   acknowledged_at?: string | null;
   acknowledged_by?: string | null;
@@ -112,6 +129,34 @@ export interface ApiAlert {
   last_error: string | null;
   sent_at: string | null;
   provider_message_id: string | null;
+  email_subject?: string;
+  email_body?: string;
+  email_html?: string;
+  recipients?: string[];
+  channels?: AlertChannelDelivery[];
+}
+
+export interface AlertEmailPreviewResponse {
+  exchange: Exchange;
+  symbol: string;
+  company: string;
+  sector: string | null;
+  saved_cmp: number | null;
+  target_kind: "base" | "bull";
+  target: number;
+  price: number;
+  breach_abs: number;
+  breach_pct: number;
+  comparison_direction: "below" | "above";
+  triggered_at: string;
+  email_subject: string;
+  email_body: string;
+  email_html: string;
+  recipients: string[];
+  smtp_configured: boolean;
+  missing_smtp: string[];
+  live_delivery_ready: boolean;
+  delivery_gate_reason: string;
 }
 
 export interface WorkerStatus {

@@ -1669,3 +1669,22 @@ def test_scale_40_companies_monitoring_and_nse_bse_calendar(
     assert len(base_triggered) == 5
     assert len(bull_triggered) == 5
 
+
+def test_production_health_security_headers_and_email_preview(client) -> None:
+    health = client.get("/api/health/ready")
+    assert health.status_code == 200
+    assert health.headers.get("X-Content-Type-Options") == "nosniff"
+    assert health.headers.get("X-Frame-Options") == "DENY"
+    payload = health.json()
+    assert payload["status"] == "ok"
+    assert payload["database"] == "connected"
+
+    preview_base = client.post("/api/notifications/test-preview?target_kind=base")
+    assert preview_base.status_code == 200
+    data = preview_base.json()
+    assert data["target_kind"] == "base"
+    assert "Price Target Alert" in data["email_subject"]
+    assert "Target Price:" in data["email_body"]
+    assert "<html" in data["email_html"]
+
+

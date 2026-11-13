@@ -45,6 +45,9 @@ class NotificationMessage:
     comparison_direction: str = "above"
     channel: str = "dry-run"
     destination: str | None = None
+    saved_cmp: str | None = None
+    sector: str | None = None
+    trigger_cycle: int = 1
 
 
 @dataclass(frozen=True)
@@ -62,34 +65,169 @@ def format_alert_email(message: NotificationMessage) -> tuple[str, str]:
     company_label = message.company_name or message.symbol
     target_type = "Base" if message.target_kind == "base" else "Bull"
     direction_label = "Downward" if message.comparison_direction == "below" else "Upward"
+    rule_symbol = "<=" if message.comparison_direction == "below" else ">="
     ts_utc = (
         message.triggered_at.replace(tzinfo=timezone.utc)
         if message.triggered_at.tzinfo is None
         else message.triggered_at.astimezone(timezone.utc)
     )
     ts_ist = ts_utc.astimezone(INDIA_TZ).strftime("%Y-%m-%d %H:%M:%S IST")
+    target_num: float | None = None
+    quote_num: float | None = None
     try:
-        target_fmt = f"₹{float(message.target_price):,.2f}"
+        target_num = float(message.target_price)
+        target_fmt = f"₹{target_num:,.2f}"
     except (ValueError, TypeError):
         target_fmt = f"₹{message.target_price}"
     try:
-        quote_fmt = f"₹{float(message.quote_price):,.2f}"
+        quote_num = float(message.quote_price)
+        quote_fmt = f"₹{quote_num:,.2f}"
     except (ValueError, TypeError):
         quote_fmt = f"₹{message.quote_price}"
 
-    subject = f"Price Target Alert – {company_label}"
+    variance_line = ""
+    if target_num and target_num > 0 and quote_num is not None:
+        diff_abs = quote_num - target_num
+        diff_pct = (diff_abs / target_num) * 100.0
+        sign = "+" if diff_abs > 0 else ""
+        variance_line = f"Variance vs Target: {sign}₹{diff_abs:,.2f} ({sign}{diff_pct:.2f}%)\n"
+
+    saved_cmp_line = ""
+    if message.saved_cmp is not None:
+        try:
+            cmp_num = float(message.saved_cmp)
+            if cmp_num > 0 and quote_num is not None:
+                cmp_pct = ((quote_num - cmp_num) / cmp_num) * 100.0
+                cmp_sign = "+" if cmp_pct > 0 else ""
+                saved_cmp_line = f"Saved Reference CMP: ₹{cmp_num:,.2f} ({cmp_sign}{cmp_pct:.2f}%)\n"
+            else:
+                saved_cmp_line = f"Saved Reference CMP: ₹{cmp_num:,.2f}\n"
+        except (ValueError, TypeError):
+            pass
+
+    sector_line = f"Sector: {message.sector}\n" if message.sector else ""
+
+    subject = f"Price Target Alert – {company_label} ({message.exchange}:{message.symbol}) [{target_type} Target {quote_fmt}]"
     body = (
         f"{company_label} has reached its configured {target_type} Target Price.\n\n"
         f"Company: {company_label}\n"
         f"Symbol: {message.symbol}\n"
         f"Exchange: {message.exchange}\n"
+        f"{sector_line}"
         f"Target Type: {target_type}\n"
+        f"Trigger Rule: Current Price {rule_symbol} {target_type} Target ({direction_label})\n"
         f"Target Price: {target_fmt}\n"
         f"Current Price: {quote_fmt}\n"
+        f"{variance_line}"
+        f"{saved_cmp_line}"
         f"Trigger Time: {ts_ist}\n"
         f"Price Direction: {direction_label}\n"
+        f"Alert Cycle: #{message.trigger_cycle}\n\n"
+        f"--\n"
+        f"Northstar Portfolio Monitor · Plutus Wealth Management\n"
+        f"Automated Price-Monitoring & Target-Alert System (No Order Execution)\n"
     )
     return subject, body
+
+
+def format_alert_email_html(message: NotificationMessage) -> str:
+    """Render a clean, institutional HTML email body for price target alerts."""
+    company_label = message.company_name or message.symbol
+    is_base = message.target_kind == "base"
+    target_type = "Base" if is_base else "Bull"
+    direction_label = "Downward" if message.comparison_direction == "below" else "Upward"
+    rule_symbol = "&le;" if message.comparison_direction == "below" else "&ge;"
+    badge_bg = "#0f3d2e" if is_base else "#451a23"
+    badge_fg = "#34d399" if is_base else "#f87171"
+    badge_border = "#10b981" if is_base else "#ef4444"
+
+    ts_utc = (
+        message.triggered_at.replace(tzinfo=timezone.utc)
+        if message.triggered_at.tzinfo is None
+        else message.triggered_at.astimezone(timezone.utc)
+    )
+    ts_ist = ts_utc.astimezone(INDIA_TZ).strftime("%d %b %Y, %I:%M:%S %p IST")
+
+    target_num: float | None = None
+    quote_num: float | None = None
+    try:
+        target_num = float(message.target_price)
+        target_fmt = f"₹{target_num:,.2f}"
+    except (ValueError, TypeError):
+        target_fmt = f"₹{message.target_price}"
+    try:
+        quote_num = float(message.quote_price)
+        quote_fmt = f"₹{quote_num:,.2f}"
+    except (ValueError, TypeError):
+        quote_fmt = f"₹{message.quote_price}"
+
+    variance_fmt = "—"
+    if target_num and target_num > 0 and quote_num is not None:
+        diff_abs = quote_num - target_num
+        diff_pct = (diff_abs / target_num) * 100.0
+        sign = "+" if diff_abs > 0 else ""
+        variance_fmt = f"{sign}₹{diff_abs:,.2f} ({sign}{diff_pct:.2f}%)"
+
+    saved_cmp_fmt = "—"
+    if message.saved_cmp is not None:
+        try:
+            cmp_num = float(message.saved_cmp)
+            saved_cmp_fmt = f"₹{cmp_num:,.2f}"
+        except (ValueError, TypeError):
+            pass
+
+    return f"""<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:24px;background-color:#0b1120;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#e2e8f0;">
+  <div style="max-width:580px;margin:0 auto;background-color:#111827;border:1px solid #1e293b;border-radius:12px;overflow:hidden;">
+    <div style="padding:20px 24px;border-bottom:1px solid #1e293b;background-color:#0f172a;">
+      <div style="font-size:11px;letter-spacing:0.12em;text-transform:uppercase;color:#94a3b8;font-weight:600;">
+        NORTHSTAR PORTFOLIO MONITOR · TARGET ALERT
+      </div>
+      <h2 style="margin:8px 0 4px;font-size:20px;color:#f8fafc;">
+        {company_label} <span style="color:#64748b;font-weight:500;">({message.exchange}:{message.symbol})</span>
+      </h2>
+      <span style="display:inline-block;margin-top:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;background:{badge_bg};color:{badge_fg};border:1px solid {badge_border};">
+        {target_type.upper()} TARGET TRIGGERED ({direction_label.upper()})
+      </span>
+    </div>
+    <div style="padding:20px 24px;">
+      <p style="margin:0 0 16px;font-size:14px;line-height:1.5;color:#cbd5e1;">
+        <strong>{company_label}</strong> has reached its configured <strong>{target_type} Target Price</strong> ({rule_symbol} {target_fmt}).
+      </p>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#94a3b8;">Current Market Price (CMP)</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#f8fafc;font-weight:700;text-align:right;font-size:15px;">{quote_fmt}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#94a3b8;">Configured {target_type} Target</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:{badge_fg};font-weight:700;text-align:right;font-size:15px;">{target_fmt}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#94a3b8;">Variance vs Target</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#e2e8f0;font-weight:600;text-align:right;">{variance_fmt}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#94a3b8;">Saved Reference CMP</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#cbd5e1;text-align:right;">{saved_cmp_fmt}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#94a3b8;">Price Direction &amp; Rule</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#cbd5e1;text-align:right;">{direction_label} ({rule_symbol} Target)</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 12px;color:#94a3b8;">Trigger Timestamp</td>
+          <td style="padding:10px 12px;color:#cbd5e1;text-align:right;">{ts_ist}</td>
+        </tr>
+      </table>
+    </div>
+    <div style="padding:14px 24px;background-color:#0f172a;border-top:1px solid #1e293b;font-size:11px;color:#64748b;">
+      Northstar Portfolio Monitor · Price-Monitoring &amp; Target-Alert System · Zero Order Execution
+    </div>
+  </div>
+</body>
+</html>"""
 
 
 class DryRunNotifier:
@@ -150,7 +288,7 @@ class SmtpEmailNotifier:
         self.host = host if host is not None else os.environ.get("SMTP_HOST", "").strip()
         self.port = port if port is not None else int(os.environ.get("SMTP_PORT", "587"))
         self.username = username if username is not None else os.environ.get("SMTP_USER", "").strip()
-        self.password = password if password is not None else os.environ.get("SMTP_PASSWORD", "")
+        self.password = (password if password is not None else os.environ.get("SMTP_PASSWORD", "")).strip()
         self.sender = (
             sender
             if sender is not None
@@ -190,6 +328,9 @@ class SmtpEmailNotifier:
                 return SendReceipt(provider_message_id=f"smtp-spool:{idempotency_key}")
             except OSError as error:
                 raise RetryableSendError(f"Failed writing email to spool directory: {error}") from error
+
+        # Attach rich HTML multipart alternative for real SMTP delivery
+        email_msg.add_alternative(format_alert_email_html(message), subtype="html")
 
         if not self.host:
             raise RetryableSendError(
@@ -388,9 +529,12 @@ def _notification_message(
         triggered_at=alert.triggered_at,
         is_simulated=alert.is_simulated,
         company_name=company.name if company else revision.symbol,
-        comparison_direction=alert.comparison_direction or "above",
+        comparison_direction=alert.comparison_direction or ("below" if alert.target_kind == "base" else "above"),
         channel=outbox.channel,
         destination=outbox.destination,
+        saved_cmp=str(company.cmp) if company and company.cmp is not None else None,
+        sector=company.sector if company else None,
+        trigger_cycle=alert.trigger_cycle or 1,
     )
 
 

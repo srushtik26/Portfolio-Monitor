@@ -1,21 +1,113 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import time
 
-from .database import ensure_sqlite_schema
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from .database import ensure_sqlite_schema, get_db
+from .models import WorkerHeartbeat
+from .notifications import check_live_notification_gate, is_smtp_complete
 from .routes import router
 
 ensure_sqlite_schema()
 
-app = FastAPI(title="Portfolio Monitor API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+
+def _parse_cors_origins() -> list[str]:
+    default_origins = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:4173",
         "http://127.0.0.1:4173",
-    ],
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ]
+    raw = os.environ.get("CORS_ORIGINS", "").strip()
+    if not raw:
+        return default_origins
+    configured = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    merged = list(dict.fromkeys([*configured, *default_origins]))
+    return merged
+
+
+app = FastAPI(
+    title="Northstar Portfolio Monitor API",
+    version="2.0.0",
+    description="Production price-monitoring, target-comparison, and multi-channel alert service.",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_parse_cors_origins(),
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Accept", "Content-Type", "Authorization"],
 )
+
+
+@app.middleware("http")
+async def add_security_and_timing_headers(request: Request, call_next) -> Response:
+    started = time.perf_counter()
+    response: Response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+    if request.url.path.startswith("/api/") and "Cache-Control" not in response.headers:
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/api/health/ready")
+@app.get("/healthz")
+def health_readiness_check(session: Session = Depends(get_db)) -> dict[str, object]:
+    db_ok = False
+    try:
+        session.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        db_ok = False
+    heartbeat = session.get(WorkerHeartbeat, "price")
+    smtp_ok, _ = is_smtp_complete()
+    live_ready, gate_reason = check_live_notification_gate()
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "version": "2.0.0",
+        "database": "connected" if db_ok else "unreachable",
+        "worker_state": heartbeat.connection_status if heartbeat else "stopped",
+        "provider": heartbeat.provider if heartbeat else None,
+        "smtp_configured": smtp_ok,
+        "live_notifications_ready": live_ready,
+        "notification_gate_reason": gate_reason,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 app.include_router(router)
+
+# Serve production frontend bundle from ../dist when built locally
+_DIST_DIR = Path(__file__).resolve().parents[2] / "dist"
+if (_DIST_DIR / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_DIST_DIR / "assets")), name="static-assets")
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def serve_spa_index(full_path: str) -> Response:
+    if full_path.startswith("api/") or full_path == "healthz":
+        return Response(status_code=404)
+    index_file = _DIST_DIR / "index.html"
+    if index_file.is_file():
+        candidate = (_DIST_DIR / full_path).resolve()
+        if full_path and candidate.is_file() and _DIST_DIR in candidate.parents:
+            return FileResponse(str(candidate))
+        return FileResponse(str(index_file))
+    return Response(
+        content='{"service":"Northstar Portfolio Monitor API","status":"running"}',
+        media_type="application/json",
+    )
+

@@ -503,20 +503,35 @@ def poll_once(
             if not _session_open(calendar, company.exchange, current_time):
                 continue
             attempted += 1
-            if provider.name == "yfinance":
+            if provider.name in {"yfinance", "shoonya"}:
                 register_verified_ticker(company.exchange, company.symbol)
             try:
                 quote = provider.fetch_quote(company.exchange, company.symbol)
             except RateLimitError:
                 raise
-            except ProviderError:
-                failed += 1
-                logger.exception("Provider could not quote %s:%s.", company.exchange, company.symbol)
-                continue
+            except (ProviderError, RuntimeError, ValueError) as primary_err:
+                if provider.name == "shoonya":
+                    logger.warning(
+                        "Shoonya quote failed for %s:%s (%s); falling back to YFinanceProvider backup.",
+                        company.exchange,
+                        company.symbol,
+                        primary_err,
+                    )
+                    try:
+                        yf_backup = YFinanceProvider()
+                        quote = yf_backup.fetch_quote(company.exchange, company.symbol)
+                    except (ProviderError, RuntimeError, ValueError):
+                        failed += 1
+                        logger.exception("Backup YFinanceProvider could not quote %s:%s.", company.exchange, company.symbol)
+                        continue
+                else:
+                    failed += 1
+                    logger.exception("Provider could not quote %s:%s.", company.exchange, company.symbol)
+                    continue
             received_at = now if now is not None else datetime.now(timezone.utc)
             try:
                 if quote.provider != provider.name and not (
-                    provider.name == "yfinance" and "Yahoo Finance" in quote.provider
+                    provider.name in {"yfinance", "shoonya"} and "Yahoo Finance" in quote.provider
                 ):
                     raise ValueError("Provider quote names do not match the selected adapter.")
                 if quote.is_simulated != provider.is_simulated:
@@ -735,19 +750,40 @@ def main() -> None:
             else NseBseExchangeCalendar()
         )
         if args.provider == "shoonya_ws":
-            with single_worker_lock():
-                asyncio.run(
-                    run_async_worker(
-                        calendar=calendar,
-                        enforce_market_hours=args.enforce_market_hours,
+            try:
+                with single_worker_lock():
+                    asyncio.run(
+                        run_async_worker(
+                            calendar=calendar,
+                            enforce_market_hours=args.enforce_market_hours,
+                        )
                     )
+                return
+            except (RuntimeError, ValueError, ProviderError) as ws_err:
+                logger.warning(
+                    "Shoonya WebSocket unavailable (%s); falling back to YFinanceProvider backup.",
+                    ws_err,
                 )
-            return
+                provider = YFinanceProvider()
+                run_worker(
+                    provider,
+                    calendar,
+                    interval_seconds=args.interval_seconds,
+                    once=args.once,
+                )
+                return
 
         if args.provider == "fixture":
-            provider: PriceProvider = FixturePriceProvider()
+            provider = FixturePriceProvider()
         elif args.provider == "shoonya":
-            provider = ShoonyaPriceProvider(ShoonyaConfig.from_env())
+            try:
+                provider = ShoonyaPriceProvider(ShoonyaConfig.from_env())
+            except (RuntimeError, ValueError, ProviderError) as shoonya_err:
+                logger.warning(
+                    "Shoonya provider unavailable (%s); falling back to YFinanceProvider backup.",
+                    shoonya_err,
+                )
+                provider = YFinanceProvider()
         else:
             provider = YFinanceProvider()
 

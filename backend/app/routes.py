@@ -50,10 +50,14 @@ from .models import (
 )
 from .notifications import (
     MultiChannelNotifier,
+    NotificationMessage,
     check_live_notification_gate,
     drain_outbox,
+    format_alert_email,
+    format_alert_email_html,
     get_or_create_preferences,
     is_smtp_complete,
+    queue_alert_notifications,
 )
 from .prices import (
     NseBseExchangeCalendar,
@@ -403,20 +407,25 @@ def trigger_manual_poll(
     exchange: str | None = Query(default=None),
     symbol: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Fetch live quotes on demand for one or all approved active companies and evaluate target rules."""
+    """Fetch live quotes on demand for one or all approved active companies and evaluate target rules.
+    Uses Shoonya when enabled and automatically falls back to YFinanceProvider as a backup if Shoonya is unavailable or fails.
+    """
+    yfinance_backup = YFinanceProvider(stale_after_seconds=86400)
     use_shoonya = (
         os.environ.get("PRICE_PROVIDER", "").strip().lower() in {"shoonya", "shoonya_ws"}
         or bool(os.environ.get("SHOONYA_USER_ID"))
     )
+    fallback_used = False
     if use_shoonya:
         from .shoonya_feed import ShoonyaPriceProvider
 
         try:
-            provider = ShoonyaPriceProvider()
-        except RuntimeError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            provider: Any = ShoonyaPriceProvider()
+        except (RuntimeError, ProviderError, ValueError):
+            provider = yfinance_backup
+            fallback_used = True
     else:
-        provider = YFinanceProvider()
+        provider = yfinance_backup
     provider_name = getattr(provider, "name", "yfinance")
     now = datetime.now(timezone.utc)
     if exchange and symbol:
@@ -442,11 +451,22 @@ def trigger_manual_poll(
         attempted += 1
         register_verified_ticker(company.exchange, company.symbol)
         try:
-            quote = provider.fetch_quote(company.exchange, company.symbol)
+            try:
+                quote = provider.fetch_quote(company.exchange, company.symbol)
+            except (ProviderError, ValueError, RuntimeError):
+                if provider is not yfinance_backup:
+                    fallback_used = True
+                    provider_name = "yfinance"
+                    quote = yfinance_backup.fetch_quote(company.exchange, company.symbol)
+                else:
+                    raise
+            eval_now = datetime.now(timezone.utc)
+            if quote.quoted_at is not None and quote.quoted_at > eval_now:
+                eval_now = quote.quoted_at
             record_quote(
                 session,
                 quote,
-                now=datetime.now(timezone.utc),
+                now=eval_now,
                 alerts_enabled=True,
                 fixture_alerts_enabled=False,
             )
@@ -491,6 +511,8 @@ def trigger_manual_poll(
         "attempted": attempted,
         "recorded": recorded,
         "failed": failed,
+        "provider": provider_name,
+        "fallback_used": fallback_used,
         "errors": errors,
         "notifications_sent": delivery.sent,
         "notifications_retried": delivery.retried,
@@ -500,6 +522,8 @@ def trigger_manual_poll(
 
 @router.get("/alerts")
 def list_alerts(session: DbSession) -> list[dict[str, object]]:
+    pref = session.get(NotificationPreference, "default")
+    default_recipients = (pref.email_recipients if pref and pref.email_recipients else [])
     rows = session.execute(
         select(TargetAlert, TargetRevision, PriceQuote, Company, NotificationOutbox)
         .join(TargetRevision, TargetRevision.id == TargetAlert.target_revision_id)
@@ -529,14 +553,48 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
                 )
             )
             quote_data = serialize_quote(quote)
+            breach_abs = (
+                float(alert.price - target)
+                if target is not None
+                else None
+            )
+            breach_pct = (
+                float(((alert.price - target) / target) * Decimal("100"))
+                if target is not None and target != 0
+                else None
+            )
+            preview_msg = NotificationMessage(
+                outbox_id=notification.id if notification else f"preview-{alert.id}",
+                target_alert_id=alert.id,
+                exchange=company.exchange,
+                symbol=company.symbol,
+                target_kind=alert.target_kind,
+                target_price=str(target) if target is not None else "0.00",
+                quote_price=str(alert.price),
+                triggered_at=alert.triggered_at,
+                is_simulated=alert.is_simulated,
+                company_name=company.name,
+                comparison_direction=alert.comparison_direction or ("below" if alert.target_kind == "base" else "above"),
+                channel=notification.channel if notification else "email",
+                destination=notification.destination if notification else (",".join(default_recipients) if default_recipients else None),
+                saved_cmp=str(company.cmp) if company.cmp is not None else None,
+                sector=company.sector,
+                trigger_cycle=alert.trigger_cycle or 1,
+            )
+            email_subject, email_body = format_alert_email(preview_msg)
+            email_html = format_alert_email_html(preview_msg)
             grouped[alert.id] = {
                 "id": alert.id,
                 "exchange": company.exchange,
                 "symbol": company.symbol,
                 "company": company.name,
+                "sector": company.sector,
+                "saved_cmp": float(company.cmp) if company.cmp is not None else None,
                 "target_kind": alert.target_kind,
                 "target": float(target) if target is not None else None,
                 "price": float(alert.price),
+                "breach_abs": round(breach_abs, 2) if breach_abs is not None else None,
+                "breach_pct": round(breach_pct, 2) if breach_pct is not None else None,
                 "comparison_direction": alert.comparison_direction,
                 "trigger_mode": alert.trigger_mode,
                 "lifecycle_status": alert.lifecycle_status,
@@ -570,6 +628,10 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
                 "provider_message_id": notification.provider_message_id
                 if notification
                 else None,
+                "email_subject": email_subject,
+                "email_body": email_body,
+                "email_html": email_html,
+                "recipients": list(default_recipients),
                 "channels": [],
             }
         if notification is not None:
@@ -598,6 +660,10 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
                 grouped[alert.id]["sent_at"] = (
                     normalize_utc(notification.sent_at) if notification.sent_at else None
                 )
+                if notification.destination:
+                    grouped[alert.id]["recipients"] = [
+                        addr.strip() for addr in notification.destination.split(",") if addr.strip()
+                    ]
     return list(grouped.values())
 
 
@@ -632,6 +698,135 @@ def trigger_outbox_drain(session: DbSession) -> dict[str, int]:
         "sent": result.sent,
         "retried": result.retried,
         "failed": result.failed,
+    }
+
+
+@router.post("/alerts/{alert_id}/resend")
+def resend_alert_notification(alert_id: int, session: DbSession) -> dict[str, Any]:
+    alert = session.get(TargetAlert, alert_id)
+    if alert is None:
+        raise HTTPException(status_code=404, detail=f"Target alert {alert_id} not found.")
+    now = datetime.now(timezone.utc)
+    outbox_rows = list(
+        session.scalars(
+            select(NotificationOutbox).where(NotificationOutbox.target_alert_id == alert_id)
+        )
+    )
+    if outbox_rows:
+        for row in outbox_rows:
+            row.status = "queued"
+            row.attempts = 0
+            row.next_attempt_at = now
+            row.claimed_at = None
+            row.claim_token = None
+            row.last_error = None
+        session.commit()
+    else:
+        queue_alert_notifications(session, alert, now=now)
+        session.commit()
+
+    result = drain_outbox(MultiChannelNotifier(), session_factory=lambda: session, now=now)
+    return {
+        "alert_id": alert_id,
+        "sent": result.sent,
+        "retried": result.retried,
+        "failed": result.failed,
+    }
+
+
+@router.post("/notifications/test-preview")
+def generate_test_alert_preview(
+    session: DbSession,
+    symbol: str | None = Query(default=None),
+    target_kind: str = Query(default="base"),
+) -> dict[str, Any]:
+    pref = get_or_create_preferences(session)
+    session.commit()
+    company: Company | None = None
+    if symbol:
+        company = session.scalar(
+            select(Company).where(Company.symbol == symbol.strip().upper())
+        )
+    if company is None:
+        company = session.scalar(select(Company).order_by(Company.symbol.asc()).limit(1))
+
+    now = datetime.now(timezone.utc)
+    chosen_kind = "bull" if target_kind.lower() == "bull" else "base"
+    if company is not None:
+        exch = company.exchange
+        sym = company.symbol
+        comp_name = company.name
+        sector = company.sector
+        saved_cmp = str(company.cmp) if company.cmp is not None else "1480.00"
+        if chosen_kind == "base":
+            t_val = company.base_target if company.base_target is not None else Decimal("1250.00")
+            q_val = (t_val * Decimal("0.985")).quantize(Decimal("0.01"))
+            direction = company.base_direction or "below"
+        else:
+            t_val = company.bull_target if company.bull_target is not None else Decimal("1850.00")
+            q_val = (t_val * Decimal("1.018")).quantize(Decimal("0.01"))
+            direction = company.bull_direction or "above"
+    else:
+        exch = "NSE"
+        sym = "RELIANCE"
+        comp_name = "Reliance Industries Ltd"
+        sector = "Energy & Conglomerate"
+        saved_cmp = "1425.00"
+        if chosen_kind == "base":
+            t_val = Decimal("1350.00")
+            q_val = Decimal("1334.50")
+            direction = "below"
+        else:
+            t_val = Decimal("1650.00")
+            q_val = Decimal("1672.80")
+            direction = "above"
+
+    breach_abs = float(q_val - t_val)
+    breach_pct = float(((q_val - t_val) / t_val) * Decimal("100")) if t_val != 0 else 0.0
+    recipients = list(pref.email_recipients or [])
+    msg = NotificationMessage(
+        outbox_id="preview-sample",
+        target_alert_id=0,
+        exchange=exch,
+        symbol=sym,
+        target_kind=chosen_kind,
+        target_price=str(t_val),
+        quote_price=str(q_val),
+        triggered_at=now,
+        is_simulated=True,
+        company_name=comp_name,
+        comparison_direction=direction,
+        channel="email",
+        destination=",".join(recipients) if recipients else "alerts@plutuswealth.local",
+        saved_cmp=saved_cmp,
+        sector=sector,
+        trigger_cycle=1,
+    )
+    email_subject, email_body = format_alert_email(msg)
+    email_html = format_alert_email_html(msg)
+    smtp_ok, missing_smtp = is_smtp_complete()
+    live_ready, gate_reason = check_live_notification_gate()
+    return {
+        "exchange": exch,
+        "symbol": sym,
+        "company": comp_name,
+        "sector": sector,
+        "saved_cmp": float(saved_cmp) if saved_cmp else None,
+        "target_kind": chosen_kind,
+        "target": float(t_val),
+        "price": float(q_val),
+        "breach_abs": round(breach_abs, 2),
+        "breach_pct": round(breach_pct, 2),
+        "comparison_direction": direction,
+        "triggered_at": now.isoformat(),
+        "email_subject": email_subject,
+        "email_body": email_body,
+        "email_html": email_html,
+        "recipients": recipients,
+        "smtp_configured": smtp_ok,
+        "missing_smtp": missing_smtp,
+        "live_delivery_ready": live_ready,
+        "delivery_gate_reason": gate_reason,
     }
 
 
@@ -1253,6 +1448,32 @@ def _serialize_single_outbox_alert(
     )
     quote_data = serialize_quote(quote)
     price_dir = "Downward" if alert.comparison_direction == "below" else "Upward"
+    breach_abs = float(alert.price - target) if target is not None else None
+    breach_pct = (
+        float(((alert.price - target) / target) * Decimal("100"))
+        if target is not None and target != 0
+        else None
+    )
+    preview_msg = NotificationMessage(
+        outbox_id=outbox.id,
+        target_alert_id=alert.id,
+        exchange=company.exchange,
+        symbol=company.symbol,
+        target_kind=alert.target_kind,
+        target_price=str(target) if target is not None else "0.00",
+        quote_price=str(alert.price),
+        triggered_at=alert.triggered_at,
+        is_simulated=alert.is_simulated,
+        company_name=company.name,
+        comparison_direction=alert.comparison_direction or ("below" if alert.target_kind == "base" else "above"),
+        channel=outbox.channel,
+        destination=outbox.destination,
+        saved_cmp=str(company.cmp) if company.cmp is not None else None,
+        sector=company.sector,
+        trigger_cycle=alert.trigger_cycle or 1,
+    )
+    email_subject, email_body = format_alert_email(preview_msg)
+    email_html = format_alert_email_html(preview_msg)
     return {
         "outbox_id": outbox.id,
         "channel": outbox.channel,
@@ -1264,9 +1485,13 @@ def _serialize_single_outbox_alert(
             "exchange": company.exchange,
             "symbol": company.symbol,
             "company": company.name,
+            "sector": company.sector,
+            "saved_cmp": float(company.cmp) if company.cmp is not None else None,
             "target_kind": alert.target_kind,
             "target": float(target) if target is not None else None,
             "price": float(alert.price),
+            "breach_abs": round(breach_abs, 2) if breach_abs is not None else None,
+            "breach_pct": round(breach_pct, 2) if breach_pct is not None else None,
             "comparison_direction": alert.comparison_direction,
             "price_direction": price_dir,
             "trigger_mode": alert.trigger_mode,
@@ -1292,6 +1517,12 @@ def _serialize_single_outbox_alert(
             "last_error": outbox.last_error,
             "sent_at": normalize_utc(outbox.sent_at).isoformat() if outbox.sent_at else None,
             "provider_message_id": outbox.provider_message_id,
+            "email_subject": email_subject,
+            "email_body": email_body,
+            "email_html": email_html,
+            "recipients": [
+                addr.strip() for addr in (outbox.destination or "").split(",") if addr.strip() and "@" in addr
+            ],
         },
     }
 
