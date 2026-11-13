@@ -1044,7 +1044,7 @@ function OverviewPage({
           <div className="heading-actions">
             {(companies.length > 0 || importHistory.length > 0) && (
               <button
-                className="button secondary"
+                className="button secondary destructive"
                 onClick={() => void onResetWorkspace()}
               >
                 <RotateCcw size={14} /> Clear All Data
@@ -2316,7 +2316,7 @@ function MarketActivityPage({
         description="Real-time connection telemetry, last quote timestamps, stale-price detection, and NSE/BSE polling status."
         action={
           <button
-            className="button primary"
+            className="button secondary"
             onClick={() => void onPollNow()}
             disabled={isPollingNow}
           >
@@ -2339,7 +2339,10 @@ function MarketActivityPage({
           <small>Provider Connection & Queue</small>
           <b>
             {workerStatus?.connection_status ?? workerStatus?.state ?? "stopped"} (
-            {workerStatus?.feed_ready ? "Ready" : "Not Ready"})
+            <span className={workerStatus?.feed_ready ? "" : "readiness-warning"}>
+              {workerStatus?.feed_ready ? "Ready" : "Not Ready"}
+            </span>
+            )
           </b>
           <small className="market-uptime">
             Backlog: {workerStatus?.backlog_state ?? "normal"} (
@@ -2401,13 +2404,7 @@ function MarketActivityPage({
                       </b>
                       <small>{c.name}</small>
                     </div>
-                    <span
-                      className={`status-badge ${
-                        isQuoteFreshnessUnknown(c.latest_quote)
-                          ? "badge-approaching"
-                          : "badge-sell"
-                      }`}
-                    >
+                    <span className="status-badge badge-approaching">
                       <i />
                       {isQuoteFreshnessUnknown(c.latest_quote)
                         ? "FRESHNESS UNKNOWN"
@@ -3364,24 +3361,24 @@ function DetailPanel({
                   {company.base_target != null && (
                     <ReferenceLine
                       y={company.base_target}
-                      stroke="#44c49a"
+                      stroke="var(--muted)"
                       strokeDasharray="5 4"
                     />
                   )}
                   {company.bull_target != null && (
                     <ReferenceLine
                       y={company.bull_target}
-                      stroke="#e97880"
+                      stroke="var(--muted)"
                       strokeDasharray="5 4"
                     />
                   )}
                   <Area
                     type="monotone"
                     dataKey="price"
-                    stroke="#70a9ff"
+                    stroke="var(--teal)"
                     strokeWidth={2}
                     fillOpacity={0.15}
-                    fill="#70a9ff"
+                    fill="#B9E4E8"
                   />
                 </AreaChart>
               </ResponsiveContainer>
