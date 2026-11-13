@@ -113,6 +113,24 @@ export async function previewTestAlertEmail(params?: {
   return expectJson<AlertEmailPreviewResponse>(response);
 }
 
+export async function sendSampleAlertEmail(params?: {
+  symbol?: string;
+  targetKind?: "base" | "bull";
+  recipient?: string;
+}): Promise<{
+  status: string;
+  recipients: string[];
+  subject: string;
+  provider_message_id: string;
+}> {
+  const url = new URL(`${apiBaseUrl}/api/notifications/send-sample`);
+  if (params?.symbol) url.searchParams.set("symbol", params.symbol);
+  if (params?.targetKind) url.searchParams.set("target_kind", params.targetKind);
+  if (params?.recipient) url.searchParams.set("recipient", params.recipient);
+  const response = await fetch(url.toString(), { method: "POST" });
+  return expectJson(response);
+}
+
 export async function fetchWorkerStatus(signal?: AbortSignal): Promise<WorkerStatus> {
   const response = await fetch(`${apiBaseUrl}/api/worker/status`, { signal });
   return expectJson<WorkerStatus>(response);

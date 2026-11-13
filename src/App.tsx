@@ -59,6 +59,7 @@ import {
   resendAlertNotification,
   resetWorkspaceData,
   restoreImportVersion,
+  sendSampleAlertEmail,
   triggerOnDemandPoll,
   triggerOutboxDrain,
   updateCompanyTargets,
@@ -1161,7 +1162,7 @@ function OverviewPage({
           </div>
         </section>
 
-        <section className="card target-list-card">
+        <section className="card target-list-card market-health-card">
           <div className="section-head">
             <div>
               <h2>Market Feed Health</h2>
@@ -1206,7 +1207,7 @@ function OverviewPage({
           </div>
         </section>
 
-        <section className="card target-list-card">
+        <section className="card target-list-card import-history-card">
           <div className="section-head">
             <div>
               <h2>Import History</h2>
@@ -2945,6 +2946,7 @@ function EmailPreviewModal({
   notify: (msg: string) => void;
 }) {
   const [viewMode, setViewMode] = useState<"rendered" | "plain">("rendered");
+  const [sendingSample, setSendingSample] = useState(false);
   const isBase = item.target_kind === "base";
   const subject =
     item.email_subject ||
@@ -2972,6 +2974,21 @@ function EmailPreviewModal({
     }
   };
 
+  const handleSendSample = async () => {
+    setSendingSample(true);
+    try {
+      const res = await sendSampleAlertEmail({
+        symbol: item.symbol,
+        targetKind: item.target_kind,
+      });
+      notify(`Sample email sent to ${res.recipients.join(", ")} (${res.status})`);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "Failed to send sample email");
+    } finally {
+      setSendingSample(false);
+    }
+  };
+
   return (
     <>
       <motion.button
@@ -2983,11 +3000,10 @@ function EmailPreviewModal({
         aria-label="Close email preview"
       />
       <motion.div
-        className="edit-modal"
+        className="edit-modal email-preview-modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="email-preview-title"
-        style={{ width: "min(680px, calc(100vw - 28px))" }}
         initial={{ opacity: 0, scale: 0.96, y: 12 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.96, y: 12 }}
@@ -3012,16 +3028,7 @@ function EmailPreviewModal({
           </button>
         </div>
 
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            gap: 10,
-            marginBottom: 14,
-            flexWrap: "wrap",
-          }}
-        >
+        <div className="email-preview-toolbar">
           <div className="theme-options">
             <button
               className={viewMode === "rendered" ? "theme-option selected" : "theme-option"}
@@ -3055,52 +3062,31 @@ function EmailPreviewModal({
         </div>
 
         {viewMode === "rendered" ? (
-          <div
-            style={{
-              borderRadius: 12,
-              border: "1px solid var(--border)",
-              background: "var(--surface-2)",
-              overflow: "hidden",
-              marginBottom: 14,
-            }}
-          >
+          <div className="email-preview-card">
             <div
-              style={{
-                padding: "16px 20px",
-                borderBottom: "1px solid var(--border)",
-                background: isBase
-                  ? "rgba(43, 212, 143, 0.1)"
-                  : "rgba(244, 91, 105, 0.1)",
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: 12,
-                flexWrap: "wrap",
-              }}
+              className={`email-preview-banner ${
+                isBase ? "email-preview-banner-base" : "email-preview-banner-bull"
+              }`}
             >
               <div>
                 <span className={`status-badge ${isBase ? "badge-buy" : "badge-sell"}`}>
                   <i />
                   {isBase ? "BASE TARGET ALERT" : "BULL TARGET ALERT"}
                 </span>
-                <h3 style={{ margin: "8px 0 2px", fontSize: "1.05rem" }}>
+                <h3>
                   {item.company} ({item.exchange}:{item.symbol})
                 </h3>
-                <small style={{ color: "var(--muted)" }}>
+                <p>
                   {item.company} has reached its configured {isBase ? "Base" : "Bull"} Target Price.
-                </small>
+                </p>
               </div>
-              <div style={{ textAlign: "right" }}>
-                <small style={{ color: "var(--muted)", display: "block", fontSize: "0.72rem" }}>
-                  CURRENT MARKET PRICE
-                </small>
-                <b style={{ fontSize: "1.35rem", fontFamily: "var(--mono)" }}>
-                  {money(item.price)}
-                </b>
+              <div className="email-preview-cmp">
+                <small>CURRENT MARKET PRICE</small>
+                <b>{money(item.price)}</b>
               </div>
             </div>
 
-            <div className="movement-grid" style={{ padding: "14px 20px", margin: 0 }}>
+            <div className="email-preview-metrics">
               <div>
                 <small>CONFIGURED TARGET</small>
                 <b>{item.target != null ? money(item.target) : "—"}</b>
@@ -3128,28 +3114,11 @@ function EmailPreviewModal({
             </div>
           </div>
         ) : (
-          <pre
-            style={{
-              padding: "14px 16px",
-              borderRadius: 10,
-              border: "1px solid var(--border)",
-              background: "var(--surface-2)",
-              color: "var(--text-secondary)",
-              fontFamily: "var(--mono)",
-              fontSize: "0.78rem",
-              lineHeight: 1.55,
-              whiteSpace: "pre-wrap",
-              maxHeight: 310,
-              overflowY: "auto",
-              marginBottom: 14,
-            }}
-          >
-            {bodyText}
-          </pre>
+          <pre className="email-preview-pre">{bodyText}</pre>
         )}
 
         {"delivery_gate_reason" in item && (
-          <div className="modal-note" style={{ marginBottom: 12 }}>
+          <div className="modal-note" style={{ marginBottom: 4 }}>
             <ShieldCheck size={14} /> Delivery Status: {item.delivery_gate_reason}
           </div>
         )}
@@ -3157,6 +3126,13 @@ function EmailPreviewModal({
         <div className="modal-actions">
           <button className="button secondary" onClick={() => void copyEmail()}>
             Copy Email Text
+          </button>
+          <button
+            className="button secondary"
+            onClick={() => void handleSendSample()}
+            disabled={sendingSample}
+          >
+            <Bell size={14} /> {sendingSample ? "Sending Email…" : "Send Sample Email to Inbox"}
           </button>
           {onResend && (
             <button className="button secondary" onClick={onResend}>

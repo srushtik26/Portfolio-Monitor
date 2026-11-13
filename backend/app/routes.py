@@ -49,8 +49,12 @@ from .models import (
     WorkerHeartbeat,
 )
 from .notifications import (
+    DryRunNotifier,
     MultiChannelNotifier,
     NotificationMessage,
+    PermanentSendError,
+    RetryableSendError,
+    SmtpEmailNotifier,
     check_live_notification_gate,
     drain_outbox,
     format_alert_email,
@@ -783,7 +787,12 @@ def generate_test_alert_preview(
 
     breach_abs = float(q_val - t_val)
     breach_pct = float(((q_val - t_val) / t_val) * Decimal("100")) if t_val != 0 else 0.0
-    recipients = list(pref.email_recipients or [])
+    env_recipients = [
+        addr.strip()
+        for addr in os.environ.get("ALERT_EMAIL_RECIPIENTS", "").split(",")
+        if addr.strip() and "@" in addr.strip()
+    ]
+    recipients = list(pref.email_recipients or env_recipients)
     msg = NotificationMessage(
         outbox_id="preview-sample",
         target_alert_id=0,
@@ -827,6 +836,76 @@ def generate_test_alert_preview(
         "missing_smtp": missing_smtp,
         "live_delivery_ready": live_ready,
         "delivery_gate_reason": gate_reason,
+    }
+
+
+@router.post("/notifications/send-sample")
+def send_sample_alert_email(
+    session: DbSession,
+    symbol: str | None = Query(default=None),
+    target_kind: str = Query(default="base"),
+    recipient: str | None = Query(default=None),
+) -> dict[str, Any]:
+    preview = generate_test_alert_preview(session, symbol=symbol, target_kind=target_kind)
+    recipients: list[str] = []
+    if recipient and "@" in recipient:
+        recipients = [addr.strip() for addr in recipient.split(",") if addr.strip() and "@" in addr.strip()]
+    else:
+        recipients = list(preview.get("recipients") or [])
+
+    if not recipients:
+        raise HTTPException(
+            status_code=422,
+            detail="No recipient email configured. Add your email in Settings -> Approved Email Recipients or ALERT_EMAIL_RECIPIENTS in .env.",
+        )
+
+    now = datetime.now(timezone.utc)
+    msg = NotificationMessage(
+        outbox_id="sample-email",
+        target_alert_id=0,
+        exchange=str(preview["exchange"]),
+        symbol=str(preview["symbol"]),
+        target_kind="bull" if str(preview["target_kind"]) == "bull" else "base",
+        target_price=str(preview["target"]),
+        quote_price=str(preview["price"]),
+        triggered_at=now,
+        is_simulated=False,
+        company_name=str(preview["company"]),
+        comparison_direction="below" if str(preview["comparison_direction"]) == "below" else "above",
+        channel="email",
+        destination=",".join(recipients),
+        saved_cmp=str(preview["saved_cmp"]) if preview.get("saved_cmp") is not None else None,
+        sector=str(preview["sector"]) if preview.get("sector") else None,
+        trigger_cycle=1,
+    )
+    idempotency_key = f"sample-{int(now.timestamp())}"
+
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        receipt = DryRunNotifier().send(msg, idempotency_key)
+        return {
+            "status": "dry_run",
+            "recipients": recipients,
+            "subject": preview["email_subject"],
+            "provider_message_id": receipt.provider_message_id,
+        }
+
+    smtp_ok, missing = is_smtp_complete()
+    if not smtp_ok:
+        raise HTTPException(
+            status_code=422,
+            detail=f"SMTP settings are incomplete in .env (missing: {', '.join(missing)}).",
+        )
+
+    try:
+        receipt = SmtpEmailNotifier().send(msg, idempotency_key)
+    except (PermanentSendError, RetryableSendError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {
+        "status": "sent",
+        "recipients": recipients,
+        "subject": preview["email_subject"],
+        "provider_message_id": receipt.provider_message_id,
     }
 
 
