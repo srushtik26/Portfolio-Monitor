@@ -85,6 +85,31 @@ def format_alert_email(message: NotificationMessage) -> tuple[str, str]:
     except (ValueError, TypeError):
         quote_fmt = f"₹{message.quote_price}"
 
+    is_approaching = (
+        target_num is not None
+        and target_num > 0
+        and quote_num is not None
+        and (
+            target_num < quote_num <= target_num * 1.01
+            if message.comparison_direction == "below"
+            else target_num * 0.99 <= quote_num < target_num
+        )
+    )
+    alert_badge = (
+        f"{target_type.upper()} TARGET APPROACHING ({direction_label.upper()})"
+        if is_approaching
+        else f"{target_type.upper()} TARGET TRIGGERED ({direction_label.upper()})"
+    )
+    alert_sentence = (
+        f"is within 1% of its configured {target_type} Target Price"
+        if is_approaching
+        else f"has reached its configured {target_type} Target Price"
+    )
+    trigger_rule = (
+        f"Within 1% of {target_type} Target ({direction_label})"
+        if is_approaching
+        else f"Current Price {rule_symbol} {target_type} Target ({direction_label})"
+    )
     variance_line = ""
     if target_num and target_num > 0 and quote_num is not None:
         diff_abs = quote_num - target_num
@@ -109,13 +134,13 @@ def format_alert_email(message: NotificationMessage) -> tuple[str, str]:
 
     subject = f"Price Target Alert – {company_label} ({message.exchange}:{message.symbol}) [{target_type} Target {quote_fmt}]"
     body = (
-        f"{company_label} has reached its configured {target_type} Target Price.\n\n"
+        f"{company_label} {alert_sentence}.\n\n"
         f"Company: {company_label}\n"
         f"Symbol: {message.symbol}\n"
         f"Exchange: {message.exchange}\n"
         f"{sector_line}"
         f"Target Type: {target_type}\n"
-        f"Trigger Rule: Current Price {rule_symbol} {target_type} Target ({direction_label})\n"
+        f"Trigger Rule: {trigger_rule}\n"
         f"Target Price: {target_fmt}\n"
         f"Current Price: {quote_fmt}\n"
         f"{variance_line}"
@@ -161,6 +186,32 @@ def format_alert_email_html(message: NotificationMessage) -> str:
     except (ValueError, TypeError):
         quote_fmt = f"₹{message.quote_price}"
 
+    is_approaching = (
+        target_num is not None
+        and target_num > 0
+        and quote_num is not None
+        and (
+            target_num < quote_num <= target_num * 1.01
+            if message.comparison_direction == "below"
+            else target_num * 0.99 <= quote_num < target_num
+        )
+    )
+    alert_badge = (
+        f"{target_type.upper()} TARGET APPROACHING ({direction_label.upper()})"
+        if is_approaching
+        else f"{target_type.upper()} TARGET TRIGGERED ({direction_label.upper()})"
+    )
+    alert_sentence = (
+        f"is within 1% of its configured {target_type} Target Price"
+        if is_approaching
+        else f"has reached its configured {target_type} Target Price"
+    )
+    trigger_rule = (
+        f"Within 1% of {target_type} Target ({direction_label})"
+        if is_approaching
+        else f"Current Price {rule_symbol} Target"
+    )
+
     variance_fmt = "—"
     if target_num and target_num > 0 and quote_num is not None:
         diff_abs = quote_num - target_num
@@ -188,12 +239,12 @@ def format_alert_email_html(message: NotificationMessage) -> str:
         {company_label} <span style="color:#64748b;font-weight:500;">({message.exchange}:{message.symbol})</span>
       </h2>
       <span style="display:inline-block;margin-top:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;background:{badge_bg};color:{badge_fg};border:1px solid {badge_border};">
-        {target_type.upper()} TARGET TRIGGERED ({direction_label.upper()})
+        {alert_badge}
       </span>
     </div>
     <div style="padding:20px 24px;">
       <p style="margin:0 0 16px;font-size:14px;line-height:1.5;color:#cbd5e1;">
-        <strong>{company_label}</strong> has reached its configured <strong>{target_type} Target Price</strong> ({rule_symbol} {target_fmt}).
+        <strong>{company_label}</strong> {alert_sentence}. <strong>{target_type} Target Price:</strong> {target_fmt}.
       </p>
       <table style="width:100%;border-collapse:collapse;font-size:13px;">
         <tr>
@@ -214,7 +265,7 @@ def format_alert_email_html(message: NotificationMessage) -> str:
         </tr>
         <tr>
           <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#94a3b8;">Price Direction &amp; Rule</td>
-          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#cbd5e1;text-align:right;">{direction_label} ({rule_symbol} Target)</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #1e293b;color:#cbd5e1;text-align:right;">{trigger_rule}</td>
         </tr>
         <tr>
           <td style="padding:10px 12px;color:#94a3b8;">Trigger Timestamp</td>

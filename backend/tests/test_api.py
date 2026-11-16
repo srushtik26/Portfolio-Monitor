@@ -508,10 +508,16 @@ def _create_price_company(
     return company
 
 
-def _provider_quote(price: str, quoted_at: datetime, *, simulated: bool = False) -> ProviderQuote:
+def _provider_quote(
+    price: str,
+    quoted_at: datetime,
+    *,
+    simulated: bool = False,
+    symbol: str = "PRICE",
+) -> ProviderQuote:
     return ProviderQuote(
         exchange="NSE",
-        symbol="PRICE",
+        symbol=symbol,
         price=Decimal(price),
         currency="INR",
         provider="test-provider",
@@ -538,8 +544,8 @@ def test_target_rules_cover_below_equal_above_repeat_and_both_targets(
         assert [quote.status for quote in recorded] == ["fresh"] * 5
         alerts = list(session.scalars(select(TargetAlert).order_by(TargetAlert.target_kind)))
         assert [(alert.target_kind, alert.price) for alert in alerts] == [
-            ("base", Decimal("100.000000")),
-            ("bull", Decimal("120.000000")),
+            ("base", Decimal("99.990000")),
+            ("bull", Decimal("119.990000")),
         ]
 
         repeated = record_quote(
@@ -550,6 +556,48 @@ def test_target_rules_cover_below_equal_above_repeat_and_both_targets(
         )
         assert repeated.status == "fresh"
         assert session.scalar(select(func.count(TargetAlert.id))) == 2
+
+
+def test_target_alerts_cover_one_percent_proximity_and_exact_match(client: TestClient) -> None:
+    with TestSession() as session:
+        approaching = _create_price_company(session, symbol="APPROACH")
+        approaching.base_direction = "below"
+        approaching.bull_direction = "above"
+        approaching.base_trigger_mode = "crosses"
+        approaching.bull_trigger_mode = "crosses"
+        session.commit()
+
+        equal = _create_price_company(session, symbol="EQUAL")
+        equal.base_direction = "below"
+        equal.base_trigger_mode = "crosses"
+        session.commit()
+
+        start = datetime(2026, 11, 3, 9, tzinfo=timezone.utc)
+        record_quote(
+            session,
+            _provider_quote("100.50", start, symbol="APPROACH"),
+            now=start,
+            alerts_enabled=True,
+        )
+        record_quote(
+            session,
+            _provider_quote("119.40", start + timedelta(seconds=1), symbol="APPROACH"),
+            now=start + timedelta(seconds=1),
+            alerts_enabled=True,
+        )
+        record_quote(
+            session,
+            _provider_quote("100.00", start + timedelta(seconds=2), symbol="EQUAL"),
+            now=start + timedelta(seconds=2),
+            alerts_enabled=True,
+        )
+
+        alerts = list(session.scalars(select(TargetAlert).order_by(TargetAlert.id)))
+        assert [(alert.target_kind, alert.price) for alert in alerts] == [
+            ("base", Decimal("100.500000")),
+            ("bull", Decimal("119.400000")),
+            ("base", Decimal("100.000000")),
+        ]
 
 
 def test_stale_simulated_out_of_order_and_invalid_quotes_never_alert(
@@ -1146,13 +1194,13 @@ def test_bhel_downward_base_and_upward_bull_target_directions_and_crosses(
         session.commit()
 
         start = datetime(2026, 11, 3, 9, 15, tzinfo=timezone.utc)
-        # 1. Quote at 430.00 (between base 426.91 and bull 561.09) -> no alert
+        # 1. Quote at 432.00 is more than 1% above Base -> no alert
         record_quote(
             session,
             ProviderQuote(
                 exchange="NSE",
                 symbol="BHEL",
-                price=Decimal("430.00"),
+                price=Decimal("432.00"),
                 currency="INR",
                 provider="test-provider",
                 quoted_at=start,
@@ -1163,13 +1211,13 @@ def test_bhel_downward_base_and_upward_bull_target_directions_and_crosses(
         )
         assert session.scalar(select(func.count(TargetAlert.id))) == 0
 
-        # 2. Quote crosses downward to 426.85 (<= 426.91 from 430.00) -> triggers Base alert
+        # 2. Quote enters the 1% Base alert zone -> triggers a proximity alert
         record_quote(
             session,
             ProviderQuote(
                 exchange="NSE",
                 symbol="BHEL",
-                price=Decimal("426.85"),
+                price=Decimal("430.00"),
                 currency="INR",
                 provider="test-provider",
                 quoted_at=start + timedelta(seconds=10),
@@ -1182,10 +1230,27 @@ def test_bhel_downward_base_and_upward_bull_target_directions_and_crosses(
         assert len(alerts) == 1
         assert alerts[0].target_kind == "base"
         assert alerts[0].comparison_direction == "below"
-        assert alerts[0].price == Decimal("426.850000")
+        assert alerts[0].price == Decimal("430.000000")
         assert alerts[0].target_price_snapshot == Decimal("426.910000")
 
-        # 3. Repeated downward quote 425.00 does NOT duplicate alert
+        # 3. Reaching the Base target does not duplicate its proximity alert
+        record_quote(
+            session,
+            ProviderQuote(
+                exchange="NSE",
+                symbol="BHEL",
+                price=Decimal("426.85"),
+                currency="INR",
+                provider="test-provider",
+                quoted_at=start + timedelta(seconds=15),
+                is_simulated=False,
+            ),
+            now=start + timedelta(seconds=15),
+            alerts_enabled=True,
+        )
+        assert session.scalar(select(func.count(TargetAlert.id))) == 1
+
+        # 4. Repeated downward quote 425.00 does NOT duplicate alert
         record_quote(
             session,
             ProviderQuote(
@@ -1202,7 +1267,7 @@ def test_bhel_downward_base_and_upward_bull_target_directions_and_crosses(
         )
         assert session.scalar(select(func.count(TargetAlert.id))) == 1
 
-        # 4. Recovery back to 440.00 re-arms Base under rearm_after_recovery
+        # 5. Recovery back to 440.00 re-arms Base under rearm_after_recovery
         record_quote(
             session,
             ProviderQuote(
@@ -1218,7 +1283,7 @@ def test_bhel_downward_base_and_upward_bull_target_directions_and_crosses(
             alerts_enabled=True,
         )
 
-        # 5. Crosses upward to 562.00 (>= 561.09 from 440.00) -> triggers Bull alert
+        # 6. Crosses upward to 562.00 (>= 561.09 from 440.00) -> triggers Bull alert
         record_quote(
             session,
             ProviderQuote(

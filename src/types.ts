@@ -289,9 +289,12 @@ export type CompanyRevisionItem = {
   version: number;
   base_target: number | null;
   bull_target: number | null;
+  previous_base_target?: number | null;
+  previous_bull_target?: number | null;
   base_direction: TargetDirection;
   bull_direction: TargetDirection;
   source: string;
+  changed_by?: string;
   import_batch_id?: string | null;
   import_id?: string | null;
   changed_at: string | null;

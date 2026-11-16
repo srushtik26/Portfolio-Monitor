@@ -1225,16 +1225,20 @@ def _evaluate_company_target(
     was_condition_met = state_row.last_condition_met
 
     if direction == "below":
-        condition_met = price <= target
+        target_condition_met = price <= target
+        approaching = target < price <= target * Decimal("1.01")
         crossed = prev_price is not None and prev_price > target and price <= target
     elif direction == "above":
-        condition_met = price >= target
+        target_condition_met = price >= target
+        approaching = target * Decimal("0.99") <= price < target
         crossed = prev_price is not None and prev_price < target and price >= target
     else:
         state_row.state = "pending_configuration"
         state_row.last_evaluated_price = price
         state_row.last_evaluated_at = current_time
         return None
+
+    condition_met = target_condition_met or approaching
 
     gap_key = (company.exchange.upper(), company.symbol.upper(), kind)
     with _POST_GAP_BASELINE_LOCK:
@@ -1244,10 +1248,11 @@ def _evaluate_company_target(
 
     if is_post_gap_snapshot:
         # First fresh snapshot after a reconnect/sequence gap establishes the new cross baseline
-        # without inferring a target crossing across the gap.
-        qualifies = False
+        # without inferring a target crossing across the gap. A near-target or exact-match alert
+        # does not depend on inferring that crossing.
+        qualifies = approaching or price == target
     elif trigger_mode == "crosses":
-        qualifies = crossed
+        qualifies = approaching or price == target or crossed
     else:
         qualifies = condition_met
 

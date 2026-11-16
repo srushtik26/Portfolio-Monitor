@@ -357,7 +357,7 @@ def test_async_worker_consumes_live_tick_stream_and_evaluates_target_rules() -> 
     base_epoch = int(datetime.now(timezone.utc).timestamp()) - 30
 
     async def fake_shoonya_stream() -> AsyncIterator[dict[str, Any]]:
-        # 1. Tick at 430.00 (between base 426.91 and bull 561.09)
+        # 1. Tick at 430.00 enters the 1% Base alert zone
         yield {"t": "tf", "e": "NSE", "tk": "438", "lp": "430.00", "ft": str(base_epoch + 1)}
         # 2. Tick crosses downward to 426.80 -> triggers Base Target Alert
         yield {"t": "tf", "e": "NSE", "tk": "438", "lp": "426.80", "ft": str(base_epoch + 2)}
@@ -386,7 +386,7 @@ def test_async_worker_consumes_live_tick_stream_and_evaluates_target_rules() -> 
         ]
         alerts = list(session.scalars(select(TargetAlert).order_by(TargetAlert.id)))
         assert [(a.target_kind, a.price, a.comparison_direction) for a in alerts] == [
-            ("base", Decimal("426.800000"), "below"),
+            ("base", Decimal("430.000000"), "below"),
             ("bull", Decimal("562.500000"), "above"),
         ]
         hb = session.get(WorkerHeartbeat, "price")
@@ -473,7 +473,7 @@ def test_uploaded_excel_rules_query_and_high_frequency_tick_pool_optimization() 
     base_epoch = int(now.timestamp()) - 40
 
     async def high_freq_burst_stream() -> AsyncIterator[dict[str, Any]]:
-        # 20 rapid identical-price ticks at 430.00 (no alert; 19 of 20 deduplicated in memory)
+        # 20 rapid identical-price ticks at 430.00 (one proximity alert; 19 deduplicated in memory)
         for i in range(20):
             yield {"t": "tf", "e": "NSE", "tk": "438", "lp": "430.00", "ft": str(base_epoch + i)}
         # 1 tick dropping below Base target (426.50 <= 426.91) -> writes Base alert to notification_outbox
@@ -505,7 +505,7 @@ def test_uploaded_excel_rules_query_and_high_frequency_tick_pool_optimization() 
         alerts = list(session.scalars(select(TargetAlert).order_by(TargetAlert.id)))
         assert len(alerts) == 2
         assert alerts[0].target_kind == "base"
-        assert alerts[0].price == Decimal("426.500000")
+        assert alerts[0].price == Decimal("430.000000")
         assert alerts[1].target_kind == "bull"
         assert alerts[1].price == Decimal("565.000000")
 
@@ -820,13 +820,13 @@ def test_bounded_queue_overflow_and_reconnect_gap_resets_cross_baselines() -> No
     service.connect_once()
     assert fake_sdk.subscribe_callback is not None
 
-    # 1. Pre-disconnect tick at 430.00 (above Base target 426.91) establishes baseline
+    # 1. Pre-disconnect tick at 440.00 (outside the 1% Base alert zone) establishes baseline
     fake_sdk.subscribe_callback(
         {
             "t": "tf",
             "e": "NSE",
             "tk": "438",
-            "lp": "430.00",
+            "lp": "440.00",
             "ft": str(base_epoch + 10),
         }
     )
@@ -834,7 +834,7 @@ def test_bounded_queue_overflow_and_reconnect_gap_resets_cross_baselines() -> No
     with TestSession() as session:
         st = session.get(TargetAlertState, ("NSE", "BHEL", "base", False))
         assert st is not None
-        assert st.last_evaluated_price == Decimal("430.000000")
+        assert st.last_evaluated_price == Decimal("440.000000")
 
     # 2. Simulate disconnect & reconnect
     assert fake_sdk.socket_close_callback is not None
@@ -892,13 +892,13 @@ def test_bounded_queue_overflow_and_reconnect_gap_resets_cross_baselines() -> No
         assert st_post_gap is not None
         assert st_post_gap.last_evaluated_price == Decimal("425.000000")
 
-    # 5. Subsequent recovery above target (430.00) followed by live downward cross (426.00) triggers alert
+    # 5. Subsequent recovery outside the alert zone (440.00) followed by a downward cross triggers alert
     fake_sdk.subscribe_callback(
         {
             "t": "tf",
             "e": "NSE",
             "tk": "438",
-            "lp": "430.00",
+            "lp": "440.00",
             "ft": str(base_epoch + 20),
         }
     )

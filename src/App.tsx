@@ -653,7 +653,6 @@ export default function App() {
               onAction={handleAlertLifecycle}
               onDrainOutbox={handleDrainOutbox}
               onResendAlert={handleResendAlert}
-              onPreviewEmail={(item) => setEmailPreviewItem(item)}
               onPreviewTestEmail={handleOpenTestPreview}
             />
           )}
@@ -1785,7 +1784,6 @@ function AlertsPage({
   onAction,
   onDrainOutbox,
   onResendAlert,
-  onPreviewEmail,
   onPreviewTestEmail,
 }: {
   apiAlerts: ApiAlert[];
@@ -1796,7 +1794,6 @@ function AlertsPage({
   onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
   onDrainOutbox: () => Promise<void>;
   onResendAlert: (id: number) => Promise<void>;
-  onPreviewEmail: (alert: ApiAlert) => void;
   onPreviewTestEmail: (kind: "base" | "bull") => Promise<void>;
 }) {
   const [targetFilter, setTargetFilter] = useState("All targets");
@@ -1845,7 +1842,7 @@ function AlertsPage({
       <PageHeading
         eyebrow="ALERT ENGINE & NOTIFICATION OUTBOX"
         title="Price Target Alerts"
-        description="Triggered Base and Bull target events with exact trigger prices, breach variance, formatted email previews, and re-arm controls."
+        description="Triggered Base and Bull target events, delivery status, and lifecycle state."
         action={
           <div className="heading-actions">
             <button
@@ -2087,41 +2084,21 @@ function AlertsPage({
                       </td>
                       <td>
                         <div className="row-actions">
-                          <button
-                            className="button secondary small"
-                            onClick={() => onPreviewEmail(alert)}
-                          >
-                            View Email
-                          </button>
+                          {active && (
+                            <button
+                              className="button primary small"
+                              title="Acknowledge this alert"
+                              onClick={() => void onAction(alert.id, "acknowledge")}
+                            >
+                              Acknowledge
+                            </button>
+                          )}
                           <button
                             className="button secondary small"
                             title="Re-dispatch notification via configured channels"
                             onClick={() => void onResendAlert(alert.id)}
                           >
                             Resend
-                          </button>
-                          {active && (
-                            <button
-                              className="button secondary small"
-                              onClick={() => void onAction(alert.id, "acknowledge")}
-                            >
-                              Acknowledge
-                            </button>
-                          )}
-                          {lifecycle !== "resolved" && lifecycle !== "reset" && (
-                            <button
-                              className="button secondary small"
-                              onClick={() => void onAction(alert.id, "resolve")}
-                            >
-                              Resolve
-                            </button>
-                          )}
-                          <button
-                            className="button secondary small"
-                            title="Reset & re-arm target alert state"
-                            onClick={() => void onAction(alert.id, "reset")}
-                          >
-                            Reset & Re-arm
                           </button>
                         </div>
                       </td>
@@ -2165,9 +2142,47 @@ function TargetManagement({
   onSelectCompany: (company: PortfolioCompany) => void;
   search: string;
 }) {
+  const [auditIdentity, setAuditIdentity] = useState("");
+  const [auditDetails, setAuditDetails] = useState<CompanyDetailsResponse | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState("");
+  const auditCompany =
+    companies.find((company) => `${company.exchange}:${company.symbol}` === auditIdentity) ??
+    companies[0] ??
+    null;
   const list = companies.filter((company) =>
     `${company.name} ${company.symbol}`.toLowerCase().includes(search.toLowerCase()),
   );
+
+  useEffect(() => {
+    if (!auditCompany) {
+      setAuditDetails(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    setAuditLoading(true);
+    setAuditError("");
+    fetchCompanyDetails(auditCompany.exchange, auditCompany.symbol, controller.signal)
+      .then(setAuditDetails)
+      .catch((requestError: unknown) => {
+        if (!controller.signal.aborted) {
+          setAuditError(
+            requestError instanceof Error
+              ? requestError.message
+              : "Could not load target change history.",
+          );
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setAuditLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [auditCompany?.exchange, auditCompany?.symbol, auditCompany?.version]);
+
+  const revisions = auditDetails?.revisions ?? auditDetails?.target_revisions ?? [];
+
   return (
     <>
       <PageHeading
@@ -2278,6 +2293,86 @@ function TargetManagement({
             </table>
           )}
         </div>
+      </section>
+
+      <section className="card target-audit-card">
+        <div className="target-audit-heading">
+          <div>
+            <h2>Target Change Audit</h2>
+            <p>
+              Previous and updated Base/Bull prices, revision time, and the person who made the change.
+            </p>
+          </div>
+          <label className="target-audit-company">
+            <span>Company</span>
+            <select
+              value={auditCompany ? `${auditCompany.exchange}:${auditCompany.symbol}` : ""}
+              onChange={(event) => setAuditIdentity(event.target.value)}
+              disabled={companies.length === 0}
+            >
+              {companies.map((company) => (
+                <option
+                  key={`${company.exchange}:${company.symbol}`}
+                  value={`${company.exchange}:${company.symbol}`}
+                >
+                  {company.name} ({company.exchange}:{company.symbol})
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {auditLoading ? (
+          <div className="target-audit-empty">Loading target history…</div>
+        ) : auditError ? (
+          <div className="target-audit-empty" role="alert">{auditError}</div>
+        ) : revisions.length > 0 ? (
+          <div className="target-audit-scroll">
+            <table className="target-audit-table">
+              <thead>
+                <tr>
+                  <th>Version</th>
+                  <th>Changed</th>
+                  <th>Changed By</th>
+                  <th>Base Target</th>
+                  <th>Bull Target</th>
+                  <th>Source</th>
+                </tr>
+              </thead>
+              <tbody>
+                {revisions.map((revision) => (
+                  <tr key={revision.id}>
+                    <td>v{revision.version}</td>
+                    <td>
+                      {revision.changed_at
+                        ? new Date(revision.changed_at).toLocaleString("en-IN")
+                        : "—"}
+                    </td>
+                    <td>{revision.changed_by || "Unknown"}</td>
+                    <td>
+                      {revision.previous_base_target == null
+                        ? "—"
+                        : money(revision.previous_base_target)}
+                      <span className="target-audit-arrow"> → </span>
+                      {revision.base_target == null ? "—" : money(revision.base_target)}
+                    </td>
+                    <td>
+                      {revision.previous_bull_target == null
+                        ? "—"
+                        : money(revision.previous_bull_target)}
+                      <span className="target-audit-arrow"> → </span>
+                      {revision.bull_target == null ? "—" : money(revision.bull_target)}
+                    </td>
+                    <td><span className="target-audit-source">{revision.source}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="target-audit-empty">
+            No target revisions are available for this company yet.
+          </div>
+        )}
       </section>
     </>
   );
