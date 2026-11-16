@@ -10,12 +10,18 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+import sys
+
 from .database import ensure_sqlite_schema, get_db
+from .auth_routes import router as auth_router
+from .bootstrap_admin import bootstrap_admin_from_env
 from .models import WorkerHeartbeat
 from .notifications import check_live_notification_gate, is_smtp_complete
-from .routes import router
+from .routes import public_router, router
 
-ensure_sqlite_schema()
+if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
+    ensure_sqlite_schema()
+    bootstrap_admin_from_env()
 
 
 def _parse_cors_origins() -> list[str]:
@@ -43,8 +49,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_parse_cors_origins(),
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type", "Authorization"],
+    allow_headers=["Accept", "Content-Type", "Authorization", "X-CSRF-Token"],
 )
 
 
@@ -88,6 +95,8 @@ def health_readiness_check(session: Session = Depends(get_db)) -> dict[str, obje
     }
 
 
+app.include_router(auth_router)
+app.include_router(public_router)
 app.include_router(router)
 
 # Serve production frontend bundle from ../dist when built locally

@@ -223,7 +223,7 @@ export interface ImportPreviewRow {
   bull_target: number | null;
   base_direction?: TargetDirection;
   bull_direction?: TargetDirection;
-  approval_status?: "approved" | "rejected";
+  approval_status?: "approved" | "rejected" | "pending";
   cell_refs?: Record<string, string>;
   current_cmp: number | null;
   current_base_target: number | null;
@@ -237,7 +237,7 @@ export interface ImportPreviewRow {
 export interface ImportPreview {
   id: string;
   filename: string;
-  status: "preview" | "confirmed" | "rejected";
+  status: "preview" | "pending_approval" | "confirmed" | "rejected";
   version_number?: number | null;
   uploaded_by?: string;
   created_at?: string | null;
@@ -252,24 +252,29 @@ export interface ImportPreview {
 
 export interface ImportResult {
   id: string;
-  status: "confirmed";
+  status: "pending_approval" | "confirmed";
   version_number?: number | null;
-  created: number;
-  updated: number;
-  unchanged: number;
+  created?: number;
+  updated?: number;
+  unchanged?: number;
   rejected?: number;
 }
 
 export interface ImportBatchHistoryItem {
   id: string;
   filename: string;
-  file_type: string;
+  file_type?: string;
   sheet_name: string | null;
-  status: "preview" | "confirmed" | "rejected";
+  status: "preview" | "pending_approval" | "confirmed" | "rejected";
   version_number: number | null;
   uploaded_by: string;
+  uploader_user_id?: number | null;
+  approved_by?: string | null;
+  approver_user_id?: number | null;
+  rejector_user_id?: number | null;
   created_at: string | null;
-  confirmed_at: string | null;
+  approved_at?: string | null;
+  confirmed_at?: string | null;
   result: Record<string, unknown> | null;
   changes_snapshot: Array<Record<string, unknown>>;
 }

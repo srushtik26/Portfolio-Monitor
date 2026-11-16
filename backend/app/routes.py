@@ -56,6 +56,7 @@ from .notifications import (
     RetryableSendError,
     SmtpEmailNotifier,
     check_live_notification_gate,
+    collect_alert_email_recipients,
     drain_outbox,
     format_alert_email,
     format_alert_email_html,
@@ -84,8 +85,10 @@ from .schemas import (
     TargetConfigUpdate,
     TargetUpdate,
 )
+from .security import AdminUser, CurrentUser, get_current_user, record_activity, require_admin
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", dependencies=[Depends(get_current_user)])
+public_router = APIRouter(prefix="/api")
 DbSession = Annotated[Session, Depends(get_db)]
 
 
@@ -139,7 +142,7 @@ def _load_quotes_and_states(
     return quote_by_company, states_by_key
 
 
-@router.get("/health")
+@public_router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
@@ -307,12 +310,13 @@ def worker_status(session: DbSession) -> dict[str, object]:
     auth_calendar = bool(heartbeat and heartbeat.exchange_calendar and heartbeat.exchange_calendar != "fixture")
     pref = session.get(NotificationPreference, "default")
     live_notif_ready, notif_gate_reason = check_live_notification_gate()
+    active_recipients = collect_alert_email_recipients(session, pref) if pref else []
     notif_mode = (
         "live_channels"
         if (
             live_notif_ready
             and pref
-            and (pref.dashboard_enabled or (pref.email_enabled and pref.email_recipients))
+            and (pref.dashboard_enabled or (pref.email_enabled and active_recipients))
         )
         else "dry_run_only"
     )
@@ -405,7 +409,7 @@ def worker_status(session: DbSession) -> dict[str, object]:
     }
 
 
-@router.post("/price-feed/poll")
+@router.post("/price-feed/poll", dependencies=[Depends(require_admin)])
 def trigger_manual_poll(
     session: DbSession,
     exchange: str | None = Query(default=None),
@@ -527,7 +531,7 @@ def trigger_manual_poll(
 @router.get("/alerts")
 def list_alerts(session: DbSession) -> list[dict[str, object]]:
     pref = session.get(NotificationPreference, "default")
-    default_recipients = (pref.email_recipients if pref and pref.email_recipients else [])
+    default_recipients = collect_alert_email_recipients(session, pref)
     rows = session.execute(
         select(TargetAlert, TargetRevision, PriceQuote, Company, NotificationOutbox)
         .join(TargetRevision, TargetRevision.id == TargetAlert.target_revision_id)
@@ -671,19 +675,21 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
     return list(grouped.values())
 
 
-@router.post("/alerts/{alert_id}/action")
+@router.post("/alerts/{alert_id}/action", dependencies=[Depends(require_admin)])
 def alert_action(
     alert_id: int,
     payload: AlertActionRequest,
     session: DbSession,
+    user: AdminUser,
 ) -> dict[str, Any]:
     try:
         updated = apply_alert_lifecycle_action(
             session,
             alert_id,
             payload.action,
-            actor=payload.actor,
+            actor=user.name,
         )
+        record_activity(session, user, f"alert_{payload.action}", {"alert_id": alert_id})
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {
@@ -695,7 +701,7 @@ def alert_action(
     }
 
 
-@router.post("/notifications/drain")
+@router.post("/notifications/drain", dependencies=[Depends(require_admin)])
 def trigger_outbox_drain(session: DbSession) -> dict[str, int]:
     result = drain_outbox(MultiChannelNotifier(), session_factory=lambda: session)
     return {
@@ -705,7 +711,7 @@ def trigger_outbox_drain(session: DbSession) -> dict[str, int]:
     }
 
 
-@router.post("/alerts/{alert_id}/resend")
+@router.post("/alerts/{alert_id}/resend", dependencies=[Depends(require_admin)])
 def resend_alert_notification(alert_id: int, session: DbSession) -> dict[str, Any]:
     alert = session.get(TargetAlert, alert_id)
     if alert is None:
@@ -716,8 +722,12 @@ def resend_alert_notification(alert_id: int, session: DbSession) -> dict[str, An
             select(NotificationOutbox).where(NotificationOutbox.target_alert_id == alert_id)
         )
     )
-    if outbox_rows:
+    live_ready, _ = check_live_notification_gate()
+    if outbox_rows and (not live_ready or any(r.channel != "dry-run" for r in outbox_rows)):
+        all_recipients = collect_alert_email_recipients(session)
         for row in outbox_rows:
+            if row.channel == "email" and all_recipients:
+                row.destination = ",".join(all_recipients)
             row.status = "queued"
             row.attempts = 0
             row.next_attempt_at = now
@@ -726,6 +736,9 @@ def resend_alert_notification(alert_id: int, session: DbSession) -> dict[str, An
             row.last_error = None
         session.commit()
     else:
+        for row in outbox_rows:
+            session.delete(row)
+        session.flush()
         queue_alert_notifications(session, alert, now=now)
         session.commit()
 
@@ -738,7 +751,7 @@ def resend_alert_notification(alert_id: int, session: DbSession) -> dict[str, An
     }
 
 
-@router.post("/notifications/test-preview")
+@router.post("/notifications/test-preview", dependencies=[Depends(require_admin)])
 def generate_test_alert_preview(
     session: DbSession,
     symbol: str | None = Query(default=None),
@@ -792,7 +805,8 @@ def generate_test_alert_preview(
         for addr in os.environ.get("ALERT_EMAIL_RECIPIENTS", "").split(",")
         if addr.strip() and "@" in addr.strip()
     ]
-    recipients = list(pref.email_recipients or env_recipients)
+    combined = collect_alert_email_recipients(session, pref)
+    recipients = list(combined or env_recipients)
     msg = NotificationMessage(
         outbox_id="preview-sample",
         target_alert_id=0,
@@ -839,7 +853,7 @@ def generate_test_alert_preview(
     }
 
 
-@router.post("/notifications/send-sample")
+@router.post("/notifications/send-sample", dependencies=[Depends(require_admin)])
 def send_sample_alert_email(
     session: DbSession,
     symbol: str | None = Query(default=None),
@@ -909,7 +923,7 @@ def send_sample_alert_email(
     }
 
 
-@router.get("/notifications/preferences")
+@router.get("/notifications/preferences", dependencies=[Depends(require_admin)])
 def read_notification_preferences(session: DbSession) -> dict[str, Any]:
     pref = get_or_create_preferences(session)
     session.commit()
@@ -918,7 +932,7 @@ def read_notification_preferences(session: DbSession) -> dict[str, Any]:
         "id": pref.id,
         "dashboard_enabled": pref.dashboard_enabled,
         "email_enabled": pref.email_enabled,
-        "email_recipients": pref.email_recipients or [],
+        "email_recipients": collect_alert_email_recipients(session, pref),
         "notify_on_base": pref.notify_on_base,
         "notify_on_bull": pref.notify_on_bull,
         "notify_on_stale": pref.notify_on_stale,
@@ -927,10 +941,11 @@ def read_notification_preferences(session: DbSession) -> dict[str, Any]:
     }
 
 
-@router.put("/notifications/preferences")
+@router.put("/notifications/preferences", dependencies=[Depends(require_admin)])
 def update_notification_preferences(
     payload: NotificationPreferenceUpdate,
     session: DbSession,
+    user: AdminUser,
 ) -> dict[str, Any]:
     pref = get_or_create_preferences(session)
     now = datetime.now(timezone.utc)
@@ -960,7 +975,8 @@ def update_notification_preferences(
     session.add(
         AuditLog(
             action="notification_preferences_updated",
-            actor=payload.actor,
+            actor=user.name,
+            user_id=user.id,
             entity_type="notification_preferences",
             entity_id=pref.id,
             details={
@@ -1018,10 +1034,12 @@ def company_price_history(
 
 
 @router.put(
-    "/companies/{exchange}/{symbol}/targets", response_model=CompanyRead
+    "/companies/{exchange}/{symbol}/targets",
+    response_model=CompanyRead,
+    dependencies=[Depends(require_admin)],
 )
 def update_company_targets(
-    exchange: str, symbol: str, update: TargetUpdate, session: DbSession
+    exchange: str, symbol: str, update: TargetUpdate, session: DbSession, user: AdminUser
 ) -> CompanyRead:
     identity = (exchange.upper(), symbol.upper())
     company = session.get(Company, identity)
@@ -1069,14 +1087,29 @@ def update_company_targets(
                 base_direction=company.base_direction,
                 bull_direction=company.bull_direction,
                 source="manual",
-                changed_by=update.actor,
+                changed_by=user.name,
+                changed_by_user_id=user.id,
                 changed_at=now,
             )
+        )
+        record_activity(
+            session,
+            user,
+            "target_prices_changed",
+            {
+                "exchange": company.exchange,
+                "symbol": company.symbol,
+                "previous_base_target": float(old_targets[0]) if old_targets[0] is not None else None,
+                "previous_bull_target": float(old_targets[1]) if old_targets[1] is not None else None,
+                "base_target": float(company.base_target) if company.base_target is not None else None,
+                "bull_target": float(company.bull_target) if company.bull_target is not None else None,
+            },
         )
     session.add(
         AuditLog(
             action="company_targets_updated",
-            actor=update.actor,
+            actor=user.name,
+            user_id=user.id,
             entity_type="company",
             entity_id=f"{company.exchange}:{company.symbol}",
             details={
@@ -1108,10 +1141,12 @@ def update_company_targets(
 
 
 @router.put(
-    "/companies/{exchange}/{symbol}/target-config", response_model=CompanyRead
+    "/companies/{exchange}/{symbol}/target-config",
+    response_model=CompanyRead,
+    dependencies=[Depends(require_admin)],
 )
 def update_company_target_config(
-    exchange: str, symbol: str, config: TargetConfigUpdate, session: DbSession
+    exchange: str, symbol: str, config: TargetConfigUpdate, session: DbSession, user: AdminUser
 ) -> CompanyRead:
     identity = (exchange.upper(), symbol.upper())
     company = session.get(Company, identity)
@@ -1126,7 +1161,8 @@ def update_company_target_config(
     session.add(
         AuditLog(
             action="target_config_updated",
-            actor=config.actor,
+            actor=user.name,
+            user_id=user.id,
             entity_type="company",
             entity_id=f"{company.exchange}:{company.symbol}",
             details={
@@ -1141,6 +1177,7 @@ def update_company_target_config(
             created_at=now,
         )
     )
+    record_activity(session, user, "target_configuration_changed", {"exchange": company.exchange, "symbol": company.symbol})
     session.commit()
     session.refresh(company)
     quote_by_company, states_by_key = _load_quotes_and_states(session)
@@ -1159,6 +1196,7 @@ async def inspect_import(
 @router.post("/imports/preview")
 async def preview_import(
     session: DbSession,
+    user: CurrentUser,
     file: Annotated[UploadFile, File()],
     header_row: Annotated[int, Form()] = 1,
     sheet_name: Annotated[str | None, Form()] = None,
@@ -1173,7 +1211,7 @@ async def preview_import(
     filename, content = await read_upload(file)
     if PurePath(filename).suffix.lower() == ".xlsx" and not sheet_name:
         raise HTTPException(status_code=422, detail="Select a worksheet to preview.")
-    return create_preview(
+    preview = create_preview(
         session,
         filename=filename,
         content=content,
@@ -1188,19 +1226,21 @@ async def preview_import(
             "cmp_column": cmp_column,
             "sector_column": sector_column,
         },
+        uploaded_by=user.name,
+        uploader_user_id=user.id,
+        row_approval_status="approved" if user.role == "ADMIN" else "pending",
     )
+    record_activity(session, user, "import_uploaded", {"batch_id": preview["id"], "filename": filename})
+    session.commit()
+    return preview
 
 
 @router.get("/imports")
-def list_imports(session: DbSession) -> list[dict[str, Any]]:
-    batches = list(
-        session.scalars(
-            select(ImportBatch)
-            .options(selectinload(ImportBatch.rows))
-            .order_by(ImportBatch.created_at.desc())
-            .limit(50)
-        )
-    )
+def list_imports(session: DbSession, user: CurrentUser) -> list[dict[str, Any]]:
+    query = select(ImportBatch).options(selectinload(ImportBatch.rows))
+    if user.role != "ADMIN":
+        query = query.where(ImportBatch.uploader_user_id == user.id)
+    batches = list(session.scalars(query.order_by(ImportBatch.created_at.desc()).limit(100)))
     return [
         {
             "id": b.id,
@@ -1208,7 +1248,10 @@ def list_imports(session: DbSession) -> list[dict[str, Any]]:
             "status": b.status,
             "version_number": b.version_number,
             "uploaded_by": b.uploaded_by,
+            "uploader_user_id": b.uploader_user_id,
             "approved_by": b.approved_by,
+            "approver_user_id": b.approver_user_id,
+            "rejector_user_id": b.rejector_user_id,
             "approved_at": normalize_utc(b.approved_at) if b.approved_at else None,
             "created_at": normalize_utc(b.created_at),
             "sheet_name": b.sheet_name,
@@ -1221,8 +1264,12 @@ def list_imports(session: DbSession) -> list[dict[str, Any]]:
 
 
 @router.get("/imports/{batch_id}")
-def read_import(batch_id: str, session: DbSession) -> dict:
+def read_import(batch_id: str, session: DbSession, user: CurrentUser) -> dict:
     batch = get_batch(session, batch_id)
+    if user.role != "ADMIN" and batch.uploader_user_id != user.id:
+        raise HTTPException(status_code=404, detail="Import preview not found.")
+    if user.role != "ADMIN" and batch.status != "preview":
+        raise HTTPException(status_code=409, detail="Submitted imports can no longer be edited.")
     companies = {
         (company.exchange, company.symbol): company
         for company in session.scalars(select(Company))
@@ -1236,38 +1283,47 @@ def edit_import_row(
     row_number: int,
     payload: ImportRowUpdate,
     session: DbSession,
+    user: CurrentUser,
 ) -> dict[str, Any]:
+    batch = get_batch(session, batch_id)
+    if user.role != "ADMIN" and batch.uploader_user_id != user.id:
+        raise HTTPException(status_code=404, detail="Import preview not found.")
+    if user.role != "ADMIN" and "approval_status" in payload.model_fields_set:
+        raise HTTPException(status_code=403, detail="Only an administrator can approve or reject import rows.")
     return update_preview_row(session, batch_id, row_number, payload)
 
 
-@router.post("/imports/{batch_id}/reject")
-def reject_import(batch_id: str, session: DbSession) -> dict[str, Any]:
+@router.post("/imports/{batch_id}/reject", dependencies=[Depends(require_admin)])
+def reject_import(batch_id: str, session: DbSession, user: AdminUser) -> dict[str, Any]:
     batch = get_batch(session, batch_id)
     if batch.status == "confirmed":
         raise HTTPException(status_code=409, detail="Confirmed imports cannot be rejected.")
     batch.status = "rejected"
+    batch.rejector_user_id = user.id
     session.add(
         AuditLog(
             action="import_rejected",
-            actor="Srushti Kadam",
+            actor=user.name,
+            user_id=user.id,
             entity_type="import_batch",
             entity_id=batch.id,
             details={"filename": batch.filename},
             created_at=datetime.now(timezone.utc),
         )
     )
+    record_activity(session, user, "import_rejected", {"batch_id": batch.id})
     session.commit()
     return {"id": batch.id, "status": "rejected"}
 
 
-@router.post("/imports/{batch_id}/restore")
-def restore_import(batch_id: str, session: DbSession) -> dict[str, Any]:
-    return restore_import_version(session, batch_id)
+@router.post("/imports/{batch_id}/restore", dependencies=[Depends(require_admin)])
+def restore_import(batch_id: str, session: DbSession, user: AdminUser) -> dict[str, Any]:
+    return restore_import_version(session, batch_id, actor=user.name, user_id=user.id)
 
 
 @router.post("/imports/{batch_id}/confirm")
 def confirm_import(
-    batch_id: str, confirmation: ImportConfirm, session: DbSession
+    batch_id: str, confirmation: ImportConfirm, session: DbSession, user: CurrentUser
 ) -> dict:
     batch = session.scalar(
         select(ImportBatch)
@@ -1280,6 +1336,8 @@ def confirm_import(
         return batch.result or {"id": batch.id, "status": "confirmed"}
     if batch.status == "rejected":
         raise HTTPException(status_code=409, detail="Rejected imports cannot be confirmed.")
+    if user.role != "ADMIN" and batch.uploader_user_id != user.id:
+        raise HTTPException(status_code=404, detail="Import preview not found.")
 
     approved_rows = [row for row in batch.rows if row.approval_status != "rejected"]
     if not approved_rows:
@@ -1295,6 +1353,20 @@ def confirm_import(
             status_code=409,
             detail="Review the cached formula target values before confirming this import.",
         )
+
+    if user.role != "ADMIN":
+        if batch.status == "pending_approval":
+            return serialize_batch(batch)
+        batch.status = "pending_approval"
+        batch.uploaded_by = user.name
+        batch.uploader_user_id = user.id
+        batch.result = {"id": batch.id, "status": "pending_approval"}
+        record_activity(session, user, "import_submitted_for_approval", {"batch_id": batch.id})
+        session.commit()
+        return serialize_batch(batch)
+
+    if any(row.approval_status == "pending" for row in batch.rows):
+        raise HTTPException(status_code=409, detail="Approve or reject every pending row before saving the shared portfolio.")
 
     identities = [(row.exchange, row.symbol) for row in approved_rows]
     companies = {
@@ -1373,7 +1445,7 @@ def confirm_import(
                 "row_number": row.row_number,
                 "cell_refs": row.cell_refs or {},
                 "imported_at": now.isoformat(),
-                "approved_by": confirmation.approved_by,
+                "approved_by": user.name,
             }
             register_verified_ticker(company.exchange, company.symbol)
 
@@ -1410,7 +1482,8 @@ def confirm_import(
                         bull_direction=company.bull_direction,
                         source="import",
                         import_id=batch.id,
-                        changed_by=confirmation.approved_by,
+                        changed_by=user.name,
+                        changed_by_user_id=user.id,
                         cell_refs=row.cell_refs,
                         changed_at=now,
                     )
@@ -1420,8 +1493,8 @@ def confirm_import(
         session.flush()
         batch.status = "confirmed"
         batch.version_number = next_version_number
-        batch.uploaded_by = confirmation.uploaded_by
-        batch.approved_by = confirmation.approved_by
+        batch.approved_by = user.name
+        batch.approver_user_id = user.id
         batch.approved_at = now
         batch.changes_snapshot = changes_snapshot
         batch.result = {
@@ -1436,7 +1509,8 @@ def confirm_import(
         session.add(
             AuditLog(
                 action="import_confirmed",
-                actor=confirmation.approved_by,
+                actor=user.name,
+                user_id=user.id,
                 entity_type="import_batch",
                 entity_id=batch.id,
                 details={
@@ -1450,6 +1524,7 @@ def confirm_import(
                 created_at=now,
             )
         )
+        record_activity(session, user, "import_approved", {"batch_id": batch.id, "version_number": next_version_number})
         session.commit()
     except IntegrityError as error:
         session.rollback()
@@ -1469,7 +1544,7 @@ def confirm_import(
     return batch.result
 
 
-@router.get("/audit-logs")
+@router.get("/audit-logs", dependencies=[Depends(require_admin)])
 def list_audit_logs(
     session: DbSession,
     limit: int = Query(default=50, ge=1, le=200),
@@ -1482,6 +1557,7 @@ def list_audit_logs(
             "id": log.id,
             "action": log.action,
             "actor": log.actor,
+            "user_id": log.user_id,
             "entity_type": log.entity_type,
             "entity_id": log.entity_id,
             "details": log.details,
@@ -1491,9 +1567,9 @@ def list_audit_logs(
     ]
 
 
-@router.post("/workspace/reset")
-@router.delete("/workspace/reset")
-def reset_workspace_data(session: DbSession) -> dict[str, Any]:
+@router.post("/workspace/reset", dependencies=[Depends(require_admin)])
+@router.delete("/workspace/reset", dependencies=[Depends(require_admin)])
+def reset_workspace_data(session: DbSession, user: AdminUser) -> dict[str, Any]:
     """Clear all companies, import batches, quotes, alerts, target revisions, and audit logs."""
     deleted_companies = session.scalar(select(func.count()).select_from(Company)) or 0
     session.execute(delete(NotificationOutbox))
@@ -1506,6 +1582,8 @@ def reset_workspace_data(session: DbSession) -> dict[str, Any]:
     session.execute(delete(Company))
     session.execute(delete(AuditLog))
     session.execute(delete(WorkerHeartbeat))
+    session.commit()
+    record_activity(session, user, "workspace_reset", {})
     session.commit()
     return {
         "status": "cleared",
@@ -1766,8 +1844,7 @@ async def stream_live_events(
         with SessionLocal() as sess:
             return fn(sess)
 
-    cursor = await asyncio.to_thread(
-        _run_with_session,
+    cursor = _run_with_session(
         lambda s: _init_stream_cursor(
             s,
             since_quote_id=since_quote_id,
@@ -1790,8 +1867,7 @@ async def stream_live_events(
         while True:
             if await request.is_disconnected():
                 break
-            delta_events = await asyncio.to_thread(
-                _run_with_session,
+            delta_events = _run_with_session(
                 lambda s: _poll_stream_delta(s, cursor),
             )
             for ev in delta_events:
@@ -1824,7 +1900,7 @@ async def stream_live_events(
     )
 
 
-@router.websocket("/ws/live")
+@public_router.websocket("/ws/live")
 async def websocket_live_events(
     websocket: WebSocket,
     since_quote_id: int | None = Query(default=None),
@@ -1834,8 +1910,11 @@ async def websocket_live_events(
     """WebSocket endpoint streaming real-time price ticks, Distance-from-Target metrics,
     and `notification_outbox` alert events to the React dashboard.
     """
-    await websocket.accept()
+    from .models import User, UserSession
+    from .security import SESSION_COOKIE, _digest, _now
+
     override_db = websocket.app.dependency_overrides.get(get_db)
+    override_auth = websocket.app.dependency_overrides.get(get_current_user)
 
     def _run_with_session(fn):
         if override_db is not None:
@@ -1851,8 +1930,27 @@ async def websocket_live_events(
         with SessionLocal() as sess:
             return fn(sess)
 
-    cursor = await asyncio.to_thread(
-        _run_with_session,
+    await websocket.accept()
+    if override_auth is None:
+        raw_token = websocket.cookies.get(SESSION_COOKIE)
+        if not raw_token:
+            await websocket.close(code=4401)
+            return
+
+        def _verify_ws_session(sess: Session) -> bool:
+            s_row = sess.scalar(
+                select(UserSession).where(UserSession.token_hash == _digest(raw_token))
+            )
+            if s_row is None or s_row.expires_at.replace(tzinfo=timezone.utc) <= _now():
+                return False
+            u = sess.get(User, s_row.user_id)
+            return bool(u is not None and u.is_active)
+
+        if not _run_with_session(_verify_ws_session):
+            await websocket.close(code=4401)
+            return
+
+    cursor = _run_with_session(
         lambda s: _init_stream_cursor(
             s,
             since_quote_id=since_quote_id,
@@ -1869,8 +1967,7 @@ async def websocket_live_events(
 
     try:
         while True:
-            delta_events = await asyncio.to_thread(
-                _run_with_session,
+            delta_events = _run_with_session(
                 lambda s: _poll_stream_delta(s, cursor),
             )
             for ev in delta_events:

@@ -1,6 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { AuthProvider } from "./AuthContext";
+import ProtectedRoute from "./ProtectedRoute";
 import "./styles.css";
 
 interface ErrorBoundaryState {
@@ -80,7 +82,11 @@ class ProductionErrorBoundary extends React.Component<
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <ProductionErrorBoundary>
-      <App />
+      <AuthProvider>
+        <ProtectedRoute>
+          <App />
+        </ProtectedRoute>
+      </AuthProvider>
     </ProductionErrorBoundary>
   </React.StrictMode>,
 );

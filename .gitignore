@@ -13,3 +13,4 @@ dist/
 .pytest_cache/
 __pycache__/
 .venv/
+backend/var/private_uploads/

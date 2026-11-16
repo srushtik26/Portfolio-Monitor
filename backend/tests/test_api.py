@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+from fastapi import Depends
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from sqlalchemy import create_engine, func, select
@@ -24,6 +25,7 @@ from app.models import (
     PriceQuote,
     TargetAlert,
     TargetRevision,
+    User,
     WorkerHeartbeat,
 )
 from app.notifications import (
@@ -44,6 +46,8 @@ from app.prices import (
     record_quote,
 )
 from app.worker import poll_once, single_worker_lock
+from app.security import get_current_user
+from app.security import hash_password
 
 test_engine = create_engine(
     "sqlite://",
@@ -51,6 +55,30 @@ test_engine = create_engine(
     poolclass=StaticPool,
 )
 TestSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+
+
+@pytest.fixture(autouse=True)
+def _private_upload_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.imports.PRIVATE_UPLOAD_DIR", tmp_path)
+
+
+def _override_admin(session: Session = Depends(get_db)) -> User:
+    user = session.get(User, 1)
+    if user is None:
+        now = datetime.now(timezone.utc)
+        user = User(
+            id=1,
+            name="Test Administrator",
+            normalized_name="test administrator",
+            password_hash="test-hash-not-used",
+            role="ADMIN",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(user)
+        session.commit()
+    return user
 
 
 @pytest.fixture
@@ -62,6 +90,23 @@ def client() -> Generator[TestClient, None, None]:
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = _override_admin
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+    Base.metadata.drop_all(bind=test_engine)
+
+
+@pytest.fixture
+def auth_client() -> Generator[TestClient, None, None]:
+    Base.metadata.create_all(bind=test_engine)
+
+    def override_get_db() -> Generator[Session, None, None]:
+        with TestSession() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides.pop(get_current_user, None)
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
@@ -73,6 +118,394 @@ def test_health(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def _insert_user(name: str, role: str = "EMPLOYEE", *, is_active: bool = True) -> User:
+    normalized = " ".join(name.strip().split()).casefold()
+    now = datetime.now(timezone.utc)
+    user = User(
+        name=name,
+        normalized_name=normalized,
+        password_hash=hash_password("SecureTestPassword!42"),
+        role=role,
+        is_active=is_active,
+        created_at=now,
+        updated_at=now,
+    )
+    with TestSession() as session:
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        return user
+
+
+def test_login_requires_auth_uses_normalized_name_and_logout_invalidates_session(
+    auth_client: TestClient,
+) -> None:
+    setup_check = auth_client.get("/api/auth/setup-status")
+    assert setup_check.status_code == 200
+    assert setup_check.json() == {"admin_configured": False}
+
+    setup_res = auth_client.post(
+        "/api/auth/setup-admin",
+        json={"name": "Srushti Kadam", "password": "SecureTestPassword!42"},
+    )
+    assert setup_res.status_code == 201
+    assert setup_res.json()["user"]["role"] == "ADMIN"
+    assert auth_client.get("/api/auth/setup-status").json() == {"admin_configured": True}
+    assert (
+        auth_client.post(
+            "/api/auth/setup-admin",
+            json={"name": "Second Admin", "password": "SecureTestPassword!42"},
+        ).status_code
+        == 409
+    )
+    auth_client.post(
+        "/api/auth/logout",
+        headers={"X-CSRF-Token": setup_res.json()["csrf_token"]},
+    )
+
+    assert auth_client.get("/api/companies").status_code == 401
+    assert auth_client.post(
+        "/api/auth/login",
+        json={"name": "srushti kadam", "password": "WrongPassword!42"},
+    ).status_code == 401
+
+    login = auth_client.post(
+        "/api/auth/login",
+        json={"name": "  SRUSHTI   KADAM ", "password": "SecureTestPassword!42"},
+    )
+    assert login.status_code == 200
+    assert login.json()["user"]["name"] == "Srushti Kadam"
+    assert login.json()["user"]["role"] == "ADMIN"
+    assert "HttpOnly" in login.headers["set-cookie"]
+    csrf_token = login.json()["csrf_token"]
+    assert auth_client.get("/api/companies").status_code == 200
+    assert auth_client.post("/api/workspace/reset").status_code == 403
+    assert auth_client.post(
+        "/api/workspace/reset", headers={"X-CSRF-Token": csrf_token}
+    ).status_code == 200
+    assert auth_client.post(
+        "/api/auth/logout", headers={"X-CSRF-Token": csrf_token}
+    ).status_code == 200
+    assert auth_client.get("/api/companies").status_code == 401
+
+
+def test_employee_cannot_access_admin_apis(auth_client: TestClient) -> None:
+    _insert_user("Employee One")
+    login = auth_client.post(
+        "/api/auth/login",
+        json={"name": "employee one", "password": "SecureTestPassword!42"},
+    )
+    assert login.status_code == 200
+    csrf_token = login.json()["csrf_token"]
+    headers = {"X-CSRF-Token": csrf_token}
+    assert auth_client.get("/api/companies").status_code == 200
+    assert auth_client.get("/api/imports").json() == []
+    assert auth_client.get("/api/audit-logs").status_code == 403
+    assert auth_client.get("/api/users").status_code == 403
+    assert auth_client.post("/api/workspace/reset", headers=headers).status_code == 403
+    assert auth_client.post(
+        "/api/price-feed/poll", headers=headers
+    ).status_code == 403
+
+
+def test_inactive_user_cannot_login_and_login_is_rate_limited(auth_client: TestClient) -> None:
+    _insert_user("Inactive Employee", is_active=False)
+    assert auth_client.post(
+        "/api/auth/login",
+        json={"name": "inactive employee", "password": "SecureTestPassword!42"},
+    ).status_code == 401
+    for _ in range(5):
+        response = auth_client.post(
+            "/api/auth/login", json={"name": "unknown person", "password": "wrong"}
+        )
+        assert response.status_code == 401
+    limited = auth_client.post(
+        "/api/auth/login", json={"name": "UNKNOWN PERSON", "password": "wrong"}
+    )
+    assert limited.status_code == 429
+
+
+def test_employee_upload_waits_for_admin_approval_and_records_owners(
+    auth_client: TestClient,
+) -> None:
+    employee = _insert_user("Uploader Employee")
+    admin = _insert_user("Portfolio Admin", "ADMIN")
+    employee_login = auth_client.post(
+        "/api/auth/login",
+        json={"name": employee.name, "password": "SecureTestPassword!42"},
+    )
+    employee_csrf = employee_login.json()["csrf_token"]
+    csv_content = (
+        "Exchange,Symbol,Company,Base,Bull\n"
+        "NSE,AUTHCO,Auth Company,100,120\n"
+    )
+    preview_response = auth_client.post(
+        "/api/imports/preview",
+        data={
+            "header_row": "1",
+            "exchange_column": "A",
+            "symbol_column": "B",
+            "name_column": "C",
+            "base_target_column": "D",
+            "bull_target_column": "E",
+        },
+        files={"file": ("targets.csv", csv_content, "text/csv")},
+        headers={"X-CSRF-Token": employee_csrf},
+    )
+    assert preview_response.status_code == 200
+    preview = preview_response.json()
+    assert preview["rows"][0]["approval_status"] == "pending"
+    assert auth_client.get("/api/companies").json() == []
+    assert auth_client.put(
+        f"/api/imports/{preview['id']}/rows/2",
+        json={"approval_status": "approved"},
+        headers={"X-CSRF-Token": employee_csrf},
+    ).status_code == 403
+    submitted = auth_client.post(
+        f"/api/imports/{preview['id']}/confirm",
+        json={},
+        headers={"X-CSRF-Token": employee_csrf},
+    )
+    assert submitted.status_code == 200
+    assert submitted.json()["status"] == "pending_approval"
+    assert auth_client.get("/api/companies").json() == []
+    assert auth_client.get("/api/imports").json()[0]["uploader_user_id"] == employee.id
+
+    admin_login = auth_client.post(
+        "/api/auth/login",
+        json={"name": admin.name, "password": "SecureTestPassword!42"},
+    )
+    admin_headers = {"X-CSRF-Token": admin_login.json()["csrf_token"]}
+    assert auth_client.get("/api/imports").json()[0]["status"] == "pending_approval"
+    approved_row = auth_client.put(
+        f"/api/imports/{preview['id']}/rows/2",
+        json={"approval_status": "approved"},
+        headers=admin_headers,
+    )
+    assert approved_row.status_code == 200
+    confirmed = auth_client.post(
+        f"/api/imports/{preview['id']}/confirm", json={}, headers=admin_headers
+    )
+    assert confirmed.status_code == 200
+    assert auth_client.get("/api/companies").json()[0]["symbol"] == "AUTHCO"
+    with TestSession() as session:
+        batch = session.get(ImportBatch, preview["id"])
+        assert batch is not None
+        assert batch.status == "confirmed"
+        assert batch.uploader_user_id == employee.id
+        assert batch.approver_user_id == admin.id
+        assert batch.stored_file_path is not None
+        assert Path(batch.stored_file_path).is_file()
+
+
+def test_admin_user_lifecycle_password_reset_employee_change_password_and_reject_upload(
+    auth_client: TestClient,
+) -> None:
+    admin = _insert_user("Admin Boss", "ADMIN")
+    admin_login = auth_client.post(
+        "/api/auth/login",
+        json={"name": admin.name, "password": "SecureTestPassword!42"},
+    )
+    assert admin_login.status_code == 200
+    admin_headers = {"X-CSRF-Token": admin_login.json()["csrf_token"]}
+
+    # Admin cannot deactivate their own sole admin account
+    self_disable = auth_client.patch(
+        f"/api/users/{admin.id}",
+        json={"is_active": False},
+        headers=admin_headers,
+    )
+    assert self_disable.status_code == 409
+
+    # 11. Admin creates employee account with email ID for notifications
+    created_res = auth_client.post(
+        "/api/users",
+        json={
+            "name": "Employee Two",
+            "email": "emp2@plutuswealth.com",
+            "password": "InitialPassword!42",
+        },
+        headers=admin_headers,
+    )
+    assert created_res.status_code == 201
+    emp_id = created_res.json()["id"]
+    assert created_res.json()["role"] == "EMPLOYEE"
+    assert created_res.json()["email"] == "emp2@plutuswealth.com"
+    assert "password_hash" not in created_res.json()
+
+    prefs_after_create = auth_client.get("/api/notifications/preferences")
+    assert prefs_after_create.status_code == 200
+    assert "emp2@plutuswealth.com" in prefs_after_create.json()["email_recipients"]
+
+    # 12. Admin resets employee password and gets one-time temporary password
+    reset_res = auth_client.post(
+        f"/api/users/{emp_id}/reset-password",
+        headers=admin_headers,
+    )
+    assert reset_res.status_code == 200
+    temp_password = reset_res.json()["temporary_password"]
+    assert len(temp_password) >= 12
+
+    # Employee logs in with temporary password and changes their own password (13)
+    emp_login = auth_client.post(
+        "/api/auth/login",
+        json={"name": "employee two", "password": temp_password},
+    )
+    assert emp_login.status_code == 200
+    emp_headers = {"X-CSRF-Token": emp_login.json()["csrf_token"]}
+
+    change_res = auth_client.post(
+        "/api/auth/change-password",
+        json={
+            "current_password": temp_password,
+            "new_password": "UpdatedEmployeePwd!99",
+        },
+        headers=emp_headers,
+    )
+    assert change_res.status_code == 200
+    emp_headers = {"X-CSRF-Token": change_res.json()["csrf_token"]}
+
+    # Employee uploads file and submits for approval; employee cannot reject or approve
+    preview = auth_client.post(
+        "/api/imports/preview",
+        data={
+            "header_row": "1",
+            "exchange_column": "A",
+            "symbol_column": "B",
+            "name_column": "C",
+            "base_target_column": "D",
+        },
+        files={
+            "file": (
+                "reject_me.csv",
+                "Exchange,Symbol,Company,Base\nNSE,REJCO,Reject Co,90\n",
+                "text/csv",
+            )
+        },
+        headers=emp_headers,
+    ).json()
+    assert (
+        auth_client.post(
+            f"/api/imports/{preview['id']}/reject", headers=emp_headers
+        ).status_code
+        == 403
+    )
+
+    # Admin logs back in, rejects upload (9), and deactivates employee (11)
+    admin_relogin = auth_client.post(
+        "/api/auth/login",
+        json={"name": admin.name, "password": "SecureTestPassword!42"},
+    )
+    admin_headers = {"X-CSRF-Token": admin_relogin.json()["csrf_token"]}
+    rejected = auth_client.post(
+        f"/api/imports/{preview['id']}/reject",
+        headers=admin_headers,
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    with TestSession() as session:
+        rejected_batch = session.get(ImportBatch, preview["id"])
+        assert rejected_batch is not None
+        assert rejected_batch.rejector_user_id == admin.id
+
+    deactivated = auth_client.patch(
+        f"/api/users/{emp_id}",
+        json={"is_active": False},
+        headers=admin_headers,
+    )
+    assert deactivated.status_code == 200
+    assert deactivated.json()["is_active"] is False
+
+    # Activity log records actions
+    activity_res = auth_client.get("/api/activity")
+    assert activity_res.status_code == 200
+    actions = {entry["action"] for entry in activity_res.json()}
+    assert "employee_created" in actions
+    assert "employee_password_reset" in actions
+    assert "password_changed" in actions
+    assert "import_rejected" in actions
+
+
+def test_monitoring_works_without_browser_session_and_preserves_existing_portfolio(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.prices import NseBseExchangeCalendar
+
+    monkeypatch.setenv("ALERT_RULES_ENABLED", "true")
+    market_open_utc = datetime(2026, 11, 3, 4, 30, tzinfo=timezone.utc)
+
+    # 16. Pre-existing portfolio company in database before any user logs in
+    with TestSession() as session:
+        company = Company(
+            exchange="NSE",
+            symbol="LEGACY",
+            name="Legacy Portfolio Co",
+            cmp=Decimal("200.00"),
+            base_target=Decimal("190.00"),
+            bull_target=Decimal("230.00"),
+            base_direction="below",
+            bull_direction="above",
+            version=1,
+        )
+        session.add(company)
+        session.flush()
+        session.add(
+            TargetRevision(
+                exchange="NSE",
+                symbol="LEGACY",
+                version=1,
+                base_target=company.base_target,
+                bull_target=company.bull_target,
+                base_direction="below",
+                bull_direction="above",
+                source="import",
+                changed_at=market_open_utc,
+            )
+        )
+        session.commit()
+
+    # 15. Background monitoring worker runs with NO logged-in browser session
+    class WorkerTestProvider:
+        name = "worker-headless-provider"
+        is_simulated = False
+
+        def fetch_quote(self, exchange: str, symbol: str) -> ProviderQuote:
+            return ProviderQuote(
+                exchange=exchange,
+                symbol=symbol,
+                price=Decimal("185.00"),
+                currency="INR",
+                provider=self.name,
+                quoted_at=market_open_utc,
+                is_simulated=False,
+            )
+
+    poll_result = poll_once(
+        WorkerTestProvider(),
+        NseBseExchangeCalendar(),
+        now=market_open_utc + timedelta(seconds=2),
+        session_factory=TestSession,
+    )
+    assert poll_result.attempted == 1
+    assert poll_result.recorded == 1
+
+    # Employee logs in and sees the preserved shared portfolio and triggered alert (6, 15, 16)
+    employee = _insert_user("Viewer Employee")
+    login = auth_client.post(
+        "/api/auth/login",
+        json={"name": employee.name, "password": "SecureTestPassword!42"},
+    )
+    assert login.status_code == 200
+    companies = auth_client.get("/api/companies").json()
+    assert len(companies) == 1
+    assert companies[0]["symbol"] == "LEGACY"
+    assert companies[0]["alert_status"] == "base_triggered"
+    alerts = auth_client.get("/api/alerts").json()
+    assert len(alerts) == 1
+    assert alerts[0]["symbol"] == "LEGACY"
 
 
 def test_live_price_feed_and_alerts_are_disabled_until_configured(
@@ -747,6 +1180,7 @@ def test_target_alerts_and_quotes_persist_after_database_restart(tmp_path: Path)
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = _override_admin
     try:
         with TestClient(app) as restarted_client:
             history = restarted_client.get("/api/companies/NSE/PRICE/history")
@@ -1125,7 +1559,9 @@ def test_confirmed_import_and_history_survive_database_reopen() -> None:
                 yield session
 
         previous_override = app.dependency_overrides.get(get_db)
+        previous_auth_override = app.dependency_overrides.get(get_current_user)
         app.dependency_overrides[get_db] = file_database
+        app.dependency_overrides[get_current_user] = _override_admin
         try:
             with TestClient(app) as persistent_client:
                 preview = csv_upload(
@@ -1141,6 +1577,10 @@ def test_confirmed_import_and_history_survive_database_reopen() -> None:
                 app.dependency_overrides.pop(get_db, None)
             else:
                 app.dependency_overrides[get_db] = previous_override
+            if previous_auth_override is None:
+                app.dependency_overrides.pop(get_current_user, None)
+            else:
+                app.dependency_overrides[get_current_user] = previous_auth_override
             database_engine.dispose()
 
         reopened_engine = create_engine(f"sqlite:///{path.as_posix()}")

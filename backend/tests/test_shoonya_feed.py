@@ -5,12 +5,14 @@ from decimal import Decimal
 from typing import Any, Callable
 
 import pytest
+from fastapi import Depends
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.database import Base
-from app.models import Company, NotificationOutbox, PriceQuote, TargetAlert, TargetRevision, WorkerHeartbeat
+from app.database import Base, get_db
+from app.models import Company, NotificationOutbox, PriceQuote, TargetAlert, TargetRevision, User, WorkerHeartbeat
+from app.security import get_current_user
 from app.shoonya_feed import (
     ShoonyaAuthError,
     ShoonyaConfig,
@@ -569,7 +571,23 @@ def test_sse_live_stream_emits_price_tick_distance_metrics_and_outbox_alert() ->
         )
 
     previous_override = app.dependency_overrides.get(get_db)
+    previous_auth_override = app.dependency_overrides.get(get_current_user)
     app.dependency_overrides[get_db] = override_get_db
+
+    def test_admin() -> User:
+        now = datetime.now(timezone.utc)
+        return User(
+            id=1,
+            name="Test Administrator",
+            normalized_name="test administrator",
+            password_hash="test-hash-not-used",
+            role="ADMIN",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+
+    app.dependency_overrides[get_current_user] = test_admin
     try:
         with TestClient(app) as client:
             res = client.get(
@@ -589,6 +607,10 @@ def test_sse_live_stream_emits_price_tick_distance_metrics_and_outbox_alert() ->
             app.dependency_overrides.pop(get_db, None)
         else:
             app.dependency_overrides[get_db] = previous_override
+        if previous_auth_override is None:
+            app.dependency_overrides.pop(get_current_user, None)
+        else:
+            app.dependency_overrides[get_current_user] = previous_auth_override
 
 
 def test_shoonya_provider_disabled_by_default_fails_fast_without_opt_in(

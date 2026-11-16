@@ -20,6 +20,7 @@ from .models import (
     NotificationPreference,
     TargetAlert,
     TargetRevision,
+    User,
 )
 
 logger = logging.getLogger("portfolio.notifications")
@@ -739,6 +740,34 @@ def get_or_create_preferences(session: Session) -> NotificationPreference:
     return pref
 
 
+def collect_alert_email_recipients(
+    session: Session,
+    pref: NotificationPreference | None = None,
+) -> list[str]:
+    """Return deduplicated list of email recipients combining Settings preferences and active User emails."""
+    active_pref = pref if pref is not None else get_or_create_preferences(session)
+    seen: set[str] = set()
+    recipients: list[str] = []
+    for raw in list(active_pref.email_recipients or []):
+        addr = str(raw).strip()
+        lower = addr.lower()
+        if addr and "@" in addr and lower not in seen:
+            seen.add(lower)
+            recipients.append(addr)
+    user_emails = session.scalars(
+        select(User.email).where(User.is_active.is_(True), User.email.is_not(None))
+    ).all()
+    for raw in user_emails:
+        if not raw:
+            continue
+        addr = str(raw).strip()
+        lower = addr.lower()
+        if addr and "@" in addr and lower not in seen:
+            seen.add(lower)
+            recipients.append(addr)
+    return recipients
+
+
 def create_dry_run_outbox(
     session: Session,
     target_alert: TargetAlert,
@@ -814,13 +843,14 @@ def queue_alert_notifications(
         session.add(dash_row)
         queued.append(dash_row)
 
-    if pref.email_enabled and pref.email_recipients:
+    email_recipients = collect_alert_email_recipients(session, pref)
+    if pref.email_enabled and email_recipients:
         email_id = str(uuid.uuid4())
         email_row = NotificationOutbox(
             id=email_id,
             target_alert_id=target_alert.id,
             channel="email",
-            destination=",".join(pref.email_recipients),
+            destination=",".join(email_recipients),
             delivery_mode="live",
             status="queued",
             attempts=0,

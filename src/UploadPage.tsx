@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import {
   confirmImport,
+  fetchImportBatch,
   fetchImportHistory,
   inspectImport,
   previewImport,
@@ -31,6 +32,7 @@ import type {
   ImportPreviewRow,
   TargetDirection,
 } from "./types";
+import type { UserRole } from "./authService";
 
 type MappingFields = Omit<ImportMapping, "sheet_name" | "header_row">;
 
@@ -60,16 +62,20 @@ const money = (value: number) =>
 export default function UploadPage({
   onCompleted,
   onNavigatePortfolio,
+  role,
+  userName,
 }: {
-  onCompleted: () => void;
+  onCompleted: (approved: boolean) => void;
   onNavigatePortfolio?: () => void;
+  role: UserRole;
+  userName: string;
 }) {
+  const isAdmin = role === "ADMIN";
   const [file, setFile] = useState<File | null>(null);
   const [inspection, setInspection] = useState<ImportInspection | null>(null);
   const [sheetName, setSheetName] = useState("");
   const [headerRow, setHeaderRow] = useState(1);
   const [mapping, setMapping] = useState<MappingFields>(emptyMapping);
-  const [uploadedBy, setUploadedBy] = useState("Srushti Kadam");
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [editingRowNumber, setEditingRowNumber] = useState<number | null>(null);
   const [rowDraft, setRowDraft] = useState<{
@@ -208,7 +214,6 @@ export default function UploadPage({
     const requestMapping: ImportMapping = {
       sheet_name: selectedSheet,
       header_row: selectedRow,
-      uploaded_by: uploadedBy || "Srushti Kadam",
       ...(activeMapping.exchange_column ? { exchange_column: activeMapping.exchange_column } : {}),
       ...(activeMapping.symbol_column ? { symbol_column: activeMapping.symbol_column } : {}),
       ...(activeMapping.name_column ? { name_column: activeMapping.name_column } : {}),
@@ -335,7 +340,6 @@ export default function UploadPage({
         bull_target: rowDraft.bull_target.trim() === "" ? null : Number(rowDraft.bull_target),
         base_direction: rowDraft.base_direction,
         bull_direction: rowDraft.bull_direction,
-        approval_status: "approved",
       });
       setPreview(updated);
       setEditingRowNumber(null);
@@ -363,14 +367,29 @@ export default function UploadPage({
     setIsConfirming(true);
     setError("");
     try {
-      const result = await confirmImport(preview.id, reviewedCachedTargets, uploadedBy || "Portfolio Admin");
-      setPreview({ ...preview, status: "confirmed", result, version_number: result.version_number });
+      const result = await confirmImport(preview.id, reviewedCachedTargets);
+      setPreview({ ...preview, status: result.status, result, version_number: result.version_number });
       await loadImportHistory();
-      onCompleted();
+      onCompleted(result.status === "confirmed");
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Could not confirm this import.");
     } finally {
       setIsConfirming(false);
+    }
+  };
+
+  const reviewImport = async (batchId: string) => {
+    setError("");
+    try {
+      const batch = await fetchImportBatch(batchId);
+      setPreview(batch);
+      setFile(null);
+      setInspection(null);
+      setEditingRowNumber(null);
+      setRowDraft(null);
+      setReviewedCachedTargets(!batch.formula_review_required);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Could not load import for review.");
     }
   };
 
@@ -391,7 +410,7 @@ export default function UploadPage({
     try {
       await restoreImportVersion(batchId);
       await loadImportHistory();
-      onCompleted();
+      onCompleted(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not restore version.");
     } finally {
@@ -423,7 +442,7 @@ export default function UploadPage({
   );
   const canApprove = Boolean(
     preview &&
-      preview.status === "preview" &&
+      (preview.status === "preview" || (isAdmin && preview.status === "pending_approval")) &&
       !isConfirming &&
       activeRows.length > 0 &&
       errorCount === 0 &&
@@ -435,9 +454,11 @@ export default function UploadPage({
       <div className="page-heading">
         <div>
           <div className="eyebrow">DATA MANAGEMENT · VERSION-CONTROLLED WORKFLOW</div>
-          <h1>Upload → Parse → Preview → Validate → Approve → Monitor</h1>
+          <h1>{isAdmin ? "Upload → Review → Approve → Monitor" : "Upload → Preview → Submit for Approval"}</h1>
           <p>
-            Upload an Excel (.xlsx) or CSV sheet to add stocks and target rules. Only approved Excel uploads add companies to the dashboard.
+            {isAdmin
+              ? "Review employee submissions or upload a workbook; only approved records update the shared portfolio."
+              : "Upload an Excel or CSV workbook for administrator review. The shared portfolio changes only after approval."}
           </p>
         </div>
         <div className="heading-actions">
@@ -597,14 +618,6 @@ export default function UploadPage({
                       }}
                     />
                   </label>
-                  <label className="mapping-field">
-                    <span>Uploaded by</span>
-                    <input
-                      type="text"
-                      value={uploadedBy}
-                      onChange={(event) => setUploadedBy(event.target.value)}
-                    />
-                  </label>
                   <button
                     className="button secondary"
                     type="button"
@@ -680,10 +693,10 @@ export default function UploadPage({
             <section className="card import-preview">
               <div className="section-head">
                 <div>
-                  <h2>2. Preview, Edit & Approve Extracted Records</h2>
+                  <h2>2. {isAdmin ? "Review & Approve Extracted Records" : "Preview & Edit Extracted Records"}</h2>
                   <p>
                     {preview.filename} · {activeRows.length} active rows ({preview.rows.length} total) ·
-                    Only approved rows will be added to live monitoring.
+                    {isAdmin ? " Only approved rows enter live monitoring." : " Submission remains pending until administrator approval."}
                   </p>
                 </div>
                 <div className="row-actions">
@@ -696,7 +709,7 @@ export default function UploadPage({
                       </>
                     )}
                   </span>
-                  {preview.status === "preview" && (
+                  {canApprove && (
                     <button
                       className="button primary small"
                       type="button"
@@ -706,7 +719,9 @@ export default function UploadPage({
                       <Check size={13} />{" "}
                       {isConfirming
                         ? "Approving…"
-                        : `Approve & Add ${activeRows.length} Stock(s)`}
+                        : isAdmin
+                          ? `Approve & Add ${activeRows.length} Stock(s)`
+                          : `Submit ${activeRows.length} Stock(s) for Approval`}
                     </button>
                   )}
                 </div>
@@ -936,7 +951,7 @@ export default function UploadPage({
                                       Cancel
                                     </button>
                                   </>
-                                ) : (
+                                ) : (preview.status === "preview" || (isAdmin && preview.status === "pending_approval")) ? (
                                   <>
                                     <button
                                       className="icon-button"
@@ -945,13 +960,17 @@ export default function UploadPage({
                                     >
                                       <Edit3 size={14} />
                                     </button>
-                                    <button
-                                      className="button secondary small"
-                                      onClick={() => void toggleRowApproval(row)}
-                                    >
-                                      {isRejected ? "Approve" : "Reject"}
-                                    </button>
+                                    {isAdmin && (
+                                      <button
+                                        className="button secondary small"
+                                        onClick={() => void toggleRowApproval(row)}
+                                      >
+                                        {isRejected ? "Approve" : "Reject"}
+                                      </button>
+                                    )}
                                   </>
+                                ) : (
+                                  <span className="cell-sub">{row.approval_status ?? preview.status}</span>
                                 )}
                               </div>
                             )}
@@ -980,7 +999,13 @@ export default function UploadPage({
                 </p>
               )}
 
-              {preview.result && (
+              {preview.result?.status === "pending_approval" && (
+                <div className="preview-note" role="status">
+                  Submitted by {userName}. The shared portfolio remains unchanged until an administrator approves this upload.
+                </div>
+              )}
+
+              {preview.result?.status === "confirmed" && (
                 <div className="preview-note" role="status">
                   <span>
                     Import Version v{preview.result.version_number ?? preview.version_number ?? 1} Approved:{" "}
@@ -1001,21 +1026,19 @@ export default function UploadPage({
               )}
 
               <div className="upload-actions">
-                <button
-                  className="button primary"
-                  type="button"
-                  disabled={!canApprove}
-                  onClick={() => void confirm()}
-                >
-                  {isConfirming ? (
-                    "Approving…"
-                  ) : (
-                    <>
-                      <Check size={14} /> Approve Import & Start Monitoring ({activeRows.length} companies)
-                    </>
-                  )}
-                </button>
-                {preview.status === "preview" && (
+                {canApprove && (
+                  <button
+                    className="button primary"
+                    type="button"
+                    disabled={!canApprove}
+                    onClick={() => void confirm()}
+                  >
+                    {isConfirming ? "Saving…" : isAdmin
+                      ? `Approve Import & Start Monitoring (${activeRows.length} companies)`
+                      : `Submit ${activeRows.length} companies for approval`}
+                  </button>
+                )}
+                {isAdmin && (preview.status === "preview" || preview.status === "pending_approval") && (
                   <button
                     className="button secondary"
                     type="button"
@@ -1035,8 +1058,8 @@ export default function UploadPage({
           <section className="card import-history-card">
             <div className="section-head">
               <div>
-                <h2>3. Import Version History & Rollback</h2>
-                <p>Review previous Excel uploads, target changes, and restore any earlier approved version.</p>
+                <h2>3. {isAdmin ? "Import Review & Version History" : "My Import History"}</h2>
+                <p>{isAdmin ? "Review submissions and restore approved versions." : "Track your uploads and approval status."}</p>
               </div>
               <History size={16} className="muted-icon" />
             </div>
@@ -1053,7 +1076,7 @@ export default function UploadPage({
                       <th>Timestamp</th>
                       <th>Status</th>
                       <th>Target Modifications</th>
-                      <th>Action</th>
+                      <th>{isAdmin ? "Action" : "Approval"}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1064,12 +1087,12 @@ export default function UploadPage({
                         </td>
                         <td>
                           <b>{item.filename}</b>
-                          <small className="cell-sub">{item.sheet_name || item.file_type.toUpperCase()}</small>
+                          <small className="cell-sub">{item.sheet_name || item.file_type?.toUpperCase() || "Workbook"}</small>
                         </td>
                         <td>{item.uploaded_by}</td>
                         <td>
-                          {item.confirmed_at
-                            ? new Date(item.confirmed_at).toLocaleString("en-IN")
+                          {(item.approved_at || item.confirmed_at)
+                            ? new Date((item.approved_at || item.confirmed_at)!).toLocaleString("en-IN")
                             : item.created_at
                               ? new Date(item.created_at).toLocaleString("en-IN")
                               : "—"}
@@ -1097,7 +1120,12 @@ export default function UploadPage({
                           )}
                         </td>
                         <td>
-                          {item.status === "confirmed" &&
+                          {isAdmin && item.status === "pending_approval" && (
+                            <button className="button primary small" onClick={() => void reviewImport(item.id)}>
+                              <ShieldCheck size={12} /> Review
+                            </button>
+                          )}
+                          {isAdmin && item.status === "confirmed" &&
                             item.changes_snapshot &&
                             item.changes_snapshot.length > 0 && (
                               <button

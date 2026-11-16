@@ -22,7 +22,6 @@ import {
   LayoutDashboard,
   LineChart,
   Menu,
-  MoreHorizontal,
   PanelLeftClose,
   RefreshCw,
   RotateCcw,
@@ -66,6 +65,11 @@ import {
 } from "./api";
 import BackendUploadPage from "./UploadPage";
 import { useLiveMarketStream } from "./useLiveMarketStream";
+import { useAuth } from "./AuthContext";
+import AdminRoute from "./AdminRoute";
+import AdminUsersPage from "./AdminUsersPage";
+import ActivityPage from "./ActivityPage";
+import UserProfileMenu from "./UserProfileMenu";
 import type {
   AlertEmailPreviewResponse,
   ApiAlert,
@@ -87,7 +91,9 @@ type Page =
   | "Market Activity"
   | "Reports"
   | "Upload Excel"
-  | "Settings";
+  | "Settings"
+  | "Admin Users"
+  | "Activity";
 
 const nav: Array<{ label: Page; icon: typeof LayoutDashboard; group?: string }> = [
   { label: "Overview", icon: LayoutDashboard, group: "WORKSPACE" },
@@ -97,6 +103,8 @@ const nav: Array<{ label: Page; icon: typeof LayoutDashboard; group?: string }> 
   { label: "Market Activity", icon: Activity },
   { label: "Reports", icon: LineChart, group: "TOOLS" },
   { label: "Upload Excel", icon: Upload },
+  { label: "Admin Users", icon: Users, group: "ADMINISTRATION" },
+  { label: "Activity", icon: Activity },
   { label: "Settings", icon: Settings, group: "PREFERENCES" },
 ];
 
@@ -184,6 +192,8 @@ function playAlertChime(isBull: boolean) {
 }
 
 export default function App() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "ADMIN";
   const [page, setPage] = useState<Page>("Overview");
   const [portfolioCompanies, setPortfolioCompanies] = useState<PortfolioCompany[]>([]);
   const [portfolioStatus, setPortfolioStatus] = useState<"loading" | "ready" | "error">("loading");
@@ -274,7 +284,7 @@ export default function App() {
     const timer = window.setInterval(() => {
       void (async () => {
         try {
-          if (portfolioCompanies.length > 0 && workerStatus?.provider !== "shoonya") {
+          if (isAdmin && portfolioCompanies.length > 0 && workerStatus?.provider !== "shoonya") {
             await triggerOnDemandPoll().catch(() => null);
           }
           const [c, a, w] = await Promise.all([
@@ -291,7 +301,7 @@ export default function App() {
       })();
     }, 30000);
     return () => window.clearInterval(timer);
-  }, [portfolioCompanies.length, workerStatus?.provider]);
+  }, [portfolioCompanies.length, workerStatus?.provider, isAdmin]);
 
   useEffect(() => {
     if (selectedCompany) {
@@ -414,15 +424,17 @@ export default function App() {
               : workerStatus?.state === "running"
                 ? "Awaiting Quotes"
                 : "Feed Offline";
+  const visibleNav = nav.filter(
+    (item) => isAdmin || !["Settings", "Admin Users", "Activity"].includes(item.label),
+  );
 
   return (
     <div
       className={`app-shell min-h-screen ${compactTables ? "compact-tables" : ""}`}
     >
       <aside
-        className={`sidebar ${collapsed ? "sidebar-collapsed" : ""} ${
-          mobileNav ? "sidebar-mobile-open" : ""
-        }`}
+        className={`sidebar ${collapsed ? "sidebar-collapsed" : ""} ${mobileNav ? "sidebar-mobile-open" : ""
+          }`}
       >
         <div className="brand">
           <div className="brand-mark">
@@ -457,7 +469,7 @@ export default function App() {
           )}
         </div>
         <nav className="side-nav" aria-label="Main navigation">
-          {nav.map((item) => (
+          {visibleNav.map((item) => (
             <div key={item.label}>
               {item.group && !collapsed && <div className="nav-group">{item.group}</div>}
               <button
@@ -476,23 +488,12 @@ export default function App() {
         </nav>
         {!collapsed && (
           <div className="sidebar-bottom">
-            <div className="support-box">
-              <div className="support-icon">
-                <ShieldCheck size={16} />
-              </div>
-              <div>
-                <b>Monitoring Only</b>
-                <small>Zero order execution</small>
-              </div>
-              <ArrowRight size={14} />
-            </div>
             <div className="sidebar-user">
-              <div className="avatar">SK</div>
+              <div className="avatar">{user?.name.slice(0, 2).toUpperCase() ?? "U"}</div>
               <div className="user-copy">
-                <b>Srushti Kadam</b>
-                <small>Portfolio Manager</small>
+                <b>{user?.name ?? "Team Member"}</b>
               </div>
-              <MoreHorizontal size={18} />
+              <ShieldCheck size={16} />
             </div>
           </div>
         )}
@@ -563,51 +564,45 @@ export default function App() {
               <Bell size={18} />
               {activeAlertsCount > 0 && <i>{activeAlertsCount}</i>}
             </button>
-            <button
-              className="profile-button"
-              onClick={() => pickPage("Settings")}
-              aria-label="Open profile and settings"
-            >
-              <div className="avatar small-avatar">SK</div>
-              <ChevronDown size={14} />
-            </button>
+            <UserProfileMenu onManageUsers={() => pickPage("Admin Users")} />
           </div>
         </header>
 
         <main className="content-area">
-          {(portfolioStatus === "error" ||
+          {isAdmin && (portfolioStatus === "error" ||
             workerStatus?.state === "error") && (
-            <div className="feed-banner feed-error" role="alert">
-              <div className="feed-main-icon">
-                <AlertTriangle size={18} />
+              <div className="feed-banner feed-error" role="alert">
+                <div className="feed-main-icon">
+                  <AlertTriangle size={18} />
+                </div>
+                <div>
+                  <b>
+                    {portfolioStatus === "error"
+                      ? "Market Monitoring API Disconnected"
+                      : `Market Feed Warning: ${workerStatus?.last_error}`}
+                  </b>
+                  <small>
+                    Check the feed connection and worker status before relying on live market data.
+                  </small>
+                </div>
+                <div className="feed-banner-right">
+                  <button
+                    className="button primary small"
+                    onClick={() => void handlePollNow()}
+                    disabled={isPollingNow}
+                  >
+                    <RefreshCw size={13} /> {isPollingNow ? "Polling…" : "Poll Live Quotes"}
+                  </button>
+                </div>
               </div>
-              <div>
-                <b>
-                  {portfolioStatus === "error"
-                    ? "Market Monitoring API Disconnected"
-                    : `Market Feed Warning: ${workerStatus?.last_error}`}
-                </b>
-                <small>
-                  Check the feed connection and worker status before relying on live market data.
-                </small>
-              </div>
-              <div className="feed-banner-right">
-                <button
-                  className="button primary small"
-                  onClick={() => void handlePollNow()}
-                  disabled={isPollingNow}
-                >
-                  <RefreshCw size={13} /> {isPollingNow ? "Polling…" : "Poll Live Quotes"}
-                </button>
-              </div>
-            </div>
-          )}
+            )}
 
           {page === "Overview" && (
             <OverviewPage
               companies={portfolioCompanies}
               alerts={apiAlerts}
               workerStatus={workerStatus}
+              isAdmin={isAdmin}
               importHistory={importHistory}
               onSelectCompany={setSelectedCompany}
               onPage={pickPage}
@@ -632,6 +627,7 @@ export default function App() {
             <PortfolioPage
               companies={portfolioCompanies}
               requestStatus={portfolioStatus}
+              isAdmin={isAdmin}
               error={portfolioError}
               onRefresh={reloadAll}
               onPollNow={handlePollNow}
@@ -649,6 +645,7 @@ export default function App() {
               apiStatus={apiAlertStatus}
               apiError={apiAlertError}
               workerStatus={workerStatus}
+              isAdmin={isAdmin}
               onRefresh={reloadAll}
               onAction={handleAlertLifecycle}
               onDrainOutbox={handleDrainOutbox}
@@ -662,6 +659,7 @@ export default function App() {
               companies={portfolioCompanies}
               requestStatus={portfolioStatus}
               error={portfolioError}
+              isAdmin={isAdmin}
               onRefresh={reloadAll}
               onImport={() => pickPage("Upload Excel")}
               onEdit={setEditing}
@@ -676,6 +674,7 @@ export default function App() {
               workerStatus={workerStatus}
               onPollNow={handlePollNow}
               isPollingNow={isPollingNow}
+              isAdmin={isAdmin}
               onSelectCompany={setSelectedCompany}
             />
           )}
@@ -691,15 +690,17 @@ export default function App() {
 
           {page === "Upload Excel" && (
             <BackendUploadPage
-              onCompleted={() => {
+              role={user?.role ?? "EMPLOYEE"}
+              userName={user?.name ?? "Team Member"}
+              onCompleted={(approved) => {
                 reloadAll();
-                void handlePollNow();
+                if (approved && isAdmin) void handlePollNow();
               }}
               onNavigatePortfolio={() => pickPage("Portfolio")}
             />
           )}
 
-          {page === "Settings" && (
+          {page === "Settings" && isAdmin && (
             <SettingsPage
               compactTables={compactTables}
               setCompactTables={setCompactTables}
@@ -710,6 +711,9 @@ export default function App() {
               onPreviewTestEmail={handleOpenTestPreview}
             />
           )}
+
+          {page === "Admin Users" && <AdminRoute><AdminUsersPage /></AdminRoute>}
+          {page === "Activity" && <AdminRoute><ActivityPage /></AdminRoute>}
         </main>
 
         <footer className="app-footer">
@@ -729,6 +733,7 @@ export default function App() {
             onClose={() => setDrawer(false)}
             onAction={handleAlertLifecycle}
             onPreviewEmail={(item) => setEmailPreviewItem(item)}
+            isAdmin={isAdmin}
           />
         )}
       </AnimatePresence>
@@ -762,6 +767,7 @@ export default function App() {
               setEditing(selectedCompany);
             }}
             onAction={handleAlertLifecycle}
+            isAdmin={isAdmin}
           />
         )}
       </AnimatePresence>
@@ -971,6 +977,7 @@ function OverviewPage({
   onRestoreVersion,
   onResetWorkspace,
   search,
+  isAdmin,
 }: {
   companies: PortfolioCompany[];
   alerts: ApiAlert[];
@@ -983,6 +990,7 @@ function OverviewPage({
   onRestoreVersion: (id: string) => Promise<void>;
   onResetWorkspace: () => Promise<void>;
   search: string;
+  isAdmin: boolean;
 }) {
   const activeMonitoringCount = companies.filter(
     (c) => c.is_approved !== false && c.monitoring_active !== false,
@@ -993,9 +1001,10 @@ function OverviewPage({
   const bullAlertsCount = companies.filter(
     (c) => c.alert_status === "bull_triggered" || c.alert_status === "both_triggered",
   ).length;
+  const pendingApprovals = importHistory.filter((b) => b.status === "pending_approval");
   const pendingConfigCount =
     companies.filter((c) => c.alert_status === "pending_configuration").length +
-    importHistory.filter((b) => b.status === "preview").length;
+    importHistory.filter((b) => b.status === "preview" || b.status === "pending_approval").length;
   const freshQuotesCount = companies.filter(
     (c) =>
       c.latest_quote != null &&
@@ -1041,7 +1050,7 @@ function OverviewPage({
         description="Real-time NSE & BSE price monitoring, configurable Base/Bull target alerts, and feed telemetry."
         action={
           <div className="heading-actions">
-            {(companies.length > 0 || importHistory.length > 0) && (
+            {isAdmin && (companies.length > 0 || importHistory.length > 0) && (
               <button
                 className="button secondary destructive"
                 onClick={() => void onResetWorkspace()}
@@ -1049,19 +1058,48 @@ function OverviewPage({
                 <RotateCcw size={14} /> Clear All Data
               </button>
             )}
-            <button
+            {isAdmin && <button
               className="button secondary"
               onClick={() => void onPollNow()}
               disabled={isPollingNow || companies.length === 0}
             >
               <RefreshCw size={14} /> {isPollingNow ? "Polling Quotes…" : "Poll Live Quotes"}
-            </button>
+            </button>}
+            {isAdmin && (
+              <button className="button secondary" onClick={() => onPage("Admin Users")}>
+                <Users size={14} /> Manage Team Users
+              </button>
+            )}
             <button className="button primary" onClick={() => onPage("Upload Excel")}>
               <Upload size={14} /> Upload Excel Targets
             </button>
           </div>
         }
       />
+
+      {isAdmin && pendingApprovals.length > 0 && (
+        <div className="feed-banner" role="status" style={{ marginBottom: 16 }}>
+          <div className="feed-main-icon">
+            <FileSpreadsheet size={18} />
+          </div>
+          <div>
+            <b>
+              {pendingApprovals.length} Employee Excel Upload{pendingApprovals.length === 1 ? "" : "s"} Pending Admin Approval
+            </b>
+            <small>
+              Uploaded by {pendingApprovals.map((b) => b.uploaded_by).join(", ")} · Review and approve to update the shared portfolio.
+            </small>
+          </div>
+          <div className="feed-banner-right">
+            <button
+              className="button primary small"
+              onClick={() => onPage("Upload Excel")}
+            >
+              <ShieldCheck size={13} /> Review Pending Uploads
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="metric-grid">
         <MetricCard
@@ -1134,9 +1172,8 @@ function OverviewPage({
               alerts.slice(0, 6).map((alert) => (
                 <div className="activity-row" key={alert.id}>
                   <span
-                    className={`activity-marker ${
-                      alert.target_kind === "bull" ? "marker-red" : "marker-green"
-                    }`}
+                    className={`activity-marker ${alert.target_kind === "bull" ? "marker-red" : "marker-green"
+                      }`}
                   >
                     <Zap size={12} />
                   </span>
@@ -1242,7 +1279,7 @@ function OverviewPage({
                       {batch.status.toUpperCase()} · {batch.uploaded_by}
                     </small>
                   </div>
-                  {batch.status === "confirmed" &&
+                  {isAdmin && batch.status === "confirmed" &&
                     batch.changes_snapshot &&
                     batch.changes_snapshot.length > 0 && (
                       <button
@@ -1366,9 +1403,8 @@ function MonitoringTable({
                       <small>
                         {company.symbol} ·{" "}
                         <span
-                          className={`exchange-tag ${
-                            company.exchange === "BSE" ? "bse-tag" : ""
-                          }`}
+                          className={`exchange-tag ${company.exchange === "BSE" ? "bse-tag" : ""
+                            }`}
                         >
                           {company.exchange}
                         </span>{" "}
@@ -1392,9 +1428,8 @@ function MonitoringTable({
                         </span>
                       )}
                       <small
-                        className={`quote-freshness ${
-                          freshnessUnknown || isStale ? "quote-warning" : ""
-                        }`}
+                        className={`quote-freshness ${freshnessUnknown || isStale ? "quote-warning" : ""
+                          }`}
                       >
                         {freshnessUnknown
                           ? "⚠ Freshness unknown"
@@ -1492,9 +1527,8 @@ function MonitoringTable({
                     <small>
                       {company.symbol} ·{" "}
                       <span
-                        className={`exchange-tag ${
-                          company.exchange === "BSE" ? "bse-tag" : ""
-                        }`}
+                        className={`exchange-tag ${company.exchange === "BSE" ? "bse-tag" : ""
+                          }`}
                       >
                         {company.exchange}
                       </span>
@@ -1509,9 +1543,8 @@ function MonitoringTable({
                   <small>Latest Price</small>
                   <b>{quote ? money(quote.price) : "Awaiting quote"}</b>
                   <span
-                    className={`cell-sub ${
-                      freshnessUnknown || isStale ? "quote-warning" : ""
-                    }`}
+                    className={`cell-sub ${freshnessUnknown || isStale ? "quote-warning" : ""
+                      }`}
                   >
                     {quote
                       ? freshnessUnknown
@@ -1578,6 +1611,7 @@ function PortfolioPage({
   onRefresh,
   onPollNow,
   isPollingNow,
+  isAdmin,
   onSelectCompany,
   search,
   onSearchChange,
@@ -1588,6 +1622,7 @@ function PortfolioPage({
   onRefresh: () => void;
   onPollNow: () => Promise<void>;
   isPollingNow: boolean;
+  isAdmin: boolean;
   onSelectCompany: (c: PortfolioCompany) => void;
   onEditCompany: (c: PortfolioCompany) => void;
   search: string;
@@ -1661,13 +1696,13 @@ function PortfolioPage({
         description={`${companies.length} monitored companies · Click any company row for detailed target configuration, price history, and Excel cell lineage.`}
         action={
           <div className="heading-actions">
-            <button
+            {isAdmin && <button
               className="button secondary"
               onClick={() => void onPollNow()}
               disabled={isPollingNow}
             >
               <Activity size={14} /> {isPollingNow ? "Polling Live Feed…" : "Poll Live Quotes Now"}
-            </button>
+            </button>}
             <button
               className="button primary"
               onClick={onRefresh}
@@ -1780,6 +1815,7 @@ function AlertsPage({
   apiStatus,
   apiError,
   workerStatus,
+  isAdmin,
   onRefresh,
   onAction,
   onDrainOutbox,
@@ -1790,6 +1826,7 @@ function AlertsPage({
   apiStatus: "loading" | "ready" | "error";
   apiError: string;
   workerStatus: WorkerStatus | null;
+  isAdmin: boolean;
   onRefresh: () => void;
   onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
   onDrainOutbox: () => Promise<void>;
@@ -1851,7 +1888,7 @@ function AlertsPage({
             >
               <Bell size={14} /> Preview Alert Email
             </button>
-            {activeAlerts.length > 0 && (
+            {isAdmin && activeAlerts.length > 0 && (
               <button
                 className="button secondary"
                 onClick={() => {
@@ -1861,13 +1898,15 @@ function AlertsPage({
                 <CheckCheck size={14} /> Acknowledge All ({activeAlerts.length})
               </button>
             )}
-            <button
-              className="button secondary"
-              onClick={() => void handleDrain()}
-              disabled={draining}
-            >
-              <Zap size={14} /> {draining ? "Draining Outbox…" : "Drain / Retry Outbox"}
-            </button>
+            {isAdmin && (
+              <button
+                className="button secondary"
+                onClick={() => void handleDrain()}
+                disabled={draining}
+              >
+                <Zap size={14} /> {draining ? "Draining Outbox…" : "Drain / Retry Outbox"}
+              </button>
+            )}
             <button
               className="button primary"
               onClick={onRefresh}
@@ -2057,13 +2096,12 @@ function AlertsPage({
                       </td>
                       <td>
                         <span
-                          className={`email-status ${
-                            alert.delivery_status === "failed"
-                              ? "disabled"
-                              : alert.delivery_status === "sent"
-                                ? "delivered"
-                                : "queued"
-                          }`}
+                          className={`email-status ${alert.delivery_status === "failed"
+                            ? "disabled"
+                            : alert.delivery_status === "sent"
+                              ? "delivered"
+                              : "queued"
+                            }`}
                         >
                           <i />
                           {alert.delivery_label} ({alert.attempts}/{alert.max_attempts})
@@ -2084,7 +2122,7 @@ function AlertsPage({
                       </td>
                       <td>
                         <div className="row-actions">
-                          {active && (
+                          {isAdmin && active && (
                             <button
                               className="button primary small"
                               title="Acknowledge this alert"
@@ -2093,13 +2131,15 @@ function AlertsPage({
                               Acknowledge
                             </button>
                           )}
-                          <button
-                            className="button secondary small"
-                            title="Re-dispatch notification via configured channels"
-                            onClick={() => void onResendAlert(alert.id)}
-                          >
-                            Resend
-                          </button>
+                          {isAdmin && (
+                            <button
+                              className="button secondary small"
+                              title="Re-dispatch notification via configured channels"
+                              onClick={() => void onResendAlert(alert.id)}
+                            >
+                              Resend
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -2132,6 +2172,7 @@ function TargetManagement({
   onEdit,
   onSelectCompany,
   search,
+  isAdmin,
 }: {
   companies: PortfolioCompany[];
   requestStatus: "loading" | "ready" | "error";
@@ -2141,6 +2182,7 @@ function TargetManagement({
   onEdit: (company: PortfolioCompany) => void;
   onSelectCompany: (company: PortfolioCompany) => void;
   search: string;
+  isAdmin: boolean;
 }) {
   const [auditIdentity, setAuditIdentity] = useState("");
   const [auditDetails, setAuditDetails] = useState<CompanyDetailsResponse | null>(null);
@@ -2280,12 +2322,14 @@ function TargetManagement({
                     </td>
                     <td>v{company.version}</td>
                     <td>
-                      <button
-                        className="button tiny secondary"
-                        onClick={() => onEdit(company)}
-                      >
-                        Configure <ArrowRight size={12} />
-                      </button>
+                      {isAdmin && (
+                        <button
+                          className="button tiny secondary"
+                          onClick={() => onEdit(company)}
+                        >
+                          Configure <ArrowRight size={12} />
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -2383,12 +2427,14 @@ function MarketActivityPage({
   workerStatus,
   onPollNow,
   isPollingNow,
+  isAdmin,
   onSelectCompany,
 }: {
   companies: PortfolioCompany[];
   workerStatus: WorkerStatus | null;
   onPollNow: () => Promise<void>;
   isPollingNow: boolean;
+  isAdmin: boolean;
   onSelectCompany: (c: PortfolioCompany) => void;
 }) {
   const freshnessUnknownList = companies.filter((c) =>
@@ -2410,14 +2456,16 @@ function MarketActivityPage({
         title="Market Feed Health & Reliability"
         description="Real-time connection telemetry, last quote timestamps, stale-price detection, and NSE/BSE polling status."
         action={
-          <button
-            className="button secondary"
-            onClick={() => void onPollNow()}
-            disabled={isPollingNow}
-          >
-            <RefreshCw size={14} />{" "}
-            {isPollingNow ? "Polling Market Feed…" : "Poll Live Quotes Now"}
-          </button>
+          isAdmin ? (
+            <button
+              className="button secondary"
+              onClick={() => void onPollNow()}
+              disabled={isPollingNow}
+            >
+              <RefreshCw size={14} />{" "}
+              {isPollingNow ? "Polling Market Feed…" : "Poll Live Quotes Now"}
+            </button>
+          ) : undefined
         }
       />
 
@@ -2478,8 +2526,8 @@ function MarketActivityPage({
             </div>
           </div>
           {staleList.length === 0 &&
-          freshnessUnknownList.length === 0 &&
-          missingQuoteList.length === 0 ? (
+            freshnessUnknownList.length === 0 &&
+            missingQuoteList.length === 0 ? (
             <p className="empty-copy">
               All monitored symbols have fresh validated market quotes.
             </p>
@@ -2845,8 +2893,7 @@ function SettingsPage({
             )}
             {row(
               "Background Monitoring Service",
-              `Provider: ${workerStatus?.provider ?? "unknown"} · Calendar: ${
-                workerStatus?.exchange_calendar ?? "unknown"
+              `Provider: ${workerStatus?.provider ?? "unknown"} · Calendar: ${workerStatus?.exchange_calendar ?? "unknown"
               }`,
               <span className="local-only-tag">
                 {workerStatus?.state?.toUpperCase() ?? "STOPPED"}
@@ -2872,11 +2919,13 @@ function NotificationDrawer({
   onClose,
   onAction,
   onPreviewEmail,
+  isAdmin,
 }: {
   alerts: ApiAlert[];
   onClose: () => void;
   onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
   onPreviewEmail: (alert: ApiAlert) => void;
+  isAdmin: boolean;
 }) {
   const [unreadOnly, setUnreadOnly] = useState(false);
   const unreadAlerts = alerts.filter(isAlertActive);
@@ -2925,14 +2974,16 @@ function NotificationDrawer({
           >
             Active <span>{unreadAlerts.length}</span>
           </button>
-          <button
-            className="mark-all"
-            onClick={() =>
-              unreadAlerts.forEach((a) => void onAction(a.id, "acknowledge"))
-            }
-          >
-            <CheckCheck size={13} /> Acknowledge all
-          </button>
+          {isAdmin && (
+            <button
+              className="mark-all"
+              onClick={() =>
+                unreadAlerts.forEach((a) => void onAction(a.id, "acknowledge"))
+              }
+            >
+              <CheckCheck size={13} /> Acknowledge all
+            </button>
+          )}
         </div>
         <div className="drawer-content">
           {visibleAlerts.length ? (
@@ -2953,9 +3004,8 @@ function NotificationDrawer({
                   key={a.id}
                 >
                   <div
-                    className={`drawer-alert-icon ${
-                      a.target_kind === "bull" ? "alert-red" : "alert-green"
-                    }`}
+                    className={`drawer-alert-icon ${a.target_kind === "bull" ? "alert-red" : "alert-green"
+                      }`}
                   >
                     <Zap size={14} />
                   </div>
@@ -2986,7 +3036,7 @@ function NotificationDrawer({
                       <button onClick={() => onPreviewEmail(a)}>
                         View Email
                       </button>
-                      {isNew && (
+                      {isAdmin && isNew && (
                         <button onClick={() => void onAction(a.id, "acknowledge")}>
                           Acknowledge
                         </button>
@@ -3141,9 +3191,8 @@ function EmailPreviewModal({
         {viewMode === "rendered" ? (
           <div className="email-preview-card">
             <div
-              className={`email-preview-banner ${
-                isBase ? "email-preview-banner-base" : "email-preview-banner-bull"
-              }`}
+              className={`email-preview-banner ${isBase ? "email-preview-banner-base" : "email-preview-banner-bull"
+                }`}
             >
               <div>
                 <span className={`status-badge ${isBase ? "badge-buy" : "badge-sell"}`}>
@@ -3230,11 +3279,13 @@ function DetailPanel({
   onClose,
   onEditTargets,
   onAction,
+  isAdmin,
 }: {
   company: PortfolioCompany;
   onClose: () => void;
   onEditTargets: () => void;
   onAction: (id: number, action: "acknowledge" | "resolve" | "reset") => Promise<void>;
+  isAdmin: boolean;
 }) {
   const [details, setDetails] = useState<CompanyDetailsResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -3262,9 +3313,9 @@ function DetailPanel({
         .map((q) => ({
           label: q.quoted_at
             ? new Date(q.quoted_at).toLocaleTimeString("en-IN", {
-                hour: "2-digit",
-                minute: "2-digit",
-              })
+              hour: "2-digit",
+              minute: "2-digit",
+            })
             : "Unknown time",
           price: q.price,
         }));
@@ -3299,9 +3350,11 @@ function DetailPanel({
             <ArrowLeft size={15} /> Back to monitoring table
           </button>
           <div className="row-actions">
-            <button className="button secondary small" onClick={onEditTargets}>
-              Configure Targets
-            </button>
+            {isAdmin && (
+              <button className="button secondary small" onClick={onEditTargets}>
+                Configure Targets
+              </button>
+            )}
             <button
               className="icon-button"
               onClick={onClose}
@@ -3328,17 +3381,15 @@ function DetailPanel({
           <b>{quote ? money(quote.price) : "No Live Quote"}</b>
           <small>
             {quote
-              ? `Provider: ${quote.provider} · ${
-                  isQuoteFreshnessUnknown(quote)
-                    ? "Freshness unknown (no source timestamp)"
-                    : quote.is_fresh
-                      ? "Fresh"
-                      : "STALE"
-                } · ${
-                  quote.quoted_at
-                    ? `Quoted ${new Date(quote.quoted_at).toLocaleString("en-IN")}`
-                    : `Received ${new Date(quote.received_at).toLocaleString("en-IN")} (diagnostic)`
-                }`
+              ? `Provider: ${quote.provider} · ${isQuoteFreshnessUnknown(quote)
+                ? "Freshness unknown (no source timestamp)"
+                : quote.is_fresh
+                  ? "Fresh"
+                  : "STALE"
+              } · ${quote.quoted_at
+                ? `Quoted ${new Date(quote.quoted_at).toLocaleString("en-IN")}`
+                : `Received ${new Date(quote.received_at).toLocaleString("en-IN")} (diagnostic)`
+              }`
               : "Poll live quotes to record current market price"}{" "}
             · Saved Reference CMP: {company.cmp == null ? "—" : money(company.cmp)}
           </small>
@@ -3410,8 +3461,8 @@ function DetailPanel({
               <b>
                 {Object.keys(cellRefs).length > 0
                   ? Object.entries(cellRefs)
-                      .map(([k, v]) => `${k}: ${v}`)
-                      .join(", ")
+                    .map(([k, v]) => `${k}: ${v}`)
+                    .join(", ")
                   : "Manual / Direct"}
               </b>
             </div>
@@ -3494,9 +3545,8 @@ function DetailPanel({
             alertList.map((a) => (
               <div className="detail-alert" key={a.id}>
                 <span
-                  className={`alert-type-icon ${
-                    a.target_kind === "bull" ? "alert-red" : "alert-green"
-                  }`}
+                  className={`alert-type-icon ${a.target_kind === "bull" ? "alert-red" : "alert-green"
+                    }`}
                 >
                   <Zap size={12} />
                 </span>
@@ -3509,12 +3559,14 @@ function DetailPanel({
                     {a.lifecycle_status ?? "active"}
                   </small>
                 </div>
-                <button
-                  className="button secondary small"
-                  onClick={() => void onAction(a.id, "reset")}
-                >
-                  Reset
-                </button>
+                {isAdmin && (
+                  <button
+                    className="button secondary small"
+                    onClick={() => void onAction(a.id, "reset")}
+                  >
+                    Reset
+                  </button>
+                )}
               </div>
             ))
           ) : (

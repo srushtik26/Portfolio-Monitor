@@ -1,3 +1,4 @@
+
 """Asynchronous price-monitoring worker consuming live CMP ticks from the Shoonya WebSocket service.
 
 Architecture:
@@ -291,8 +292,7 @@ async def consume_tick_stream(
         received += 1
         tick_time = datetime.now(timezone.utc)
         try:
-            stored = await asyncio.to_thread(
-                process_incoming_tick,
+            stored = process_incoming_tick(
                 raw_tick,
                 active_calendar,
                 resolver=active_resolver,
@@ -315,8 +315,7 @@ async def consume_tick_stream(
                     or heartbeat_interval_seconds <= 0
                     or (now_mono - last_heartbeat_mono) >= heartbeat_interval_seconds
                 ):
-                    await asyncio.to_thread(
-                        _update_stream_heartbeat,
+                    _update_stream_heartbeat(
                         provider_name=last_provider_name,
                         calendar_name=active_calendar.name,
                         started_at=started_at,
@@ -332,8 +331,7 @@ async def consume_tick_stream(
             failed += 1
             err_msg = str(exc)[:1000]
             logger.exception("Failed to process incoming WebSocket CMP tick.")
-            await asyncio.to_thread(
-                _update_stream_heartbeat,
+            _update_stream_heartbeat(
                 provider_name=last_provider_name,
                 calendar_name=active_calendar.name,
                 started_at=started_at,
@@ -349,8 +347,7 @@ async def consume_tick_stream(
             break
 
     if pending_heartbeat_quotes > 0 and last_tick_time is not None:
-        await asyncio.to_thread(
-            _update_stream_heartbeat,
+        _update_stream_heartbeat(
             provider_name=last_provider_name,
             calendar_name=active_calendar.name,
             started_at=started_at,

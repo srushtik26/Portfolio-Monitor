@@ -92,6 +92,31 @@ def ensure_sqlite_schema(db_engine: Engine = engine) -> None:
     if not str(db_engine.url).startswith("sqlite"):
         return
     with db_engine.begin() as conn:
+        for table_name, col_defs in (
+            (
+                "import_batches",
+                (
+                    ("uploader_user_id", "INTEGER"),
+                    ("approver_user_id", "INTEGER"),
+                    ("rejector_user_id", "INTEGER"),
+                    ("stored_file_path", "VARCHAR(500)"),
+                ),
+            ),
+            ("target_revisions", (("changed_by_user_id", "INTEGER"),)),
+            ("audit_logs", (("user_id", "INTEGER"),)),
+            ("users", (("email", "VARCHAR(320)"),)),
+        ):
+            existing_cols = {
+                r[1]
+                for r in conn.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            if existing_cols:
+                for col_name, col_type in col_defs:
+                    if col_name not in existing_cols:
+                        conn.exec_driver_sql(
+                            f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                        )
+
         row = conn.exec_driver_sql(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='price_quotes'"
         ).fetchone()

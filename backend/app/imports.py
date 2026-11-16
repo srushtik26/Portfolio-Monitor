@@ -1,9 +1,11 @@
 import csv
+import os
 import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO, StringIO
 from pathlib import PurePath
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 from zipfile import BadZipFile
@@ -20,6 +22,9 @@ from .schemas import ImportRowUpdate
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_IMPORT_ROWS = 2000
 ALLOWED_EXTENSIONS = {".xlsx", ".csv"}
+PRIVATE_UPLOAD_DIR = Path(
+    os.environ.get("PRIVATE_UPLOAD_DIR", str(Path(__file__).resolve().parents[1] / "var" / "private_uploads"))
+).expanduser().resolve()
 MAPPED_FIELDS = (
     "exchange_column",
     "symbol_column",
@@ -275,6 +280,21 @@ def _normalize_symbol(raw_symbol: str) -> str:
     return cleaned[:32]
 
 
+def _store_private_upload(batch_id: str, filename: str, content: bytes) -> str:
+    extension = PurePath(filename).suffix.lower()
+    PRIVATE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = (PRIVATE_UPLOAD_DIR / f"{batch_id}{extension}").resolve()
+    if PRIVATE_UPLOAD_DIR not in destination.parents:
+        raise HTTPException(status_code=400, detail="Invalid upload destination.")
+    with destination.open("xb") as stored_file:
+        stored_file.write(content)
+    try:
+        os.chmod(destination, 0o600)
+    except OSError:
+        pass
+    return str(destination)
+
+
 def create_preview(
     session: Session,
     *,
@@ -284,6 +304,8 @@ def create_preview(
     header_row: int,
     mapping: dict[str, str | None],
     uploaded_by: str = "Srushti Kadam",
+    uploader_user_id: int | None = None,
+    row_approval_status: str = "approved",
 ) -> dict[str, Any]:
     if not mapping.get("symbol_column") and not mapping.get("name_column"):
         raise HTTPException(
@@ -469,7 +491,7 @@ def create_preview(
             base_direction=base_dir,
             bull_direction=bull_dir,
             cell_refs=cell_refs,
-            approval_status="approved",
+            approval_status=row_approval_status,
         )
         rows.append(row)
         seen.setdefault(identity, []).append(row)
@@ -484,19 +506,32 @@ def create_preview(
                     f"Row {row.row_number}: duplicate company identity {label} in this file."
                 )
 
+    batch_id = str(uuid4())
     batch = ImportBatch(
-        id=str(uuid4()),
+        id=batch_id,
         filename=filename[:255],
         status="preview",
         formula_review_required=formula_review_required,
         created_at=datetime.now(timezone.utc),
         uploaded_by=uploaded_by,
+        uploader_user_id=uploader_user_id,
+        stored_file_path=(
+            _store_private_upload(batch_id, filename, content)
+            if uploader_user_id is not None
+            else None
+        ),
         sheet_name=sheet_name or ("CSV" if PurePath(filename).suffix.lower() == ".csv" else None),
         header_row=header_row,
         rows=rows,
     )
     session.add(batch)
-    session.commit()
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        if batch.stored_file_path:
+            Path(batch.stored_file_path).unlink(missing_ok=True)
+        raise
     session.refresh(batch)
     return serialize_batch(batch, company_lookup)
 
@@ -563,8 +598,8 @@ def update_preview_row(
     update_data: ImportRowUpdate,
 ) -> dict[str, Any]:
     batch = get_batch(session, batch_id)
-    if batch.status != "preview":
-        raise HTTPException(status_code=409, detail="Only preview imports can be edited.")
+    if batch.status not in ("preview", "pending_approval"):
+        raise HTTPException(status_code=409, detail="Only unapproved imports can be edited.")
     target_row = next((r for r in batch.rows if r.row_number == row_number), None)
     if target_row is None:
         raise HTTPException(status_code=404, detail=f"Row {row_number} not found in import batch.")
@@ -640,7 +675,10 @@ def serialize_batch(
         "status": batch.status,
         "version_number": batch.version_number,
         "uploaded_by": batch.uploaded_by,
+        "uploader_user_id": batch.uploader_user_id,
         "approved_by": batch.approved_by,
+        "approver_user_id": batch.approver_user_id,
+        "rejector_user_id": batch.rejector_user_id,
         "approved_at": batch.approved_at.isoformat() if batch.approved_at else None,
         "created_at": batch.created_at.isoformat() if batch.created_at else None,
         "sheet_name": batch.sheet_name,
@@ -671,6 +709,7 @@ def restore_import_version(
     batch_id: str,
     *,
     actor: str = "Srushti Kadam",
+    user_id: int | None = None,
 ) -> dict[str, Any]:
     batch = get_batch(session, batch_id)
     if batch.status not in ("confirmed", "restored") or not batch.changes_snapshot:
@@ -714,6 +753,7 @@ def restore_import_version(
                     source="restore",
                     import_id=batch.id,
                     changed_by=actor,
+                    changed_by_user_id=user_id,
                     changed_at=now,
                 )
             )
@@ -721,6 +761,7 @@ def restore_import_version(
         AuditLog(
             action="import_version_restored",
             actor=actor,
+            user_id=user_id,
             entity_type="import_batch",
             entity_id=batch.id,
             details={

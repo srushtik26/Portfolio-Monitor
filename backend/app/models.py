@@ -79,7 +79,11 @@ class ImportBatch(Base):
 
     version_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     uploaded_by: Mapped[str] = mapped_column(String(100), nullable=False, default="Srushti Kadam")
+    uploader_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    approver_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    rejector_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    stored_file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sheet_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     header_row: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -143,6 +147,7 @@ class TargetRevision(Base):
     base_direction: Mapped[str | None] = mapped_column(String(16), nullable=True)
     bull_direction: Mapped[str | None] = mapped_column(String(16), nullable=True)
     changed_by: Mapped[str] = mapped_column(String(100), nullable=False, default="Srushti Kadam")
+    changed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     cell_refs: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
@@ -338,7 +343,59 @@ class AuditLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     actor: Mapped[str] = mapped_column(String(100), nullable=False, default="Srushti Kadam")
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(128), nullable=False)
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("role IN ('ADMIN', 'EMPLOYEE')", name="ck_users_role"),
+        Index("uq_users_normalized_name", "normalized_name", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+    __table_args__ = (Index("uq_user_sessions_token_hash", "token_hash", unique=True),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    csrf_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ActivityLog(Base):
+    __tablename__ = "activity_logs"
+    __table_args__ = (Index("ix_activity_logs_timestamp", "timestamp"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class LoginRateLimit(Base):
+    __tablename__ = "login_rate_limits"
+
+    fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

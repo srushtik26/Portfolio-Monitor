@@ -14,8 +14,10 @@ import type {
   TriggerMode,
   WorkerStatus,
 } from "./types";
+import { authFetch } from "./authService";
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+const fetch = authFetch;
 
 async function responseError(response: Response): Promise<Error> {
   const body: unknown = await response.json().catch(() => null);
@@ -217,7 +219,6 @@ export async function updateImportPreviewRow(
 export async function confirmImport(
   importId: string,
   reviewCachedTargets: boolean,
-  uploadedBy = "admin",
 ): Promise<ImportResult> {
   return expectJson(
     await fetch(`${apiBaseUrl}/api/imports/${encodeURIComponent(importId)}/confirm`, {
@@ -225,7 +226,6 @@ export async function confirmImport(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         review_cached_targets: reviewCachedTargets,
-        uploaded_by: uploadedBy,
       }),
     }),
   );
@@ -241,6 +241,10 @@ export async function rejectImport(importId: string): Promise<{ id: string; stat
 
 export async function fetchImportHistory(signal?: AbortSignal): Promise<ImportBatchHistoryItem[]> {
   return expectJson(await fetch(`${apiBaseUrl}/api/imports`, { signal }));
+}
+
+export async function fetchImportBatch(importId: string): Promise<ImportPreview> {
+  return expectJson(await fetch(`${apiBaseUrl}/api/imports/${encodeURIComponent(importId)}`));
 }
 
 export async function restoreImportVersion(importId: string): Promise<ImportResult> {

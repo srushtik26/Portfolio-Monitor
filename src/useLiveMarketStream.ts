@@ -249,7 +249,7 @@ export function useLiveMarketStream({
       setState(retryAttempt > 0 ? "reconnecting" : "connecting");
       const sseUrl = getLiveSseStreamUrl({ sinceQuoteId: lastQuoteIdRef.current });
       try {
-        eventSource = new EventSource(sseUrl);
+        eventSource = new EventSource(sseUrl, { withCredentials: true });
       } catch {
         connectWebSocket();
         return;

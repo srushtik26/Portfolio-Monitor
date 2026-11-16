@@ -59,15 +59,23 @@ Before enabling Shoonya in any live environment, verify and complete the followi
 
 ## Running Locally & in Production
 
-### 1. Backend API Server
+### 1. Backend API Server & First Admin Bootstrap
 
 ```powershell
 cd "Portfolio-Monitor/backend"
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m alembic upgrade head
+# One-time setup: create the initial Administrator account (interactive hidden prompt or via BOOTSTRAP_ADMIN_NAME / BOOTSTRAP_ADMIN_PASSWORD)
+.\.venv\Scripts\python.exe -m app.bootstrap_admin
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+### 2. Team Authentication & Role-Based Access Control (`ADMIN` vs `EMPLOYEE`)
+
+- **Authentication**: Name + Password login (`POST /api/auth/login`) using normalized case-insensitive name matching, Argon2id password hashing, `HttpOnly` session cookies (`portfolio_session`), double-submit CSRF tokens (`X-CSRF-Token`), and per-client login rate limiting (5 attempts / 15-minute window).
+- **Administrator (`ADMIN`)**: Can manage employee accounts (`Admin Users`), reset employee passwords (one-time credential display), activate/deactivate accounts, approve or reject employee Excel uploads, restore earlier portfolio versions, configure target rules, and inspect the full `Activity` audit log.
+- **Employee (`EMPLOYEE`)**: Can sign in with their name and password, view the shared portfolio and live market prices/alerts, upload and preview Excel files, submit uploads for administrator approval (`pending_approval`), track their own upload approval status, and change their own password.
 
 ### 2. Independent Background Price Monitoring Worker
 
