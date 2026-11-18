@@ -305,8 +305,39 @@ export type CompanyRevisionItem = {
   changed_at: string | null;
 };
 
+export interface SessionIntradayPoint {
+  minute: number;
+  time_label: string;
+  timestamp: string;
+  price: number;
+}
+
+export interface SessionDailyClose {
+  date: string;
+  label: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
+
+export interface SessionChartData {
+  session_date: string;
+  market_open_label: string;
+  market_close_label: string;
+  open_price: number | null;
+  high_price: number | null;
+  low_price: number | null;
+  closing_price: number | null;
+  previous_close: number | null;
+  previous_close_date: string | null;
+  intraday: SessionIntradayPoint[];
+  daily_closes: SessionDailyClose[];
+}
+
 export interface CompanyDetailsResponse {
   company: PortfolioCompany;
+  session_chart?: SessionChartData;
   revisions?: CompanyRevisionItem[];
   target_revisions?: CompanyRevisionItem[];
   alerts?: ApiAlert[];

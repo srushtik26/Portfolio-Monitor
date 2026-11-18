@@ -6450,3 +6450,134 @@ option {
     padding: 3px 8px 3px 4px;
   }
 }
+
+/* ==========================================================================
+   Market Session & Daily Closing Price Chart (Detail Panel)
+   ========================================================================== */
+.session-chart-head {
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.session-chart-tabs {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: 9px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  gap: 3px;
+}
+
+.session-chart-tabs > button {
+  height: 28px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.session-chart-tabs > button:hover {
+  color: var(--text);
+}
+
+.session-chart-tabs > button.active {
+  background: var(--teal);
+  color: #ffffff;
+  box-shadow: 0 2px 6px rgba(21, 127, 142, 0.25);
+}
+
+.session-ohlc-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.session-ohlc-item {
+  padding: 9px 10px;
+  border-radius: 9px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.session-ohlc-item small {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.45px;
+  color: var(--muted);
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-ohlc-item b {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.session-delta {
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.session-chart-card {
+  height: 225px !important;
+  margin-top: 12px;
+  padding: 12px 8px 6px 6px;
+  border-radius: 12px;
+  background: linear-gradient(180deg, var(--surface-raised) 0%, var(--surface) 100%);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+}
+
+.daily-closes-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.daily-close-pill {
+  flex: 1 1 88px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-soft);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.daily-close-pill span {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.daily-close-pill b {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 680px) {
+  .session-ohlc-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}

@@ -3274,6 +3274,15 @@ function EmailPreviewModal({
   );
 }
 
+function formatSessionMinute(minuteOffset: number): string {
+  const totalMinutes = 9 * 60 + 15 + Math.round(minuteOffset);
+  const hours24 = Math.floor(totalMinutes / 60);
+  const mins = totalMinutes % 60;
+  const period = hours24 >= 12 ? "PM" : "AM";
+  const hours12 = hours24 % 12 === 0 ? 12 : hours24 % 12;
+  return `${hours12}:${String(mins).padStart(2, "0")} ${period}`;
+}
+
 function DetailPanel({
   company,
   onClose,
@@ -3289,6 +3298,7 @@ function DetailPanel({
 }) {
   const [details, setDetails] = useState<CompanyDetailsResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [chartMode, setChartMode] = useState<"session" | "daily">("session");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -3305,26 +3315,93 @@ function DetailPanel({
   const quote = company.latest_quote;
   const alertList = details?.alerts ?? details?.alert_history ?? [];
   const revisionList = details?.revisions ?? details?.target_revisions ?? [];
-  const chartSeries = useMemo(() => {
+  const sessionChart = details?.session_chart;
+
+  const intradaySeries = useMemo(() => {
+    if (sessionChart?.intraday && sessionChart.intraday.length > 0) {
+      return sessionChart.intraday;
+    }
     const hist = details?.price_history ?? details?.quote_history ?? [];
     if (hist.length > 0) {
-      return [...hist]
-        .reverse()
-        .map((q) => ({
-          label: q.quoted_at
-            ? new Date(q.quoted_at).toLocaleTimeString("en-IN", {
-              hour: "2-digit",
-              minute: "2-digit",
-            })
-            : "Unknown time",
+      const byMinute = new Map<number, { minute: number; time_label: string; price: number }>();
+      [...hist].reverse().forEach((q) => {
+        const ts = q.quoted_at ?? q.received_at;
+        const dt = ts ? new Date(ts) : new Date();
+        const istDate = new Date(dt.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+        const rawMin = istDate.getHours() * 60 + istDate.getMinutes() - (9 * 60 + 15);
+        const clampedMin = Math.max(0, Math.min(375, rawMin));
+        byMinute.set(clampedMin, {
+          minute: clampedMin,
+          time_label: formatSessionMinute(clampedMin),
           price: q.price,
-        }));
+        });
+      });
+      return Array.from(byMinute.values()).sort((a, b) => a.minute - b.minute);
     }
     if (quote) {
-      return [{ label: "Latest", price: quote.price }];
+      return [{ minute: 180, time_label: "Latest", price: quote.price }];
     }
     return [];
-  }, [details, quote]);
+  }, [sessionChart, details, quote]);
+
+  const dailyCloses = useMemo(() => {
+    if (sessionChart?.daily_closes && sessionChart.daily_closes.length > 0) {
+      return sessionChart.daily_closes;
+    }
+    if (intradaySeries.length > 0) {
+      const prices = intradaySeries.map((p) => p.price);
+      return [
+        {
+          date: sessionChart?.session_date ?? "Today",
+          label: "Latest Session",
+          open: prices[0],
+          high: Math.max(...prices),
+          low: Math.min(...prices),
+          close: prices[prices.length - 1],
+        },
+      ];
+    }
+    return [];
+  }, [sessionChart, intradaySeries]);
+
+  const openPrice =
+    sessionChart?.open_price ?? (intradaySeries.length > 0 ? intradaySeries[0].price : null);
+  const closingOrLatestPrice =
+    quote?.price ??
+    sessionChart?.closing_price ??
+    (intradaySeries.length > 0 ? intradaySeries[intradaySeries.length - 1].price : null);
+  const highPrice =
+    sessionChart?.high_price ??
+    (intradaySeries.length > 0 ? Math.max(...intradaySeries.map((p) => p.price)) : null);
+  const lowPrice =
+    sessionChart?.low_price ??
+    (intradaySeries.length > 0 ? Math.min(...intradaySeries.map((p) => p.price)) : null);
+  const prevClose = sessionChart?.previous_close ?? company.cmp ?? openPrice;
+  const prevCloseLabel = sessionChart?.previous_close_date ?? "Prev Close";
+
+  const sessionChangeAbs =
+    closingOrLatestPrice != null && prevClose != null ? closingOrLatestPrice - prevClose : null;
+  const sessionChangePct =
+    sessionChangeAbs != null && prevClose != null && prevClose > 0
+      ? (sessionChangeAbs / prevClose) * 100
+      : null;
+  const isPositiveSession = (sessionChangeAbs ?? 0) >= 0;
+
+  const yDomain = useMemo((): [number, number] => {
+    const activePrices =
+      chartMode === "session"
+        ? intradaySeries.map((d) => d.price)
+        : dailyCloses.map((d) => d.close);
+    if (prevClose != null && chartMode === "session") {
+      activePrices.push(prevClose);
+    }
+    if (activePrices.length === 0) return [0, 100];
+    const minVal = Math.min(...activePrices);
+    const maxVal = Math.max(...activePrices);
+    const spread = Math.max(maxVal - minVal, minVal * 0.004, 0.5);
+    const pad = spread * 0.22;
+    return [Number((minVal - pad).toFixed(2)), Number((maxVal + pad).toFixed(2))];
+  }, [chartMode, intradaySeries, dailyCloses, prevClose]);
 
   const cellRefs = (company.source_metadata?.cell_refs ?? {}) as Record<string, string>;
 
@@ -3469,66 +3546,210 @@ function DetailPanel({
           </div>
         </section>
 
-        {chartSeries.length > 0 && (
-          <section className="detail-section">
-            <div className="section-head">
+        {(intradaySeries.length > 0 || dailyCloses.length > 0) && (
+          <section className="detail-section session-chart-section">
+            <div className="section-head session-chart-head">
               <div>
-                <h2>Recorded Price Snapshots</h2>
-                <p>{chartSeries.length} recorded quote snapshot(s)</p>
+                <h2>Market Session &amp; Closing Price</h2>
+                <p>
+                  {chartMode === "session"
+                    ? `Full Trading Session (09:15 AM – 03:30 PM IST) · ${sessionChart?.session_date ?? "Latest Session"}`
+                    : `${dailyCloses.length} Trading Day Closing History (03:30 PM IST Close)`}
+                </p>
+              </div>
+              <div className="session-chart-tabs" role="tablist" aria-label="Chart timeframe">
+                <button
+                  type="button"
+                  className={chartMode === "session" ? "active" : ""}
+                  onClick={() => setChartMode("session")}
+                >
+                  Full Day (9:15–3:30)
+                </button>
+                <button
+                  type="button"
+                  className={chartMode === "daily" ? "active" : ""}
+                  onClick={() => setChartMode("daily")}
+                >
+                  Daily Closing
+                </button>
               </div>
             </div>
-            <div className="detail-chart" style={{ height: 180 }}>
+
+            <div className="session-ohlc-grid">
+              <div className="session-ohlc-item">
+                <small>PREV CLOSE ({prevCloseLabel})</small>
+                <b>{prevClose != null ? money(prevClose) : "—"}</b>
+              </div>
+              <div className="session-ohlc-item">
+                <small>OPEN (09:15 AM)</small>
+                <b>{openPrice != null ? money(openPrice) : "—"}</b>
+              </div>
+              <div className="session-ohlc-item">
+                <small>DAY RANGE (L – H)</small>
+                <b>
+                  {lowPrice != null && highPrice != null
+                    ? `${money(lowPrice)} – ${money(highPrice)}`
+                    : "—"}
+                </b>
+              </div>
+              <div className="session-ohlc-item">
+                <small>CLOSE / LATEST (03:30 PM)</small>
+                <b className={isPositiveSession ? "positive" : "negative"}>
+                  {closingOrLatestPrice != null ? money(closingOrLatestPrice) : "—"}
+                </b>
+                {sessionChangeAbs != null && sessionChangePct != null && (
+                  <span className={`session-delta ${isPositiveSession ? "positive" : "negative"}`}>
+                    {formatDistance(sessionChangeAbs, sessionChangePct)}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="detail-chart session-chart-card">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart
-                  data={chartSeries}
-                  margin={{ top: 8, right: 8, left: -18, bottom: 0 }}
-                >
-                  <CartesianGrid
-                    strokeDasharray="3 5"
-                    vertical={false}
-                    stroke="var(--chart-grid)"
-                  />
-                  <XAxis
-                    dataKey="label"
-                    tickLine={false}
-                    axisLine={false}
-                    tick={{ fill: "var(--muted)", fontSize: 10 }}
-                  />
-                  <YAxis
-                    orientation="right"
-                    tickLine={false}
-                    axisLine={false}
-                    tick={{ fill: "var(--muted)", fontSize: 10 }}
-                    domain={["auto", "auto"]}
-                  />
-                  <Tooltip
-                    formatter={(v) => [money(Number(v)), "Quote Price"]}
-                  />
-                  {company.base_target != null && (
-                    <ReferenceLine
-                      y={company.base_target}
-                      stroke="var(--muted)"
-                      strokeDasharray="5 4"
+                {chartMode === "session" ? (
+                  <AreaChart
+                    data={intradaySeries}
+                    margin={{ top: 12, right: 10, left: 4, bottom: 4 }}
+                  >
+                    <defs>
+                      <linearGradient id="sessionAreaGradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop
+                          offset="0%"
+                          stopColor={isPositiveSession ? "#157f8e" : "#dc2626"}
+                          stopOpacity={0.32}
+                        />
+                        <stop
+                          offset="95%"
+                          stopColor={isPositiveSession ? "#157f8e" : "#dc2626"}
+                          stopOpacity={0.02}
+                        />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid
+                      strokeDasharray="3 5"
+                      vertical={false}
+                      stroke="var(--chart-grid)"
                     />
-                  )}
-                  {company.bull_target != null && (
-                    <ReferenceLine
-                      y={company.bull_target}
-                      stroke="var(--muted)"
-                      strokeDasharray="5 4"
+                    <XAxis
+                      dataKey="minute"
+                      type="number"
+                      domain={[0, 375]}
+                      ticks={[0, 75, 150, 225, 300, 375]}
+                      tickFormatter={(val) => formatSessionMinute(Number(val))}
+                      tickLine={false}
+                      axisLine={false}
+                      tick={{ fill: "var(--muted)", fontSize: 10.5, fontWeight: 600 }}
                     />
-                  )}
-                  <Area
-                    type="monotone"
-                    dataKey="price"
-                    stroke="var(--teal)"
-                    strokeWidth={2}
-                    fillOpacity={0.15}
-                    fill="#B9E4E8"
-                  />
-                </AreaChart>
+                    <YAxis
+                      orientation="right"
+                      domain={yDomain}
+                      tickFormatter={(v) => `₹${Number(v).toFixed(1)}`}
+                      tickLine={false}
+                      axisLine={false}
+                      width={58}
+                      tick={{ fill: "var(--muted)", fontSize: 10.5, fontWeight: 600 }}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        background: "var(--navy)",
+                        border: "1px solid rgba(185, 228, 232, 0.25)",
+                        borderRadius: "10px",
+                        color: "#ffffff",
+                        fontSize: "12px",
+                        boxShadow: "0 12px 28px rgba(0, 0, 0, 0.28)",
+                      }}
+                      labelFormatter={(val) => `Session Time: ${formatSessionMinute(Number(val))} IST`}
+                      formatter={(v) => [money(Number(v)), "Market Price"]}
+                    />
+                    {prevClose != null && (
+                      <ReferenceLine
+                        y={prevClose}
+                        stroke="#64748b"
+                        strokeDasharray="4 4"
+                        label={{
+                          value: `Prev Close ${money(prevClose)}`,
+                          position: "insideTopLeft",
+                          fill: "var(--muted)",
+                          fontSize: 10,
+                        }}
+                      />
+                    )}
+                    <Area
+                      type="monotone"
+                      dataKey="price"
+                      stroke={isPositiveSession ? "#157f8e" : "#dc2626"}
+                      strokeWidth={2.4}
+                      fill="url(#sessionAreaGradient)"
+                      activeDot={{ r: 4.5, strokeWidth: 2, stroke: "#ffffff" }}
+                    />
+                  </AreaChart>
+                ) : (
+                  <AreaChart
+                    data={dailyCloses}
+                    margin={{ top: 12, right: 10, left: 4, bottom: 4 }}
+                  >
+                    <defs>
+                      <linearGradient id="dailyCloseGradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#157f8e" stopOpacity={0.34} />
+                        <stop offset="95%" stopColor="#157f8e" stopOpacity={0.03} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid
+                      strokeDasharray="3 5"
+                      vertical={false}
+                      stroke="var(--chart-grid)"
+                    />
+                    <XAxis
+                      dataKey="label"
+                      tickLine={false}
+                      axisLine={false}
+                      tick={{ fill: "var(--muted)", fontSize: 10.5, fontWeight: 600 }}
+                    />
+                    <YAxis
+                      orientation="right"
+                      domain={yDomain}
+                      tickFormatter={(v) => `₹${Number(v).toFixed(1)}`}
+                      tickLine={false}
+                      axisLine={false}
+                      width={58}
+                      tick={{ fill: "var(--muted)", fontSize: 10.5, fontWeight: 600 }}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        background: "var(--navy)",
+                        border: "1px solid rgba(185, 228, 232, 0.25)",
+                        borderRadius: "10px",
+                        color: "#ffffff",
+                        fontSize: "12px",
+                        boxShadow: "0 12px 28px rgba(0, 0, 0, 0.28)",
+                      }}
+                      formatter={(v) => [money(Number(v)), "Closing Amount (3:30 PM)"]}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="close"
+                      stroke="#157f8e"
+                      strokeWidth={2.5}
+                      fill="url(#dailyCloseGradient)"
+                      dot={{ r: 3.5, fill: "#157f8e", stroke: "#ffffff", strokeWidth: 1.5 }}
+                      activeDot={{ r: 5, strokeWidth: 2, stroke: "#ffffff" }}
+                    />
+                  </AreaChart>
+                )}
               </ResponsiveContainer>
             </div>
+
+            {dailyCloses.length > 0 && (
+              <div className="daily-closes-strip">
+                {dailyCloses.slice(-5).map((d) => (
+                  <div key={d.date} className="daily-close-pill">
+                    <span>{d.label} Close</span>
+                    <b>{money(d.close)}</b>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
         )}
 

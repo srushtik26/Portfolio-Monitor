@@ -159,6 +159,201 @@ def list_companies(session: DbSession) -> list[CompanyRead]:
     ]
 
 
+_SESSION_CHART_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _fetch_yf_session_bars(exchange: str, symbol: str) -> dict[str, Any] | None:
+    """Fetch 5-day 5m intraday bars from Yahoo Finance (cached 120s) to populate full 09:15-15:30 session and previous close."""
+    import sys
+    import time
+    from zoneinfo import ZoneInfo
+    from .prices import yahoo_ticker_for
+
+    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+        return None
+    key = (exchange.upper(), symbol.upper())
+    now_mono = time.monotonic()
+    cached = _SESSION_CHART_CACHE.get(key)
+    if cached and (now_mono - cached[0]) < 120.0:
+        return cached[1]
+    try:
+        import yfinance as yf
+
+        ticker_str = yahoo_ticker_for(exchange, symbol)
+        hist = yf.Ticker(ticker_str).history(period="5d", interval="5m")
+        if hist is None or hist.empty:
+            return None
+        ist = ZoneInfo("Asia/Kolkata")
+        by_day: dict[str, list[tuple[datetime, float]]] = {}
+        for idx_ts, row in hist.iterrows():
+            close_val = row.get("Close") if hasattr(row, "get") else row["Close"]
+            if close_val is None or float(close_val) != float(close_val) or float(close_val) <= 0:
+                continue
+            dt_ist = idx_ts.to_pydatetime().astimezone(ist)
+            day_key = dt_ist.strftime("%Y-%m-%d")
+            by_day.setdefault(day_key, []).append((dt_ist, round(float(close_val), 2)))
+        if not by_day:
+            return None
+        sorted_days = sorted(by_day.keys())
+        latest_day = sorted_days[-1]
+        intraday_points = []
+        for dt_ist, price_val in by_day[latest_day]:
+            mins = (dt_ist.hour * 60 + dt_ist.minute) - (9 * 60 + 15)
+            if 0 <= mins <= 375:
+                intraday_points.append(
+                    {
+                        "minute": mins,
+                        "time_label": dt_ist.strftime("%I:%M %p").lstrip("0"),
+                        "timestamp": dt_ist.isoformat(),
+                        "price": price_val,
+                    }
+                )
+        daily_closes = []
+        for d_key in sorted_days:
+            day_bars = by_day[d_key]
+            if day_bars:
+                last_dt, last_price = day_bars[-1]
+                open_price = day_bars[0][1]
+                high_price = max(p for _, p in day_bars)
+                low_price = min(p for _, p in day_bars)
+                daily_closes.append(
+                    {
+                        "date": d_key,
+                        "label": last_dt.strftime("%d %b"),
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "close": last_price,
+                    }
+                )
+        prev_close = daily_closes[-2]["close"] if len(daily_closes) >= 2 else None
+        prev_close_date = daily_closes[-2]["label"] if len(daily_closes) >= 2 else None
+        payload = {
+            "session_date": latest_day,
+            "intraday": intraday_points,
+            "daily_closes": daily_closes,
+            "previous_close": prev_close,
+            "previous_close_date": prev_close_date,
+        }
+        _SESSION_CHART_CACHE[key] = (now_mono, payload)
+        return payload
+    except Exception:
+        return None
+
+
+def _build_session_chart_payload(
+    exchange: str,
+    symbol: str,
+    serialized_quotes: list[dict[str, Any]],
+    saved_cmp: float | None,
+) -> dict[str, Any]:
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    yf_data = _fetch_yf_session_bars(exchange, symbol)
+
+    # Group DB quotes by IST date and 5-minute bucket
+    db_by_day: dict[str, list[tuple[datetime, float]]] = {}
+    for q in reversed(serialized_quotes):
+        raw_ts = q.get("quoted_at") or q.get("received_at")
+        price_val = q.get("price")
+        if raw_ts is None or price_val is None:
+            continue
+        if isinstance(raw_ts, str):
+            try:
+                dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        else:
+            dt = raw_ts
+        dt_ist = normalize_utc(dt).astimezone(ist)
+        day_str = dt_ist.strftime("%Y-%m-%d")
+        db_by_day.setdefault(day_str, []).append((dt_ist, round(float(price_val), 2)))
+
+    sorted_db_days = sorted(db_by_day.keys())
+    session_date = (
+        yf_data["session_date"]
+        if yf_data and yf_data.get("session_date")
+        else (sorted_db_days[-1] if sorted_db_days else datetime.now(ist).strftime("%Y-%m-%d"))
+    )
+
+    # Merge intraday points by minute offset from 09:15 AM IST (0..375)
+    by_minute: dict[int, dict[str, Any]] = {}
+    if yf_data and yf_data.get("intraday"):
+        for pt in yf_data["intraday"]:
+            by_minute[int(pt["minute"])] = dict(pt)
+
+    for dt_ist, price_val in db_by_day.get(session_date, []):
+        mins = max(0, min(375, (dt_ist.hour * 60 + dt_ist.minute) - (9 * 60 + 15)))
+        by_minute[mins] = {
+            "minute": mins,
+            "time_label": dt_ist.strftime("%I:%M %p").lstrip("0"),
+            "timestamp": dt_ist.isoformat(),
+            "price": price_val,
+        }
+
+    intraday_series = [by_minute[m] for m in sorted(by_minute.keys())]
+
+    # Build daily closing history
+    daily_closes: list[dict[str, Any]] = []
+    if yf_data and yf_data.get("daily_closes"):
+        daily_closes = list(yf_data["daily_closes"])
+    else:
+        for d_key in sorted_db_days:
+            pts = db_by_day[d_key]
+            if pts:
+                last_dt, last_p = pts[-1]
+                daily_closes.append(
+                    {
+                        "date": d_key,
+                        "label": last_dt.strftime("%d %b"),
+                        "open": pts[0][1],
+                        "high": max(p for _, p in pts),
+                        "low": min(p for _, p in pts),
+                        "close": last_p,
+                    }
+                )
+
+    previous_close = (
+        yf_data.get("previous_close")
+        if yf_data and yf_data.get("previous_close") is not None
+        else (
+            daily_closes[-2]["close"]
+            if len(daily_closes) >= 2
+            else saved_cmp
+        )
+    )
+    previous_close_date = (
+        yf_data.get("previous_close_date")
+        if yf_data and yf_data.get("previous_close_date")
+        else (
+            daily_closes[-2]["label"]
+            if len(daily_closes) >= 2
+            else "Ref CMP"
+        )
+    )
+
+    prices_today = [pt["price"] for pt in intraday_series]
+    open_price = prices_today[0] if prices_today else None
+    closing_price = prices_today[-1] if prices_today else None
+    high_price = max(prices_today) if prices_today else None
+    low_price = min(prices_today) if prices_today else None
+
+    return {
+        "session_date": session_date,
+        "market_open_label": "09:15 AM",
+        "market_close_label": "03:30 PM",
+        "open_price": open_price,
+        "high_price": high_price,
+        "low_price": low_price,
+        "closing_price": closing_price,
+        "previous_close": previous_close,
+        "previous_close_date": previous_close_date,
+        "intraday": intraday_series,
+        "daily_closes": daily_closes,
+    }
+
+
 @router.get("/companies/{exchange}/{symbol}/details")
 def get_company_details(
     exchange: str,
@@ -182,7 +377,7 @@ def get_company_details(
             func.coalesce(PriceQuote.quoted_at, PriceQuote.received_at).desc(),
             PriceQuote.id.desc(),
         )
-        .limit(100)
+        .limit(500)
     )
     revisions = session.scalars(
         select(TargetRevision)
@@ -257,10 +452,18 @@ def get_company_details(
     ]
 
     serialized_quotes = [serialize_quote(q) for q in quotes]
+    saved_cmp_val = float(company.cmp) if company.cmp is not None else None
+    session_chart = _build_session_chart_payload(
+        identity[0],
+        identity[1],
+        serialized_quotes,
+        saved_cmp_val,
+    )
     return {
         "company": company_read.model_dump(),
         "quote_history": serialized_quotes,
         "price_history": serialized_quotes,
+        "session_chart": session_chart,
         "alert_history": alerts_serialized,
         "alerts": alerts_serialized,
         "target_revisions": revisions_serialized,
