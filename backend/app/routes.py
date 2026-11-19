@@ -612,7 +612,7 @@ def worker_status(session: DbSession) -> dict[str, object]:
     }
 
 
-@router.post("/price-feed/poll", dependencies=[Depends(require_admin)])
+@router.post("/price-feed/poll")
 def trigger_manual_poll(
     session: DbSession,
     exchange: str | None = Query(default=None),
@@ -878,12 +878,12 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
     return list(grouped.values())
 
 
-@router.post("/alerts/{alert_id}/action", dependencies=[Depends(require_admin)])
+@router.post("/alerts/{alert_id}/action")
 def alert_action(
     alert_id: int,
     payload: AlertActionRequest,
     session: DbSession,
-    user: AdminUser,
+    user: CurrentUser,
 ) -> dict[str, Any]:
     try:
         updated = apply_alert_lifecycle_action(
@@ -904,7 +904,7 @@ def alert_action(
     }
 
 
-@router.post("/notifications/drain", dependencies=[Depends(require_admin)])
+@router.post("/notifications/drain")
 def trigger_outbox_drain(session: DbSession) -> dict[str, int]:
     result = drain_outbox(MultiChannelNotifier(), session_factory=lambda: session)
     return {
@@ -914,7 +914,7 @@ def trigger_outbox_drain(session: DbSession) -> dict[str, int]:
     }
 
 
-@router.post("/alerts/{alert_id}/resend", dependencies=[Depends(require_admin)])
+@router.post("/alerts/{alert_id}/resend")
 def resend_alert_notification(alert_id: int, session: DbSession) -> dict[str, Any]:
     alert = session.get(TargetAlert, alert_id)
     if alert is None:
@@ -954,7 +954,7 @@ def resend_alert_notification(alert_id: int, session: DbSession) -> dict[str, An
     }
 
 
-@router.post("/notifications/test-preview", dependencies=[Depends(require_admin)])
+@router.post("/notifications/test-preview")
 def generate_test_alert_preview(
     session: DbSession,
     symbol: str | None = Query(default=None),
@@ -1056,7 +1056,7 @@ def generate_test_alert_preview(
     }
 
 
-@router.post("/notifications/send-sample", dependencies=[Depends(require_admin)])
+@router.post("/notifications/send-sample")
 def send_sample_alert_email(
     session: DbSession,
     symbol: str | None = Query(default=None),
@@ -1126,7 +1126,7 @@ def send_sample_alert_email(
     }
 
 
-@router.get("/notifications/preferences", dependencies=[Depends(require_admin)])
+@router.get("/notifications/preferences")
 def read_notification_preferences(session: DbSession) -> dict[str, Any]:
     pref = get_or_create_preferences(session)
     session.commit()
@@ -1144,11 +1144,11 @@ def read_notification_preferences(session: DbSession) -> dict[str, Any]:
     }
 
 
-@router.put("/notifications/preferences", dependencies=[Depends(require_admin)])
+@router.put("/notifications/preferences")
 def update_notification_preferences(
     payload: NotificationPreferenceUpdate,
     session: DbSession,
-    user: AdminUser,
+    user: CurrentUser,
 ) -> dict[str, Any]:
     pref = get_or_create_preferences(session)
     now = datetime.now(timezone.utc)
@@ -1239,10 +1239,9 @@ def company_price_history(
 @router.put(
     "/companies/{exchange}/{symbol}/targets",
     response_model=CompanyRead,
-    dependencies=[Depends(require_admin)],
 )
 def update_company_targets(
-    exchange: str, symbol: str, update: TargetUpdate, session: DbSession, user: AdminUser
+    exchange: str, symbol: str, update: TargetUpdate, session: DbSession, user: CurrentUser
 ) -> CompanyRead:
     identity = (exchange.upper(), symbol.upper())
     company = session.get(Company, identity)
@@ -1346,10 +1345,9 @@ def update_company_targets(
 @router.put(
     "/companies/{exchange}/{symbol}/target-config",
     response_model=CompanyRead,
-    dependencies=[Depends(require_admin)],
 )
 def update_company_target_config(
-    exchange: str, symbol: str, config: TargetConfigUpdate, session: DbSession, user: AdminUser
+    exchange: str, symbol: str, config: TargetConfigUpdate, session: DbSession, user: CurrentUser
 ) -> CompanyRead:
     identity = (exchange.upper(), symbol.upper())
     company = session.get(Company, identity)
@@ -1431,7 +1429,7 @@ async def preview_import(
         },
         uploaded_by=user.name,
         uploader_user_id=user.id,
-        row_approval_status="approved" if user.role == "ADMIN" else "pending",
+        row_approval_status="approved",
     )
     record_activity(session, user, "import_uploaded", {"batch_id": preview["id"], "filename": filename})
     session.commit()
@@ -1441,8 +1439,6 @@ async def preview_import(
 @router.get("/imports")
 def list_imports(session: DbSession, user: CurrentUser) -> list[dict[str, Any]]:
     query = select(ImportBatch).options(selectinload(ImportBatch.rows))
-    if user.role != "ADMIN":
-        query = query.where(ImportBatch.uploader_user_id == user.id)
     batches = list(session.scalars(query.order_by(ImportBatch.created_at.desc()).limit(100)))
     return [
         {
@@ -1469,10 +1465,6 @@ def list_imports(session: DbSession, user: CurrentUser) -> list[dict[str, Any]]:
 @router.get("/imports/{batch_id}")
 def read_import(batch_id: str, session: DbSession, user: CurrentUser) -> dict:
     batch = get_batch(session, batch_id)
-    if user.role != "ADMIN" and batch.uploader_user_id != user.id:
-        raise HTTPException(status_code=404, detail="Import preview not found.")
-    if user.role != "ADMIN" and batch.status != "preview":
-        raise HTTPException(status_code=409, detail="Submitted imports can no longer be edited.")
     companies = {
         (company.exchange, company.symbol): company
         for company in session.scalars(select(Company))
@@ -1488,16 +1480,11 @@ def edit_import_row(
     session: DbSession,
     user: CurrentUser,
 ) -> dict[str, Any]:
-    batch = get_batch(session, batch_id)
-    if user.role != "ADMIN" and batch.uploader_user_id != user.id:
-        raise HTTPException(status_code=404, detail="Import preview not found.")
-    if user.role != "ADMIN" and "approval_status" in payload.model_fields_set:
-        raise HTTPException(status_code=403, detail="Only an administrator can approve or reject import rows.")
     return update_preview_row(session, batch_id, row_number, payload)
 
 
-@router.post("/imports/{batch_id}/reject", dependencies=[Depends(require_admin)])
-def reject_import(batch_id: str, session: DbSession, user: AdminUser) -> dict[str, Any]:
+@router.post("/imports/{batch_id}/reject")
+def reject_import(batch_id: str, session: DbSession, user: CurrentUser) -> dict[str, Any]:
     batch = get_batch(session, batch_id)
     if batch.status == "confirmed":
         raise HTTPException(status_code=409, detail="Confirmed imports cannot be rejected.")
@@ -1519,8 +1506,8 @@ def reject_import(batch_id: str, session: DbSession, user: AdminUser) -> dict[st
     return {"id": batch.id, "status": "rejected"}
 
 
-@router.post("/imports/{batch_id}/restore", dependencies=[Depends(require_admin)])
-def restore_import(batch_id: str, session: DbSession, user: AdminUser) -> dict[str, Any]:
+@router.post("/imports/{batch_id}/restore")
+def restore_import(batch_id: str, session: DbSession, user: CurrentUser) -> dict[str, Any]:
     return restore_import_version(session, batch_id, actor=user.name, user_id=user.id)
 
 
@@ -1539,8 +1526,6 @@ def confirm_import(
         return batch.result or {"id": batch.id, "status": "confirmed"}
     if batch.status == "rejected":
         raise HTTPException(status_code=409, detail="Rejected imports cannot be confirmed.")
-    if user.role != "ADMIN" and batch.uploader_user_id != user.id:
-        raise HTTPException(status_code=404, detail="Import preview not found.")
 
     approved_rows = [row for row in batch.rows if row.approval_status != "rejected"]
     if not approved_rows:
@@ -1557,19 +1542,9 @@ def confirm_import(
             detail="Review the cached formula target values before confirming this import.",
         )
 
-    if user.role != "ADMIN":
-        if batch.status == "pending_approval":
-            return serialize_batch(batch)
-        batch.status = "pending_approval"
-        batch.uploaded_by = user.name
-        batch.uploader_user_id = user.id
-        batch.result = {"id": batch.id, "status": "pending_approval"}
-        record_activity(session, user, "import_submitted_for_approval", {"batch_id": batch.id})
-        session.commit()
-        return serialize_batch(batch)
-
-    if any(row.approval_status == "pending" for row in batch.rows):
-        raise HTTPException(status_code=409, detail="Approve or reject every pending row before saving the shared portfolio.")
+    for row in approved_rows:
+        if row.approval_status == "pending":
+            row.approval_status = "approved"
 
     identities = [(row.exchange, row.symbol) for row in approved_rows]
     companies = {

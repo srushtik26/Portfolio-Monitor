@@ -62,7 +62,7 @@ const money = (value: number) =>
 export default function UploadPage({
   onCompleted,
   onNavigatePortfolio,
-  role,
+  role: _role,
   userName,
 }: {
   onCompleted: (approved: boolean) => void;
@@ -70,7 +70,8 @@ export default function UploadPage({
   role: UserRole;
   userName: string;
 }) {
-  const isAdmin = role === "ADMIN";
+  // Both Administrators and Employees can directly upload, edit, confirm, and monitor Excel files without extra approval.
+  const isAdmin = true;
   const [file, setFile] = useState<File | null>(null);
   const [inspection, setInspection] = useState<ImportInspection | null>(null);
   const [sheetName, setSheetName] = useState("");

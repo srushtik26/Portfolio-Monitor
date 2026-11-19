@@ -200,14 +200,15 @@ def test_employee_cannot_access_admin_apis(auth_client: TestClient) -> None:
     assert login.status_code == 200
     csrf_token = login.json()["csrf_token"]
     headers = {"X-CSRF-Token": csrf_token}
+    # Employee has full portfolio, import, settings, and monitoring access
     assert auth_client.get("/api/companies").status_code == 200
     assert auth_client.get("/api/imports").json() == []
+    assert auth_client.get("/api/notifications/preferences").status_code == 200
+    # Only Administration (Users, Activity/Audit Logs) and Clear All (workspace/reset) are Admin-only
     assert auth_client.get("/api/audit-logs").status_code == 403
+    assert auth_client.get("/api/activity").status_code == 403
     assert auth_client.get("/api/users").status_code == 403
     assert auth_client.post("/api/workspace/reset", headers=headers).status_code == 403
-    assert auth_client.post(
-        "/api/price-feed/poll", headers=headers
-    ).status_code == 403
 
 
 def test_inactive_user_cannot_login_and_login_is_rate_limited(auth_client: TestClient) -> None:
@@ -227,11 +228,10 @@ def test_inactive_user_cannot_login_and_login_is_rate_limited(auth_client: TestC
     assert limited.status_code == 429
 
 
-def test_employee_upload_waits_for_admin_approval_and_records_owners(
+def test_employee_upload_confirms_directly_without_admin_permission_and_records_owner(
     auth_client: TestClient,
 ) -> None:
     employee = _insert_user("Uploader Employee")
-    admin = _insert_user("Portfolio Admin", "ADMIN")
     employee_login = auth_client.post(
         "/api/auth/login",
         json={"name": employee.name, "password": "SecureTestPassword!42"},
@@ -256,37 +256,12 @@ def test_employee_upload_waits_for_admin_approval_and_records_owners(
     )
     assert preview_response.status_code == 200
     preview = preview_response.json()
-    assert preview["rows"][0]["approval_status"] == "pending"
+    assert preview["rows"][0]["approval_status"] == "approved"
     assert auth_client.get("/api/companies").json() == []
-    assert auth_client.put(
-        f"/api/imports/{preview['id']}/rows/2",
-        json={"approval_status": "approved"},
-        headers={"X-CSRF-Token": employee_csrf},
-    ).status_code == 403
-    submitted = auth_client.post(
+    confirmed = auth_client.post(
         f"/api/imports/{preview['id']}/confirm",
         json={},
         headers={"X-CSRF-Token": employee_csrf},
-    )
-    assert submitted.status_code == 200
-    assert submitted.json()["status"] == "pending_approval"
-    assert auth_client.get("/api/companies").json() == []
-    assert auth_client.get("/api/imports").json()[0]["uploader_user_id"] == employee.id
-
-    admin_login = auth_client.post(
-        "/api/auth/login",
-        json={"name": admin.name, "password": "SecureTestPassword!42"},
-    )
-    admin_headers = {"X-CSRF-Token": admin_login.json()["csrf_token"]}
-    assert auth_client.get("/api/imports").json()[0]["status"] == "pending_approval"
-    approved_row = auth_client.put(
-        f"/api/imports/{preview['id']}/rows/2",
-        json={"approval_status": "approved"},
-        headers=admin_headers,
-    )
-    assert approved_row.status_code == 200
-    confirmed = auth_client.post(
-        f"/api/imports/{preview['id']}/confirm", json={}, headers=admin_headers
     )
     assert confirmed.status_code == 200
     assert auth_client.get("/api/companies").json()[0]["symbol"] == "AUTHCO"
@@ -295,7 +270,7 @@ def test_employee_upload_waits_for_admin_approval_and_records_owners(
         assert batch is not None
         assert batch.status == "confirmed"
         assert batch.uploader_user_id == employee.id
-        assert batch.approver_user_id == admin.id
+        assert batch.approver_user_id == employee.id
         assert batch.stored_file_path is not None
         assert Path(batch.stored_file_path).is_file()
 
@@ -367,7 +342,7 @@ def test_admin_user_lifecycle_password_reset_employee_change_password_and_reject
     assert change_res.status_code == 200
     emp_headers = {"X-CSRF-Token": change_res.json()["csrf_token"]}
 
-    # Employee uploads file and submits for approval; employee cannot reject or approve
+    # Employee uploads file and can discard/reject their own preview
     preview = auth_client.post(
         "/api/imports/preview",
         data={
@@ -386,29 +361,23 @@ def test_admin_user_lifecycle_password_reset_employee_change_password_and_reject
         },
         headers=emp_headers,
     ).json()
-    assert (
-        auth_client.post(
-            f"/api/imports/{preview['id']}/reject", headers=emp_headers
-        ).status_code
-        == 403
-    )
-
-    # Admin logs back in, rejects upload (9), and deactivates employee (11)
-    admin_relogin = auth_client.post(
-        "/api/auth/login",
-        json={"name": admin.name, "password": "SecureTestPassword!42"},
-    )
-    admin_headers = {"X-CSRF-Token": admin_relogin.json()["csrf_token"]}
     rejected = auth_client.post(
         f"/api/imports/{preview['id']}/reject",
-        headers=admin_headers,
+        headers=emp_headers,
     )
     assert rejected.status_code == 200
     assert rejected.json()["status"] == "rejected"
     with TestSession() as session:
         rejected_batch = session.get(ImportBatch, preview["id"])
         assert rejected_batch is not None
-        assert rejected_batch.rejector_user_id == admin.id
+        assert rejected_batch.rejector_user_id == emp_id
+
+    # Admin logs back in and deactivates employee (11)
+    admin_relogin = auth_client.post(
+        "/api/auth/login",
+        json={"name": admin.name, "password": "SecureTestPassword!42"},
+    )
+    admin_headers = {"X-CSRF-Token": admin_relogin.json()["csrf_token"]}
 
     deactivated = auth_client.patch(
         f"/api/users/{emp_id}",

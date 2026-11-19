@@ -284,7 +284,7 @@ export default function App() {
     const timer = window.setInterval(() => {
       void (async () => {
         try {
-          if (isAdmin && portfolioCompanies.length > 0 && workerStatus?.provider !== "shoonya") {
+          if (portfolioCompanies.length > 0 && workerStatus?.provider !== "shoonya") {
             await triggerOnDemandPoll().catch(() => null);
           }
           const [c, a, w] = await Promise.all([
@@ -425,7 +425,7 @@ export default function App() {
                 ? "Awaiting Quotes"
                 : "Feed Offline";
   const visibleNav = nav.filter(
-    (item) => isAdmin || !["Settings", "Admin Users", "Activity"].includes(item.label),
+    (item) => isAdmin || !["Admin Users", "Activity"].includes(item.label),
   );
 
   return (
@@ -569,7 +569,7 @@ export default function App() {
         </header>
 
         <main className="content-area">
-          {isAdmin && (portfolioStatus === "error" ||
+          {(portfolioStatus === "error" ||
             workerStatus?.state === "error") && (
               <div className="feed-banner feed-error" role="alert">
                 <div className="feed-main-icon">
@@ -694,13 +694,13 @@ export default function App() {
               userName={user?.name ?? "Team Member"}
               onCompleted={(approved) => {
                 reloadAll();
-                if (approved && isAdmin) void handlePollNow();
+                if (approved) void handlePollNow();
               }}
               onNavigatePortfolio={() => pickPage("Portfolio")}
             />
           )}
 
-          {page === "Settings" && isAdmin && (
+          {page === "Settings" && (
             <SettingsPage
               compactTables={compactTables}
               setCompactTables={setCompactTables}
@@ -1058,13 +1058,13 @@ function OverviewPage({
                 <RotateCcw size={14} /> Clear All Data
               </button>
             )}
-            {isAdmin && <button
+            <button
               className="button secondary"
               onClick={() => void onPollNow()}
               disabled={isPollingNow || companies.length === 0}
             >
               <RefreshCw size={14} /> {isPollingNow ? "Polling Quotes…" : "Poll Live Quotes"}
-            </button>}
+            </button>
             {isAdmin && (
               <button className="button secondary" onClick={() => onPage("Admin Users")}>
                 <Users size={14} /> Manage Team Users
@@ -1279,7 +1279,7 @@ function OverviewPage({
                       {batch.status.toUpperCase()} · {batch.uploaded_by}
                     </small>
                   </div>
-                  {isAdmin && batch.status === "confirmed" &&
+                  {batch.status === "confirmed" &&
                     batch.changes_snapshot &&
                     batch.changes_snapshot.length > 0 && (
                       <button
@@ -1611,7 +1611,7 @@ function PortfolioPage({
   onRefresh,
   onPollNow,
   isPollingNow,
-  isAdmin,
+  isAdmin: _isAdmin,
   onSelectCompany,
   search,
   onSearchChange,
@@ -1696,13 +1696,13 @@ function PortfolioPage({
         description={`${companies.length} monitored companies · Click any company row for detailed target configuration, price history, and Excel cell lineage.`}
         action={
           <div className="heading-actions">
-            {isAdmin && <button
+            <button
               className="button secondary"
               onClick={() => void onPollNow()}
               disabled={isPollingNow}
             >
               <Activity size={14} /> {isPollingNow ? "Polling Live Feed…" : "Poll Live Quotes Now"}
-            </button>}
+            </button>
             <button
               className="button primary"
               onClick={onRefresh}
@@ -1815,7 +1815,7 @@ function AlertsPage({
   apiStatus,
   apiError,
   workerStatus,
-  isAdmin,
+  isAdmin: _isAdmin,
   onRefresh,
   onAction,
   onDrainOutbox,
@@ -1888,7 +1888,7 @@ function AlertsPage({
             >
               <Bell size={14} /> Preview Alert Email
             </button>
-            {isAdmin && activeAlerts.length > 0 && (
+            {activeAlerts.length > 0 && (
               <button
                 className="button secondary"
                 onClick={() => {
@@ -1898,15 +1898,13 @@ function AlertsPage({
                 <CheckCheck size={14} /> Acknowledge All ({activeAlerts.length})
               </button>
             )}
-            {isAdmin && (
-              <button
-                className="button secondary"
-                onClick={() => void handleDrain()}
-                disabled={draining}
-              >
-                <Zap size={14} /> {draining ? "Draining Outbox…" : "Drain / Retry Outbox"}
-              </button>
-            )}
+            <button
+              className="button secondary"
+              onClick={() => void handleDrain()}
+              disabled={draining}
+            >
+              <Zap size={14} /> {draining ? "Draining Outbox…" : "Drain / Retry Outbox"}
+            </button>
             <button
               className="button primary"
               onClick={onRefresh}
@@ -2122,7 +2120,7 @@ function AlertsPage({
                       </td>
                       <td>
                         <div className="row-actions">
-                          {isAdmin && active && (
+                          {active && (
                             <button
                               className="button primary small"
                               title="Acknowledge this alert"
@@ -2131,15 +2129,13 @@ function AlertsPage({
                               Acknowledge
                             </button>
                           )}
-                          {isAdmin && (
-                            <button
-                              className="button secondary small"
-                              title="Re-dispatch notification via configured channels"
-                              onClick={() => void onResendAlert(alert.id)}
-                            >
-                              Resend
-                            </button>
-                          )}
+                          <button
+                            className="button secondary small"
+                            title="Re-dispatch notification via configured channels"
+                            onClick={() => void onResendAlert(alert.id)}
+                          >
+                            Resend
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -2172,7 +2168,7 @@ function TargetManagement({
   onEdit,
   onSelectCompany,
   search,
-  isAdmin,
+  isAdmin: _isAdmin,
 }: {
   companies: PortfolioCompany[];
   requestStatus: "loading" | "ready" | "error";
@@ -2322,14 +2318,12 @@ function TargetManagement({
                     </td>
                     <td>v{company.version}</td>
                     <td>
-                      {isAdmin && (
-                        <button
-                          className="button tiny secondary"
-                          onClick={() => onEdit(company)}
-                        >
-                          Configure <ArrowRight size={12} />
-                        </button>
-                      )}
+                      <button
+                        className="button tiny secondary"
+                        onClick={() => onEdit(company)}
+                      >
+                        Configure <ArrowRight size={12} />
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -2427,7 +2421,7 @@ function MarketActivityPage({
   workerStatus,
   onPollNow,
   isPollingNow,
-  isAdmin,
+  isAdmin: _isAdmin,
   onSelectCompany,
 }: {
   companies: PortfolioCompany[];
@@ -2456,16 +2450,14 @@ function MarketActivityPage({
         title="Market Feed Health & Reliability"
         description="Real-time connection telemetry, last quote timestamps, stale-price detection, and NSE/BSE polling status."
         action={
-          isAdmin ? (
-            <button
-              className="button secondary"
-              onClick={() => void onPollNow()}
-              disabled={isPollingNow}
-            >
-              <RefreshCw size={14} />{" "}
-              {isPollingNow ? "Polling Market Feed…" : "Poll Live Quotes Now"}
-            </button>
-          ) : undefined
+          <button
+            className="button secondary"
+            onClick={() => void onPollNow()}
+            disabled={isPollingNow}
+          >
+            <RefreshCw size={14} />{" "}
+            {isPollingNow ? "Polling Market Feed…" : "Poll Live Quotes Now"}
+          </button>
         }
       />
 
@@ -2919,7 +2911,7 @@ function NotificationDrawer({
   onClose,
   onAction,
   onPreviewEmail,
-  isAdmin,
+  isAdmin: _isAdmin,
 }: {
   alerts: ApiAlert[];
   onClose: () => void;
@@ -2974,16 +2966,14 @@ function NotificationDrawer({
           >
             Active <span>{unreadAlerts.length}</span>
           </button>
-          {isAdmin && (
-            <button
-              className="mark-all"
-              onClick={() =>
-                unreadAlerts.forEach((a) => void onAction(a.id, "acknowledge"))
-              }
-            >
-              <CheckCheck size={13} /> Acknowledge all
-            </button>
-          )}
+          <button
+            className="mark-all"
+            onClick={() =>
+              unreadAlerts.forEach((a) => void onAction(a.id, "acknowledge"))
+            }
+          >
+            <CheckCheck size={13} /> Acknowledge all
+          </button>
         </div>
         <div className="drawer-content">
           {visibleAlerts.length ? (
@@ -3036,7 +3026,7 @@ function NotificationDrawer({
                       <button onClick={() => onPreviewEmail(a)}>
                         View Email
                       </button>
-                      {isAdmin && isNew && (
+                      {isNew && (
                         <button onClick={() => void onAction(a.id, "acknowledge")}>
                           Acknowledge
                         </button>
@@ -3427,11 +3417,9 @@ function DetailPanel({
             <ArrowLeft size={15} /> Back to monitoring table
           </button>
           <div className="row-actions">
-            {isAdmin && (
-              <button className="button secondary small" onClick={onEditTargets}>
-                Configure Targets
-              </button>
-            )}
+            <button className="button secondary small" onClick={onEditTargets}>
+              Configure Targets
+            </button>
             <button
               className="icon-button"
               onClick={onClose}
@@ -3780,14 +3768,12 @@ function DetailPanel({
                     {a.lifecycle_status ?? "active"}
                   </small>
                 </div>
-                {isAdmin && (
-                  <button
-                    className="button secondary small"
-                    onClick={() => void onAction(a.id, "reset")}
-                  >
-                    Reset
-                  </button>
-                )}
+                <button
+                  className="button secondary small"
+                  onClick={() => void onAction(a.id, "reset")}
+                >
+                  Reset
+                </button>
               </div>
             ))
           ) : (
