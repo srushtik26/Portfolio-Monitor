@@ -1,0 +1,98 @@
+name: CI & Deploy to Oracle Cloud VM
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  frontend-check:
+    name: Frontend Typecheck & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript typecheck
+        run: npx tsc --noEmit
+
+      - name: Production Vite build
+        env:
+          VITE_API_BASE_URL: ""
+        run: npm run build
+
+  backend-check:
+    name: Backend Tests & Migration Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Run pytest suite
+        working-directory: backend
+        run: pytest -q
+
+      - name: Validate Alembic migrations on fresh database
+        working-directory: backend
+        env:
+          DATABASE_URL: sqlite:///./ci_migration_test.db
+        run: |
+          rm -f ci_migration_test.db
+          alembic upgrade head
+          alembic current
+          rm -f ci_migration_test.db
+
+  deploy:
+    name: Deploy to Oracle Cloud VM
+    needs: [frontend-check, backend-check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check deployment secrets
+        id: check_secrets
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USERNAME: ${{ secrets.VM_USERNAME }}
+          VM_SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${VM_HOST}" || -z "${VM_USERNAME}" || -z "${VM_SSH_PRIVATE_KEY}" ]]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Deployment secrets (VM_HOST, VM_USERNAME, VM_SSH_PRIVATE_KEY) are not configured yet. Skipping SSH deployment."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy over SSH
+        if: steps.check_secrets.outputs.configured == 'true'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USERNAME }}
+          key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+          port: ${{ secrets.VM_SSH_PORT || 22 }}
+          script_stop: true
+          script: |
+            cd "${{ secrets.VM_APP_DIR || '/opt/portfolio-monitor' }}"
+            chmod +x scripts/deploy.sh scripts/backup.sh scripts/restore.sh
+            ./scripts/deploy.sh
+            curl -fsS "http://127.0.0.1/healthz" || docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready').read().decode())"

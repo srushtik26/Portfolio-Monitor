@@ -73,10 +73,31 @@ async def add_security_and_timing_headers(request: Request, call_next) -> Respon
 @app.get("/api/health/ready")
 @app.get("/healthz")
 def health_readiness_check(session: Session = Depends(get_db)) -> dict[str, object]:
+    from .models import Company, NotificationOutbox
+    from sqlalchemy import func, select
+
     db_ok = False
+    db_dialect = "unknown"
+    monitored_count = 0
+    failed_emails = 0
     try:
         session.execute(text("SELECT 1"))
         db_ok = True
+        db_dialect = session.bind.dialect.name if session.bind is not None else "unknown"
+        monitored_count = int(
+            session.scalar(
+                select(func.count()).select_from(Company).where(Company.monitoring_active.is_(True))
+            )
+            or 0
+        )
+        failed_emails = int(
+            session.scalar(
+                select(func.count())
+                .select_from(NotificationOutbox)
+                .where(NotificationOutbox.status == "failed")
+            )
+            or 0
+        )
     except Exception:
         db_ok = False
     heartbeat = session.get(WorkerHeartbeat, "price")
@@ -86,12 +107,91 @@ def health_readiness_check(session: Session = Depends(get_db)) -> dict[str, obje
         "status": "ok" if db_ok else "degraded",
         "version": "2.0.0",
         "database": "connected" if db_ok else "unreachable",
+        "database_engine": db_dialect,
         "worker_state": heartbeat.connection_status if heartbeat else "stopped",
         "provider": heartbeat.provider if heartbeat else None,
+        "monitored_symbols_count": monitored_count,
+        "failed_notifications_count": failed_emails,
         "smtp_configured": smtp_ok,
         "live_notifications_ready": live_ready,
         "notification_gate_reason": gate_reason,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/health/worker")
+def health_worker_check(session: Session = Depends(get_db)) -> dict[str, object]:
+    """Public secret-free worker & market-feed health summary distinguishing healthy/degraded/disconnected/stale/unavailable."""
+    from datetime import timedelta
+    from .models import NotificationOutbox
+    from .prices import normalize_utc
+    from .shoonya_feed import get_latest_feed_health
+    from sqlalchemy import func, select
+
+    now = datetime.now(timezone.utc)
+    heartbeat = session.get(WorkerHeartbeat, "price")
+    feed_health = get_latest_feed_health()
+    failed_emails = int(
+        session.scalar(
+            select(func.count())
+            .select_from(NotificationOutbox)
+            .where(NotificationOutbox.status == "failed")
+        )
+        or 0
+    )
+
+    if heartbeat is None:
+        return {
+            "status": "unavailable",
+            "worker_running": False,
+            "provider": None,
+            "exchange_calendar": None,
+            "connection_status": "disconnected",
+            "last_poll_at": None,
+            "last_valid_tick_at": None,
+            "subscribed_symbols": 0,
+            "failed_requests_count": 0,
+            "stale_symbols_count": 0,
+            "queue_overflow_drops": int(feed_health.get("queue_overflow_drops", 0)),
+            "reconnect_attempts": int(feed_health.get("reconnect_count", 0)),
+            "failed_notifications_count": failed_emails,
+            "timestamp": now.isoformat(),
+        }
+
+    last_poll = normalize_utc(heartbeat.last_poll_at) if heartbeat.last_poll_at else None
+    last_quote = (
+        normalize_utc(heartbeat.last_successful_quote_at)
+        if heartbeat.last_successful_quote_at
+        else None
+    )
+    heartbeat_fresh = last_poll is not None and (now - last_poll) <= timedelta(minutes=3)
+
+    if not heartbeat_fresh:
+        status = "disconnected"
+    elif heartbeat.last_error:
+        status = "degraded"
+    elif (heartbeat.stale_symbols_count or 0) > 0 and (heartbeat.monitored_symbols_count or 0) > 0:
+        status = "stale"
+    elif int(feed_health.get("queue_overflow_drops", 0)) > 0 or failed_emails > 0:
+        status = "degraded"
+    else:
+        status = "healthy"
+
+    return {
+        "status": status,
+        "worker_running": heartbeat_fresh,
+        "provider": heartbeat.provider,
+        "exchange_calendar": heartbeat.exchange_calendar,
+        "connection_status": heartbeat.connection_status if heartbeat_fresh else "disconnected",
+        "last_poll_at": last_poll.isoformat() if last_poll else None,
+        "last_valid_tick_at": last_quote.isoformat() if last_quote else None,
+        "subscribed_symbols": int(heartbeat.monitored_symbols_count or 0),
+        "failed_requests_count": int(heartbeat.failed_requests_count or 0),
+        "stale_symbols_count": int(heartbeat.stale_symbols_count or 0),
+        "queue_overflow_drops": int(feed_health.get("queue_overflow_drops", 0)),
+        "reconnect_attempts": int(heartbeat.reconnect_count or feed_health.get("reconnect_count", 0)),
+        "failed_notifications_count": failed_emails,
+        "timestamp": now.isoformat(),
     }
 
 

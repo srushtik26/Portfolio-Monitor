@@ -51,6 +51,8 @@ import {
   fetchCompanyDetails,
   fetchImportHistory,
   fetchNotificationPreferences,
+  fetchSystemHealthReady,
+  fetchSystemHealthWorker,
   fetchWorkerStatus,
   performAlertAction,
   previewTestAlertEmail,
@@ -63,6 +65,7 @@ import {
   updateCompanyTargets,
   updateNotificationPreferences,
 } from "./api";
+import type { SystemHealthReady, SystemHealthWorker } from "./api";
 import BackendUploadPage from "./UploadPage";
 import { useLiveMarketStream } from "./useLiveMarketStream";
 import { useAuth } from "./AuthContext";
@@ -1661,6 +1664,15 @@ function PortfolioPage({
               c.alert_status === "both_triggered")) ||
           (alertFilter === "Pending Config" &&
             c.alert_status === "pending_configuration") ||
+          (alertFilter === "Near Base (Buy)" &&
+            c.distance_to_base_pct != null &&
+            Math.abs(c.distance_to_base_pct) <= 2.5) ||
+          (alertFilter === "Near Bull (Sell)" &&
+            c.distance_to_bull_pct != null &&
+            Math.abs(c.distance_to_bull_pct) <= 2.5) ||
+          (alertFilter === "No Targets" &&
+            c.base_target == null &&
+            c.bull_target == null) ||
           (alertFilter === "Freshness Unknown" && freshnessUnknown) ||
           (alertFilter === "Stale Quote" && isStale) ||
           (alertFilter === "Monitoring" && c.alert_status === "monitoring");
@@ -1756,6 +1768,9 @@ function PortfolioPage({
               <option>Triggered</option>
               <option>Base Triggered</option>
               <option>Bull Triggered</option>
+              <option>Near Base (Buy)</option>
+              <option>Near Bull (Sell)</option>
+              <option>No Targets</option>
               <option>Monitoring</option>
               <option>Pending Config</option>
               <option>Freshness Unknown</option>
@@ -2431,6 +2446,30 @@ function MarketActivityPage({
   isAdmin: boolean;
   onSelectCompany: (c: PortfolioCompany) => void;
 }) {
+  const [apiHealth, setApiHealth] = useState<SystemHealthReady | null>(null);
+  const [workerHealth, setWorkerHealth] = useState<SystemHealthWorker | null>(null);
+  const [healthLoading, setHealthLoading] = useState(false);
+
+  const refreshHealth = async () => {
+    setHealthLoading(true);
+    try {
+      const [ready, worker] = await Promise.all([
+        fetchSystemHealthReady(),
+        fetchSystemHealthWorker(),
+      ]);
+      setApiHealth(ready);
+      setWorkerHealth(worker);
+    } catch {
+      // keep previous snapshot
+    } finally {
+      setHealthLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void refreshHealth();
+  }, [workerStatus?.last_poll_at]);
+
   const freshnessUnknownList = companies.filter((c) =>
     isQuoteFreshnessUnknown(c.latest_quote),
   );
@@ -2442,24 +2481,82 @@ function MarketActivityPage({
       !c.latest_quote.is_simulated,
   );
   const missingQuoteList = companies.filter((c) => c.latest_quote == null);
+  const overallWorkerState = workerHealth?.status ?? (workerStatus?.state === "running" ? "healthy" : "unavailable");
 
   return (
     <>
       <PageHeading
-        eyebrow="INDEPENDENT BACKGROUND MONITORING SERVICE"
-        title="Market Feed Health & Reliability"
-        description="Real-time connection telemetry, last quote timestamps, stale-price detection, and NSE/BSE polling status."
+        eyebrow="SYSTEM HEALTH · API, DATABASE, WORKER & MARKET FEED TELEMETRY"
+        title="System Health & Market Feed Reliability"
+        description="Live operational status for Backend API, Database, Independent Monitoring Worker, Market Feed, Queue Health, and Email Notification Service."
         action={
-          <button
-            className="button secondary"
-            onClick={() => void onPollNow()}
-            disabled={isPollingNow}
-          >
-            <RefreshCw size={14} />{" "}
-            {isPollingNow ? "Polling Market Feed…" : "Poll Live Quotes Now"}
-          </button>
+          <div className="heading-actions">
+            <button
+              className="button secondary"
+              onClick={() => void refreshHealth()}
+              disabled={healthLoading}
+            >
+              <RefreshCw size={14} /> {healthLoading ? "Checking…" : "Refresh Health"}
+            </button>
+            <button
+              className="button primary"
+              onClick={() => void onPollNow()}
+              disabled={isPollingNow}
+            >
+              <Activity size={14} />{" "}
+              {isPollingNow ? "Polling Market Feed…" : "Poll Live Quotes Now"}
+            </button>
+          </div>
         }
       />
+
+      <div className="market-stat-grid" style={{ marginBottom: 14 }}>
+        <div className="card market-stat">
+          <small>Backend API &amp; Database</small>
+          <b>
+            <span className={`health-badge health-${apiHealth?.status === "ok" ? "healthy" : "degraded"}`}>
+              {apiHealth?.status === "ok" ? "Healthy" : "Degraded"}
+            </span>
+          </b>
+          <small className="market-uptime">
+            DB: {apiHealth?.database ?? "checking…"} ({apiHealth?.database_engine ?? "sql"}) · v{apiHealth?.version ?? "2.0.0"}
+          </small>
+        </div>
+        <div className="card market-stat">
+          <small>Worker Process Status</small>
+          <b>
+            <span className={`health-badge health-${overallWorkerState}`}>
+              {overallWorkerState}
+            </span>
+          </b>
+          <small className="market-uptime">
+            {workerHealth?.worker_running ? "Heartbeat active" : "Worker stopped / stale"} ·{" "}
+            {workerHealth?.subscribed_symbols ?? companies.length} symbols
+          </small>
+        </div>
+        <div className="card market-stat">
+          <small>Notification Service</small>
+          <b>
+            <span className={`health-badge health-${(workerHealth?.failed_notifications_count ?? 0) > 0 ? "degraded" : "healthy"}`}>
+              {apiHealth?.live_notifications_ready ? "Live SMTP Ready" : "Dry-Run Safe Mode"}
+            </span>
+          </b>
+          <small className="market-uptime">
+            Failed emails: {workerHealth?.failed_notifications_count ?? 0} · SMTP: {apiHealth?.smtp_configured ? "Configured" : "Incomplete"}
+          </small>
+        </div>
+        <div className="card market-stat">
+          <small>Last Valid Tick</small>
+          <b>
+            {workerHealth?.last_valid_tick_at
+              ? new Date(workerHealth.last_valid_tick_at).toLocaleTimeString("en-IN")
+              : "None yet"}
+          </b>
+          <small className="market-uptime">
+            Reconnects: {workerHealth?.reconnect_attempts ?? 0} · Failed polls: {workerHealth?.failed_requests_count ?? 0}
+          </small>
+        </div>
+      </div>
 
       <div className="market-stat-grid">
         <div className="card market-stat">
@@ -3278,7 +3375,7 @@ function DetailPanel({
   onClose,
   onEditTargets,
   onAction,
-  isAdmin,
+  isAdmin: _isAdmin,
 }: {
   company: PortfolioCompany;
   onClose: () => void;

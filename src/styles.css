@@ -6544,6 +6544,38 @@ option {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
 }
 
+.health-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.health-badge.health-healthy {
+  background: var(--green-soft);
+  color: var(--green);
+  border: 1px solid #86EFAC;
+}
+
+.health-badge.health-degraded,
+.health-badge.health-stale {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border: 1px solid #FCD34D;
+}
+
+.health-badge.health-disconnected,
+.health-badge.health-unavailable {
+  background: var(--red-soft);
+  color: var(--red);
+  border: 1px solid #FCA5A5;
+}
+
 .daily-closes-strip {
   display: flex;
   flex-wrap: wrap;

@@ -1,0 +1,125 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-portfolio_monitor}
+      POSTGRES_USER: ${POSTGRES_USER:-portfolio_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-portfolio_app} -d ${POSTGRES_DB:-portfolio_monitor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-portfolio_app}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-portfolio_monitor}
+      PRIVATE_UPLOAD_DIR: /app/var/private_uploads
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - private_uploads:/app/var/private_uploads
+      - email_spool:/app/var/email_spool
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command:
+      [
+        "python",
+        "-m",
+        "app.worker",
+        "--provider",
+        "${PRICE_PROVIDER:-yfinance}",
+        "--calendar",
+        "${EXCHANGE_CALENDAR:-nse_bse}",
+        "--interval-seconds",
+        "${WORKER_INTERVAL_SECONDS:-60}",
+      ]
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-portfolio_app}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-portfolio_monitor}
+      PRIVATE_UPLOAD_DIR: /app/var/private_uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - private_uploads:/app/var/private_uploads
+      - email_spool:/app/var/email_spool
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.database import SessionLocal; from app.models import WorkerHeartbeat; s=SessionLocal(); hb=s.get(WorkerHeartbeat,'price'); s.close(); exit(0 if hb else 1)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 45s
+      retries: 3
+    networks:
+      - internal
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: ""
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - internal
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - api
+    networks:
+      - internal
+
+volumes:
+  pgdata:
+  private_uploads:
+  email_spool:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
+    driver: bridge

@@ -1,0 +1,23 @@
+# Multi-stage production build for Northstar Portfolio Monitor Frontend
+FROM node:22-alpine AS builder
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY index.html tsconfig.json vite.config.ts postcss.config.js ./
+COPY src ./src
+
+# Same-origin /api requests behind Caddy reverse proxy in production
+ARG VITE_API_BASE_URL=""
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+
+RUN npx tsc --noEmit && npm run build
+
+FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
+COPY deploy/nginx.frontend.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1

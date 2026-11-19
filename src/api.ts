@@ -16,7 +16,8 @@ import type {
 } from "./types";
 import { authFetch } from "./authService";
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+const configuredApiBase = (import.meta.env.VITE_API_BASE_URL ?? "").trim().replace(/\/+$/, "");
+const apiBaseUrl = configuredApiBase || (import.meta.env.DEV ? "http://127.0.0.1:8000" : "");
 const fetch = authFetch;
 
 async function responseError(response: Response): Promise<Error> {
@@ -131,6 +132,48 @@ export async function sendSampleAlertEmail(params?: {
   if (params?.recipient) url.searchParams.set("recipient", params.recipient);
   const response = await fetch(url.toString(), { method: "POST" });
   return expectJson(response);
+}
+
+export interface SystemHealthReady {
+  status: string;
+  version: string;
+  database: string;
+  database_engine?: string;
+  worker_state: string;
+  provider: string | null;
+  monitored_symbols_count?: number;
+  failed_notifications_count?: number;
+  smtp_configured: boolean;
+  live_notifications_ready: boolean;
+  notification_gate_reason: string;
+  timestamp: string;
+}
+
+export interface SystemHealthWorker {
+  status: "healthy" | "degraded" | "disconnected" | "stale" | "unavailable";
+  worker_running: boolean;
+  provider: string | null;
+  exchange_calendar: string | null;
+  connection_status: string;
+  last_poll_at: string | null;
+  last_valid_tick_at: string | null;
+  subscribed_symbols: number;
+  failed_requests_count: number;
+  stale_symbols_count: number;
+  queue_overflow_drops: number;
+  reconnect_attempts: number;
+  failed_notifications_count: number;
+  timestamp: string;
+}
+
+export async function fetchSystemHealthReady(signal?: AbortSignal): Promise<SystemHealthReady> {
+  const response = await fetch(`${apiBaseUrl}/api/health/ready`, { signal });
+  return expectJson<SystemHealthReady>(response);
+}
+
+export async function fetchSystemHealthWorker(signal?: AbortSignal): Promise<SystemHealthWorker> {
+  const response = await fetch(`${apiBaseUrl}/api/health/worker`, { signal });
+  return expectJson<SystemHealthWorker>(response);
 }
 
 export async function fetchWorkerStatus(signal?: AbortSignal): Promise<WorkerStatus> {
@@ -303,7 +346,8 @@ export function getLiveSseStreamUrl(params?: {
   sinceQuoteId?: number;
   pollIntervalMs?: number;
 }): string {
-  const url = new URL(`${apiBaseUrl}/api/stream/live`);
+  const originBase = apiBaseUrl || window.location.origin;
+  const url = new URL(`${originBase}/api/stream/live`);
   if (params?.sinceQuoteId !== undefined) {
     url.searchParams.set("since_quote_id", String(params.sinceQuoteId));
   }
@@ -317,7 +361,8 @@ export function getLiveWebSocketUrl(params?: {
   sinceQuoteId?: number;
   pollIntervalMs?: number;
 }): string {
-  const wsBase = apiBaseUrl.replace(/^http/i, "ws");
+  const originBase = apiBaseUrl || window.location.origin;
+  const wsBase = originBase.replace(/^http/i, "ws");
   const url = new URL(`${wsBase}/api/ws/live`);
   if (params?.sinceQuoteId !== undefined) {
     url.searchParams.set("since_quote_id", String(params.sinceQuoteId));

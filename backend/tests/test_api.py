@@ -2162,3 +2162,52 @@ def test_production_health_security_headers_and_email_preview(client) -> None:
     assert "<html" in data["email_html"]
 
 
+def test_worker_health_endpoint_states_and_no_secret_leakage(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SMTP_PASSWORD", "super-secret-smtp-value")
+    # 1. No worker heartbeat -> unavailable (never falsely healthy)
+    unavail = client.get("/api/health/worker")
+    assert unavail.status_code == 200
+    assert unavail.json()["status"] == "unavailable"
+    assert unavail.json()["worker_running"] is False
+    assert "super-secret-smtp-value" not in unavail.text
+
+    # 2. Fresh worker heartbeat -> healthy
+    now = datetime.now(timezone.utc)
+    with TestSession() as session:
+        session.add(
+            WorkerHeartbeat(
+                name="price",
+                provider="yfinance",
+                exchange_calendar="nse_bse",
+                started_at=now,
+                last_poll_at=now,
+                last_successful_quote_at=now,
+                connection_status="connected",
+                websocket_status="fallback_polling",
+                monitored_symbols_count=5,
+                stale_symbols_count=0,
+            )
+        )
+        session.commit()
+    healthy = client.get("/api/health/worker")
+    assert healthy.status_code == 200
+    assert healthy.json()["status"] == "healthy"
+    assert healthy.json()["worker_running"] is True
+    assert healthy.json()["subscribed_symbols"] == 5
+
+    # 3. Stale heartbeat (>3m old) -> disconnected
+    with TestSession() as session:
+        hb = session.get(WorkerHeartbeat, "price")
+        assert hb is not None
+        hb.last_poll_at = now - timedelta(minutes=10)
+        session.commit()
+    disconnected = client.get("/api/health/worker")
+    assert disconnected.status_code == 200
+    assert disconnected.json()["status"] == "disconnected"
+    assert disconnected.json()["worker_running"] is False
+
+
+

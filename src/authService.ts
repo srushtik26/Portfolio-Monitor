@@ -22,7 +22,8 @@ export interface ActivityEntry {
   timestamp: string;
 }
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+const configuredApiBase = (import.meta.env.VITE_API_BASE_URL ?? "").trim().replace(/\/+$/, "");
+const apiBaseUrl = configuredApiBase || (import.meta.env.DEV ? "http://127.0.0.1:8000" : "");
 let csrfToken = "";
 
 function apiUrl(path: string) {
