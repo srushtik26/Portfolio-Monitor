@@ -28,6 +28,8 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-portfolio_app}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-portfolio_monitor}
       PRIVATE_UPLOAD_DIR: /app/var/private_uploads
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
+      PRICE_PROVIDER_PRIMARY: ${PRICE_PROVIDER_PRIMARY:-yfinance}
+      PRICE_PROVIDER_BACKUP: ${PRICE_PROVIDER_BACKUP:-angel_rest}
     depends_on:
       db:
         condition: service_healthy
@@ -53,7 +55,9 @@ services:
         "-m",
         "app.worker",
         "--provider",
-        "${PRICE_PROVIDER:-yfinance}",
+        "${PRICE_PROVIDER_PRIMARY:-yfinance}",
+        "--backup-provider",
+        "${PRICE_PROVIDER_BACKUP:-angel_rest}",
         "--calendar",
         "${EXCHANGE_CALENDAR:-nse_bse}",
         "--interval-seconds",
@@ -65,6 +69,8 @@ services:
       APP_ENV: production
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-portfolio_app}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-portfolio_monitor}
       PRIVATE_UPLOAD_DIR: /app/var/private_uploads
+      PRICE_PROVIDER_PRIMARY: ${PRICE_PROVIDER_PRIMARY:-yfinance}
+      PRICE_PROVIDER_BACKUP: ${PRICE_PROVIDER_BACKUP:-angel_rest}
     depends_on:
       db:
         condition: service_healthy
@@ -74,7 +80,13 @@ services:
       - private_uploads:/app/var/private_uploads
       - email_spool:/app/var/email_spool
     healthcheck:
-      test: ["CMD", "python", "-c", "from app.database import SessionLocal; from app.models import WorkerHeartbeat; s=SessionLocal(); hb=s.get(WorkerHeartbeat,'price'); s.close(); exit(0 if hb else 1)"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from datetime import datetime, timedelta, timezone; from app.database import SessionLocal; from app.models import WorkerHeartbeat; from app.prices import normalize_utc; s=SessionLocal(); hb=s.get(WorkerHeartbeat,'price'); s.close(); ok=bool(hb and hb.last_poll_at and (datetime.now(timezone.utc)-normalize_utc(hb.last_poll_at))<=timedelta(minutes=5)); exit(0 if ok else 1)",
+        ]
       interval: 60s
       timeout: 10s
       start_period: 45s

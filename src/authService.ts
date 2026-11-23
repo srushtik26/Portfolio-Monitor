@@ -49,7 +49,17 @@ export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}
   if (isMutating && csrfToken) {
     headers.set("X-CSRF-Token", csrfToken);
   }
-  return fetch(input, { ...init, headers, credentials: "include" });
+  const response = await fetch(input, { ...init, headers, credentials: "include" });
+  if (response.status === 401) {
+    const reqUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (!reqUrl.includes("/api/auth/login") && !reqUrl.includes("/api/auth/setup-admin")) {
+      csrfToken = "";
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("portfolio:auth-expired"));
+      }
+    }
+  }
+  return response;
 }
 
 export async function fetchCurrentUser(): Promise<{ user: AuthUser; csrf_token: string } | null> {

@@ -60,12 +60,16 @@ class PasswordChangeRequest(BaseModel):
 
 
 def _normalize_email(raw_email: str | None) -> str | None:
+    import re
+
     if raw_email is None:
         return None
+    if "\r" in raw_email or "\n" in raw_email or "," in raw_email:
+        raise HTTPException(status_code=422, detail="Invalid email address format.")
     cleaned = raw_email.strip().lower()
     if not cleaned:
         return None
-    if "@" not in cleaned or "." not in cleaned.split("@")[-1]:
+    if not re.fullmatch(r"[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+", cleaned):
         raise HTTPException(status_code=422, detail=f"Invalid email address: {cleaned}")
     return cleaned
 

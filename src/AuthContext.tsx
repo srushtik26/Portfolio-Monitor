@@ -37,6 +37,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => { active = false; };
   }, []);
 
+  useEffect(() => {
+    const handleAuthExpired = () => {
+      setUser(null);
+    };
+    window.addEventListener("portfolio:auth-expired", handleAuthExpired);
+    return () => {
+      window.removeEventListener("portfolio:auth-expired", handleAuthExpired);
+    };
+  }, []);
+
   const value: AuthContextValue = {
     user,
     loading,
@@ -52,8 +62,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setAdminConfigured(true);
     },
     async logout() {
-      await authService.logout();
-      setUser(null);
+      try {
+        await authService.logout();
+      } catch {
+        // Session may already be expired; always clear local auth state.
+      } finally {
+        setUser(null);
+      }
     },
     async changePassword(currentPassword, newPassword) {
       const session = await authService.changePassword(currentPassword, newPassword);

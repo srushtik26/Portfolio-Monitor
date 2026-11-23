@@ -745,7 +745,8 @@ class NseBseExchangeCalendar:
         self.allow_extended_hours = (
             allow_extended_hours
             if allow_extended_hours is not None
-            else os.environ.get("MARKET_HOURS_OVERRIDE", "").strip().lower() == "always_open"
+            else os.environ.get("MARKET_HOURS_OVERRIDE", "").strip().lower()
+            in {"always_open", "true", "1", "yes"}
         )
 
     def session_for(self, exchange: str, session_date: date) -> ExchangeSession | None:

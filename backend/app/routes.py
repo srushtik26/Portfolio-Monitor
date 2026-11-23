@@ -1,5 +1,6 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -73,7 +74,15 @@ from .prices import (
     normalize_utc,
     record_quote,
     register_verified_ticker,
+    reset_symbol_cross_baselines,
     serialize_quote,
+)
+from .provider_coordinator import (
+    YFINANCE_DELAYED_LABEL,
+    get_shared_coordinator,
+    is_angel_owner_user,
+    is_angel_provider_name,
+    is_yfinance_provider_name,
 )
 from .schemas import (
     AlertActionRequest,
@@ -109,7 +118,10 @@ def _serialize_company(
 
 def _load_quotes_and_states(
     session: Session,
+    *,
+    allow_angel: bool = False,
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str, str], TargetAlertState]]:
+    quote_filter = [] if allow_angel else [~PriceQuote.provider.ilike("%angel%")]
     latest_quotes = (
         select(
             PriceQuote.id,
@@ -123,6 +135,7 @@ def _load_quotes_and_states(
             )
             .label("position"),
         )
+        .where(*quote_filter)
         .subquery()
     )
     quotes = session.scalars(
@@ -148,11 +161,14 @@ def health() -> dict[str, str]:
 
 
 @router.get("/companies", response_model=list[CompanyRead])
-def list_companies(session: DbSession) -> list[CompanyRead]:
+def list_companies(session: DbSession, user: CurrentUser) -> list[CompanyRead]:
     companies = list(
         session.scalars(select(Company).order_by(Company.exchange, Company.symbol))
     )
-    quote_by_company, states_by_key = _load_quotes_and_states(session)
+    quote_by_company, states_by_key = _load_quotes_and_states(
+        session,
+        allow_angel=is_angel_owner_user(user),
+    )
     return [
         _serialize_company(session, company, quote_by_company, states_by_key)
         for company in companies
@@ -173,6 +189,13 @@ def _fetch_yf_session_bars(exchange: str, symbol: str) -> dict[str, Any] | None:
         return None
     key = (exchange.upper(), symbol.upper())
     now_mono = time.monotonic()
+    # Evict expired entries to prevent unbounded cache growth
+    if len(_SESSION_CHART_CACHE) > 200:
+        expired_keys = [k for k, (ts, _) in _SESSION_CHART_CACHE.items() if (now_mono - ts) >= 120.0]
+        for k in expired_keys:
+            _SESSION_CHART_CACHE.pop(k, None)
+        if len(_SESSION_CHART_CACHE) > 200:
+            _SESSION_CHART_CACHE.clear()
     cached = _SESSION_CHART_CACHE.get(key)
     if cached and (now_mono - cached[0]) < 120.0:
         return cached[1]
@@ -359,20 +382,25 @@ def get_company_details(
     exchange: str,
     symbol: str,
     session: DbSession,
+    user: CurrentUser,
 ) -> dict[str, Any]:
     identity = (exchange.upper(), symbol.upper())
     company = session.get(Company, identity)
     if company is None:
         raise HTTPException(status_code=404, detail="Company not found.")
-    quote_by_company, states_by_key = _load_quotes_and_states(session)
+    allow_angel = is_angel_owner_user(user)
+    quote_by_company, states_by_key = _load_quotes_and_states(session, allow_angel=allow_angel)
     company_read = _serialize_company(session, company, quote_by_company, states_by_key)
 
+    quote_conditions = [
+        PriceQuote.exchange == identity[0],
+        PriceQuote.symbol == identity[1],
+    ]
+    if not allow_angel:
+        quote_conditions.append(~PriceQuote.provider.ilike("%angel%"))
     quotes = session.scalars(
         select(PriceQuote)
-        .where(
-            PriceQuote.exchange == identity[0],
-            PriceQuote.symbol == identity[1],
-        )
+        .where(*quote_conditions)
         .order_by(
             func.coalesce(PriceQuote.quoted_at, PriceQuote.received_at).desc(),
             PriceQuote.id.desc(),
@@ -388,6 +416,12 @@ def get_company_details(
         .order_by(TargetRevision.version.desc(), TargetRevision.id.desc())
         .limit(50)
     )
+    alert_conditions = [
+        TargetRevision.exchange == identity[0],
+        TargetRevision.symbol == identity[1],
+    ]
+    if not allow_angel:
+        alert_conditions.append(~PriceQuote.provider.ilike("%angel%"))
     alert_rows = session.execute(
         select(TargetAlert, TargetRevision, PriceQuote, NotificationOutbox)
         .join(TargetRevision, TargetRevision.id == TargetAlert.target_revision_id)
@@ -396,10 +430,7 @@ def get_company_details(
             NotificationOutbox,
             NotificationOutbox.target_alert_id == TargetAlert.id,
         )
-        .where(
-            TargetRevision.exchange == identity[0],
-            TargetRevision.symbol == identity[1],
-        )
+        .where(*alert_conditions)
         .order_by(TargetAlert.triggered_at.desc(), TargetAlert.id.desc())
         .limit(50)
     ).all()
@@ -502,9 +533,8 @@ def price_feed_status(session: DbSession) -> dict[str, object]:
 
 
 @router.get("/worker/status")
-def worker_status(session: DbSession) -> dict[str, object]:
-    from .shoonya_feed import get_latest_feed_health
-
+def worker_status(session: DbSession, user: CurrentUser) -> dict[str, object]:
+    allow_angel = is_angel_owner_user(user)
     heartbeat = session.get(WorkerHeartbeat, "price")
     now = datetime.now(timezone.utc)
     last_poll = normalize_utc(heartbeat.last_poll_at) if heartbeat and heartbeat.last_poll_at else None
@@ -524,7 +554,7 @@ def worker_status(session: DbSession) -> dict[str, object]:
         else "dry_run_only"
     )
 
-    quote_by_company, _ = _load_quotes_and_states(session)
+    quote_by_company, _ = _load_quotes_and_states(session, allow_angel=allow_angel)
     companies = list(session.scalars(select(Company).where(Company.is_approved.is_(True), Company.monitoring_active.is_(True))))
     stale_symbols: list[str] = []
     freshness_unknown_symbols: list[str] = []
@@ -543,26 +573,72 @@ def worker_status(session: DbSession) -> dict[str, object]:
 
     calendar = NseBseExchangeCalendar()
     market_open = calendar.is_open("NSE", now)
-    feed_health = get_latest_feed_health()
+    coord_health = get_shared_coordinator().get_health_snapshot(include_angel_details=allow_angel)
     state = "error" if heartbeat and heartbeat.last_error else "running" if heartbeat_fresh else "stopped"
     connection_status = (
         heartbeat.connection_status
         if (heartbeat and state == "running")
         else "disconnected"
     )
-    awaiting_snapshot = bool(feed_health.get("awaiting_snapshot", False)) if heartbeat and heartbeat.provider == "shoonya" else False
     feed_ready = bool(
         state == "running"
         and connection_status in {"connected", "polling"}
         and live_provider
         and fresh_symbols_count > 0
         and len(stale_symbols) == 0
-        and not awaiting_snapshot
+    )
+
+    # Build per-symbol source metadata (owner-isolated for Angel)
+    coord_by_sym = {
+        (item["exchange"], item["symbol"]): item
+        for item in coord_health.get("symbols", [])
+    }
+    symbol_sources: list[dict[str, Any]] = []
+    for c in companies:
+        q = quote_by_company.get((c.exchange, c.symbol))
+        coord_item = coord_by_sym.get((c.exchange, c.symbol))
+        if coord_item is not None:
+            symbol_sources.append(coord_item)
+        elif q is not None:
+            q_provider = str(q.get("provider") or "")
+            is_yf = is_yfinance_provider_name(q_provider)
+            is_angel = is_angel_provider_name(q_provider)
+            if is_angel and not allow_angel:
+                continue
+            symbol_sources.append(
+                {
+                    "exchange": c.exchange,
+                    "symbol": c.symbol,
+                    "source": "angel_rest" if is_angel else ("yfinance" if is_yf else q_provider),
+                    "source_label": (
+                        YFINANCE_DELAYED_LABEL if is_yf else q_provider
+                    ),
+                    "source_time": q.get("quoted_at").isoformat()
+                    if isinstance(q.get("quoted_at"), datetime)
+                    else q.get("quoted_at"),
+                    "fallback_active": is_angel,
+                    "fallback_reason": None,
+                }
+            )
+
+    provider_label = (
+        YFINANCE_DELAYED_LABEL
+        if (heartbeat is None or is_yfinance_provider_name(heartbeat.provider))
+        else ("Fixture (simulated)" if heartbeat.provider == "fixture" else heartbeat.provider)
     )
 
     return {
         "state": state,
-        "provider": heartbeat.provider if heartbeat else None,
+        "provider": heartbeat.provider if heartbeat else coord_health["primary_provider"],
+        "provider_label": provider_label,
+        "primary_provider": coord_health["primary_provider"],
+        "primary_label": coord_health["primary_label"],
+        "data_delay_label": "delayed_candle_data",
+        "backup_provider": coord_health["backup_provider"],
+        "backup_status": coord_health["backup_status"],
+        "fallback_active_count": coord_health["fallback_active_count"],
+        "queued_requests_total": coord_health["queued_requests_total"],
+        "symbols": symbol_sources,
         "exchange_calendar": heartbeat.exchange_calendar if heartbeat else None,
         "last_started_at": normalize_utc(heartbeat.started_at) if heartbeat else None,
         "last_poll_at": last_poll,
@@ -574,12 +650,9 @@ def worker_status(session: DbSession) -> dict[str, object]:
         else None,
         "last_error": heartbeat.last_error if heartbeat else None,
         "connection_status": connection_status,
-        "websocket_status": heartbeat.websocket_status if heartbeat else "unavailable",
+        "websocket_status": heartbeat.websocket_status if heartbeat else "fallback_polling",
         "failed_requests_count": heartbeat.failed_requests_count if heartbeat else 0,
-        "reconnect_count": max(
-            heartbeat.reconnect_count if heartbeat else 0,
-            int(feed_health.get("reconnect_count", 0)),
-        ),
+        "reconnect_count": heartbeat.reconnect_count if heartbeat else 0,
         "monitored_symbols_count": len(companies),
         "fresh_symbols_count": fresh_symbols_count,
         "stale_symbols_count": len(stale_symbols),
@@ -587,17 +660,6 @@ def worker_status(session: DbSession) -> dict[str, object]:
         "freshness_unknown_symbols_count": len(freshness_unknown_symbols),
         "freshness_unknown_symbols": freshness_unknown_symbols,
         "feed_ready": feed_ready,
-        "awaiting_snapshot": awaiting_snapshot,
-        "backlog_state": feed_health.get("backlog_state", "normal"),
-        "lag_detected": bool(feed_health.get("lag_detected", False)),
-        "queue_maxsize": int(feed_health.get("queue_maxsize", 256)),
-        "queue_depth": int(feed_health.get("queue_depth", 0)),
-        "queue_overflow_drops": int(feed_health.get("queue_overflow_drops", 0)),
-        "protocol_gap_detection": feed_health.get("protocol_gap_detection", "disabled"),
-        "protocol_gap_reason": feed_health.get("protocol_gap_reason"),
-        "protocol_sequence_gaps": int(feed_health.get("protocol_sequence_gaps", 0)),
-        "reconnect_gaps_count": int(feed_health.get("reconnect_gaps_count", 0)),
-        "gap_history": feed_health.get("gap_history", []),
         "market_open": market_open,
         "live_provider_configured": live_provider,
         "authoritative_calendar_configured": auth_calendar,
@@ -605,39 +667,39 @@ def worker_status(session: DbSession) -> dict[str, object]:
         "notification_mode": notif_mode,
         "notification_gate_reason": notif_gate_reason,
         "note": (
-            "Live NSE/BSE monitoring active."
+            "Primary feed is Yahoo Finance (delayed candle data); Angel One REST is backup only."
             if (live_provider and auth_calendar)
-            else "Fixture worker data is simulated. Laptop sleep or offline time stops polling."
+            else "Fixture worker data is simulated. Configure yfinance primary + NSE/BSE calendar for real monitoring."
         ),
     }
+
+
+@contextmanager
+def _reuse_session(session: Session) -> Iterator[Session]:
+    """Yield an already-open FastAPI request Session without closing it on exit."""
+    yield session
 
 
 @router.post("/price-feed/poll")
 def trigger_manual_poll(
     session: DbSession,
+    user: CurrentUser,
     exchange: str | None = Query(default=None),
     symbol: str | None = Query(default=None),
+    force_refresh: bool = Query(default=True),
 ) -> dict[str, Any]:
-    """Fetch live quotes on demand for one or all approved active companies and evaluate target rules.
-    Uses Shoonya when enabled and automatically falls back to YFinanceProvider as a backup if Shoonya is unavailable or fails.
-    """
-    yfinance_backup = YFinanceProvider(stale_after_seconds=86400)
-    use_shoonya = (
-        os.environ.get("PRICE_PROVIDER", "").strip().lower() in {"shoonya", "shoonya_ws"}
-        or bool(os.environ.get("SHOONYA_USER_ID"))
-    )
-    fallback_used = False
-    if use_shoonya:
-        from .shoonya_feed import ShoonyaPriceProvider
+    """Request a queued quote refresh via the shared per-symbol coordinator (yfinance primary, Angel REST backup).
 
-        try:
-            provider: Any = ShoonyaPriceProvider()
-        except (RuntimeError, ProviderError, ValueError):
-            provider = yfinance_backup
-            fallback_used = True
-    else:
-        provider = yfinance_backup
-    provider_name = getattr(provider, "name", "yfinance")
+    - Shares one cache and one rate-limited queue with the background worker.
+    - Uses the configured freshness setting (no hardcoded 86400s stale override).
+    - Enforces owner-only activation for Angel One REST backup.
+    - Enforces alert and notification safety gates (ALERT_RULES_ENABLED + market calendar + MultiChannelNotifier).
+    """
+    coordinator = get_shared_coordinator()
+    allow_backup = is_angel_owner_user(user)
+    calendar = NseBseExchangeCalendar()
+    alert_rules_env_enabled = os.environ.get("ALERT_RULES_ENABLED", "false").strip().lower() == "true"
+
     now = datetime.now(timezone.utc)
     if exchange and symbol:
         identity = (exchange.upper(), symbol.upper())
@@ -657,64 +719,96 @@ def trigger_manual_poll(
     attempted = 0
     recorded = 0
     failed = 0
+    fallback_used = False
     errors: list[str] = []
+    symbol_results: list[dict[str, Any]] = []
+
     for company in companies:
         attempted += 1
         register_verified_ticker(company.exchange, company.symbol)
+        eval_now = datetime.now(timezone.utc)
         try:
-            try:
-                quote = provider.fetch_quote(company.exchange, company.symbol)
-            except (ProviderError, ValueError, RuntimeError):
-                if provider is not yfinance_backup:
-                    fallback_used = True
-                    provider_name = "yfinance"
-                    quote = yfinance_backup.fetch_quote(company.exchange, company.symbol)
-                else:
-                    raise
-            eval_now = datetime.now(timezone.utc)
+            coord_res = coordinator.fetch_coordinated_quote(
+                company.exchange,
+                company.symbol,
+                allow_backup=allow_backup,
+                force_refresh=force_refresh,
+                now=eval_now,
+            )
+            quote = coord_res.quote
+            if coord_res.fallback_active:
+                fallback_used = True
             if quote.quoted_at is not None and quote.quoted_at > eval_now:
                 eval_now = quote.quoted_at
+
+            if coord_res.source_changed:
+                reset_symbol_cross_baselines(
+                    session,
+                    [(company.exchange, company.symbol)],
+                    reason=f"source_change:{coord_res.previous_source}->{coord_res.source}",
+                    now=eval_now,
+                )
+
+            market_is_open = calendar.is_open(company.exchange, eval_now)
+            symbol_alerts_enabled = bool(alert_rules_env_enabled and market_is_open)
             record_quote(
                 session,
                 quote,
                 now=eval_now,
-                alerts_enabled=True,
+                alerts_enabled=symbol_alerts_enabled,
                 fixture_alerts_enabled=False,
             )
             recorded += 1
+            symbol_results.append(
+                {
+                    "exchange": company.exchange,
+                    "symbol": company.symbol,
+                    "source": coord_res.source,
+                    "source_label": coord_res.source_label,
+                    "source_time": quote.quoted_at.isoformat() if quote.quoted_at else None,
+                    "fallback_active": coord_res.fallback_active,
+                    "fallback_reason": coord_res.fallback_reason,
+                    "from_cache": coord_res.from_cache,
+                }
+            )
         except (ProviderError, ValueError, RuntimeError) as exc:
             failed += 1
             errors.append(f"{company.exchange}:{company.symbol}: {exc}")
 
-    delivery = drain_outbox(MultiChannelNotifier(), session_factory=lambda: session, now=now)
+    drain_now = datetime.now(timezone.utc)
+    delivery = drain_outbox(
+        MultiChannelNotifier(),
+        session_factory=lambda: _reuse_session(session),
+        now=drain_now,
+    )
     heartbeat = session.get(WorkerHeartbeat, "price")
     if heartbeat is None:
         heartbeat = WorkerHeartbeat(
             name="price",
-            provider=provider_name,
+            provider="yfinance",
             exchange_calendar="nse_bse",
             started_at=now,
-            last_poll_at=now,
+            last_poll_at=drain_now,
             last_error=errors[0][:1000] if errors and recorded == 0 else None,
             connection_status="polling" if recorded > 0 else ("error" if errors else "connected"),
             websocket_status="fallback_polling",
-            last_successful_quote_at=now if recorded > 0 else None,
-            last_failed_at=now if failed > 0 else None,
+            last_successful_quote_at=drain_now if recorded > 0 else None,
+            last_failed_at=drain_now if failed > 0 else None,
             failed_requests_count=failed,
             monitored_symbols_count=len(companies),
         )
         session.add(heartbeat)
     else:
-        heartbeat.provider = provider_name
+        heartbeat.provider = "yfinance"
         heartbeat.exchange_calendar = "nse_bse"
-        heartbeat.last_poll_at = now
+        heartbeat.last_poll_at = drain_now
         heartbeat.last_error = errors[0][:1000] if errors and recorded == 0 else None
         heartbeat.connection_status = "polling" if recorded > 0 else ("error" if errors else "connected")
         heartbeat.websocket_status = "fallback_polling"
         if recorded > 0:
-            heartbeat.last_successful_quote_at = now
+            heartbeat.last_successful_quote_at = drain_now
         if failed > 0:
-            heartbeat.last_failed_at = now
+            heartbeat.last_failed_at = drain_now
             heartbeat.failed_requests_count = (heartbeat.failed_requests_count or 0) + failed
     session.commit()
 
@@ -722,8 +816,12 @@ def trigger_manual_poll(
         "attempted": attempted,
         "recorded": recorded,
         "failed": failed,
-        "provider": provider_name,
+        "provider": "yfinance",
+        "primary_label": YFINANCE_DELAYED_LABEL,
+        "backup_status": coordinator.backup_status(allow_backup=allow_backup),
         "fallback_used": fallback_used,
+        "alerts_enabled": alert_rules_env_enabled,
+        "symbols": symbol_results,
         "errors": errors,
         "notifications_sent": delivery.sent,
         "notifications_retried": delivery.retried,
@@ -732,10 +830,11 @@ def trigger_manual_poll(
 
 
 @router.get("/alerts")
-def list_alerts(session: DbSession) -> list[dict[str, object]]:
+def list_alerts(session: DbSession, user: CurrentUser) -> list[dict[str, object]]:
+    allow_angel = is_angel_owner_user(user)
     pref = session.get(NotificationPreference, "default")
     default_recipients = collect_alert_email_recipients(session, pref)
-    rows = session.execute(
+    stmt = (
         select(TargetAlert, TargetRevision, PriceQuote, Company, NotificationOutbox)
         .join(TargetRevision, TargetRevision.id == TargetAlert.target_revision_id)
         .join(PriceQuote, PriceQuote.id == TargetAlert.quote_id)
@@ -748,7 +847,11 @@ def list_alerts(session: DbSession) -> list[dict[str, object]]:
             NotificationOutbox,
             NotificationOutbox.target_alert_id == TargetAlert.id,
         )
-        .order_by(TargetAlert.triggered_at.desc(), TargetAlert.id.desc())
+    )
+    if not allow_angel:
+        stmt = stmt.where(~PriceQuote.provider.ilike("%angel%"))
+    rows = session.execute(
+        stmt.order_by(TargetAlert.triggered_at.desc(), TargetAlert.id.desc())
     ).all()
 
     grouped: dict[int, dict[str, Any]] = {}
@@ -893,6 +996,7 @@ def alert_action(
             actor=user.name,
         )
         record_activity(session, user, f"alert_{payload.action}", {"alert_id": alert_id})
+        session.commit()
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {
@@ -906,7 +1010,7 @@ def alert_action(
 
 @router.post("/notifications/drain")
 def trigger_outbox_drain(session: DbSession) -> dict[str, int]:
-    result = drain_outbox(MultiChannelNotifier(), session_factory=lambda: session)
+    result = drain_outbox(MultiChannelNotifier(), session_factory=lambda: _reuse_session(session))
     return {
         "sent": result.sent,
         "retried": result.retried,
@@ -945,7 +1049,11 @@ def resend_alert_notification(alert_id: int, session: DbSession) -> dict[str, An
         queue_alert_notifications(session, alert, now=now)
         session.commit()
 
-    result = drain_outbox(MultiChannelNotifier(), session_factory=lambda: session, now=now)
+    result = drain_outbox(
+        MultiChannelNotifier(),
+        session_factory=lambda: _reuse_session(session),
+        now=datetime.now(timezone.utc),
+    )
     return {
         "alert_id": alert_id,
         "sent": result.sent,
@@ -1097,7 +1205,8 @@ def send_sample_alert_email(
     )
     idempotency_key = f"sample-{int(now.timestamp())}"
 
-    if "PYTEST_CURRENT_TEST" in os.environ:
+    raw_mode = os.environ.get("NOTIFICATION_MODE", "dry_run").strip().lower() or "dry_run"
+    if "PYTEST_CURRENT_TEST" in os.environ or raw_mode != "live":
         receipt = DryRunNotifier().send(msg, idempotency_key)
         return {
             "status": "dry_run",
@@ -1163,9 +1272,16 @@ def update_notification_preferences(
             if isinstance(payload.email_recipients, str)
             else payload.email_recipients
         )
+        import re
+
         cleaned = [addr.strip() for addr in raw_list if addr.strip()]
         for addr in cleaned:
-            if "@" not in addr or "." not in addr.split("@")[-1]:
+            if (
+                "\r" in addr
+                or "\n" in addr
+                or "," in addr
+                or not re.fullmatch(r"[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+", addr)
+            ):
                 raise HTTPException(status_code=422, detail=f"Invalid email address: {addr}")
         pref.email_recipients = cleaned
     if "notify_on_base" in fields and payload.notify_on_base is not None:
@@ -1196,7 +1312,7 @@ def update_notification_preferences(
         "id": pref.id,
         "dashboard_enabled": pref.dashboard_enabled,
         "email_enabled": pref.email_enabled,
-        "email_recipients": pref.email_recipients or [],
+        "email_recipients": collect_alert_email_recipients(session, pref),
         "notify_on_base": pref.notify_on_base,
         "notify_on_bull": pref.notify_on_bull,
         "notify_on_stale": pref.notify_on_stale,
@@ -1212,17 +1328,21 @@ def company_price_history(
     exchange: str,
     symbol: str,
     session: DbSession,
+    user: CurrentUser,
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict[str, object]:
     identity = (exchange.upper(), symbol.upper())
     if session.get(Company, identity) is None:
         raise HTTPException(status_code=404, detail="Company not found.")
+    conditions = [
+        PriceQuote.exchange == identity[0],
+        PriceQuote.symbol == identity[1],
+    ]
+    if not is_angel_owner_user(user):
+        conditions.append(~PriceQuote.provider.ilike("%angel%"))
     quotes = session.scalars(
         select(PriceQuote)
-        .where(
-            PriceQuote.exchange == identity[0],
-            PriceQuote.symbol == identity[1],
-        )
+        .where(*conditions)
         .order_by(
             func.coalesce(PriceQuote.quoted_at, PriceQuote.received_at).desc(),
             PriceQuote.id.desc(),
@@ -1502,7 +1622,15 @@ def reject_import(batch_id: str, session: DbSession, user: CurrentUser) -> dict[
         )
     )
     record_activity(session, user, "import_rejected", {"batch_id": batch.id})
+    stored_path = batch.stored_file_path
+    batch.stored_file_path = None
     session.commit()
+    if stored_path:
+        from pathlib import Path
+        try:
+            Path(stored_path).unlink(missing_ok=True)
+        except OSError:
+            pass
     return {"id": batch.id, "status": "rejected"}
 
 
@@ -1750,6 +1878,11 @@ def list_audit_logs(
 def reset_workspace_data(session: DbSession, user: AdminUser) -> dict[str, Any]:
     """Clear all companies, import batches, quotes, alerts, target revisions, and audit logs."""
     deleted_companies = session.scalar(select(func.count()).select_from(Company)) or 0
+    stored_paths = [
+        p
+        for p in session.scalars(select(ImportBatch.stored_file_path).where(ImportBatch.stored_file_path.is_not(None))).all()
+        if p
+    ]
     session.execute(delete(NotificationOutbox))
     session.execute(delete(TargetAlert))
     session.execute(delete(TargetAlertState))
@@ -1761,6 +1894,12 @@ def reset_workspace_data(session: DbSession, user: AdminUser) -> dict[str, Any]:
     session.execute(delete(AuditLog))
     session.execute(delete(WorkerHeartbeat))
     session.commit()
+    from pathlib import Path
+    for p in stored_paths:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except OSError:
+            pass
     record_activity(session, user, "workspace_reset", {})
     session.commit()
     return {
@@ -1872,10 +2011,13 @@ def _poll_stream_delta(
     seen_outbox_ids: set[str] = state.setdefault("seen_outbox_ids", set())
     last_outbox_created_at: datetime | None = state.get("last_outbox_created_at")
 
+    allow_angel: bool = bool(state.get("allow_angel", False))
+    quote_stmt = select(PriceQuote).where(PriceQuote.id > last_quote_id)
+    if not allow_angel:
+        quote_stmt = quote_stmt.where(~PriceQuote.provider.ilike("%angel%"))
     new_quotes = list(
         session.scalars(
-            select(PriceQuote)
-            .where(PriceQuote.id > last_quote_id)
+            quote_stmt
             .order_by(PriceQuote.id.asc())
             .limit(100)
         )
@@ -1960,7 +2102,14 @@ def _poll_stream_delta(
     for outbox, alert, revision, quote, company in outbox_rows:
         if outbox.id in seen_outbox_ids:
             continue
+        if not allow_angel and is_angel_provider_name(quote.provider):
+            seen_outbox_ids.add(outbox.id)
+            continue
         seen_outbox_ids.add(outbox.id)
+        if len(seen_outbox_ids) > 1000:
+            # Keep bounded to prevent unbounded memory growth on long-lived connections
+            seen_outbox_ids.clear()
+            seen_outbox_ids.add(outbox.id)
         state["last_outbox_created_at"] = normalize_utc(outbox.created_at)
         payload = _serialize_single_outbox_alert(outbox, alert, revision, quote, company)
         events.append({"type": "outbox_alert", **payload})
@@ -1982,8 +2131,12 @@ def _init_stream_cursor(
     seen_outbox_ids: set[str] = set()
     last_outbox_created_at: datetime | None = None
     if not include_existing_outbox:
-        existing_outbox = session.scalars(select(NotificationOutbox.id)).all()
-        seen_outbox_ids.update(existing_outbox)
+        recent_outbox = session.scalars(
+            select(NotificationOutbox.id)
+            .order_by(NotificationOutbox.created_at.desc())
+            .limit(500)
+        ).all()
+        seen_outbox_ids.update(recent_outbox)
         latest_created = session.scalar(select(func.max(NotificationOutbox.created_at)))
         if latest_created is not None:
             last_outbox_created_at = normalize_utc(latest_created)
@@ -1998,6 +2151,7 @@ def _init_stream_cursor(
 @router.get("/stream/live")
 async def stream_live_events(
     request: Request,
+    user: CurrentUser,
     since_quote_id: int | None = Query(default=None, ge=0),
     include_existing_outbox: bool = Query(default=False),
     poll_interval_ms: int = Query(default=750, ge=100, le=10000),
@@ -2007,6 +2161,7 @@ async def stream_live_events(
     and new `notification_outbox` alert events to the React dashboard.
     """
     override_db = request.app.dependency_overrides.get(get_db)
+    allow_angel = is_angel_owner_user(user)
 
     def _run_with_session(fn):
         if override_db is not None:
@@ -2029,6 +2184,7 @@ async def stream_live_events(
             include_existing_outbox=include_existing_outbox,
         ),
     )
+    cursor["allow_angel"] = allow_angel
 
     async def event_generator() -> AsyncIterator[str]:
         emitted = 0
@@ -2045,9 +2201,15 @@ async def stream_live_events(
         while True:
             if await request.is_disconnected():
                 break
-            delta_events = _run_with_session(
-                lambda s: _poll_stream_delta(s, cursor),
-            )
+            if override_db is None:
+                delta_events = await asyncio.to_thread(
+                    _run_with_session,
+                    lambda s: _poll_stream_delta(s, cursor),
+                )
+            else:
+                delta_events = _run_with_session(
+                    lambda s: _poll_stream_delta(s, cursor),
+                )
             for ev in delta_events:
                 ev_type = ev.get("type", "message")
                 yield f"event: {ev_type}\ndata: {json.dumps(ev, default=str)}\n\n"
@@ -2081,13 +2243,14 @@ async def stream_live_events(
 @public_router.websocket("/ws/live")
 async def websocket_live_events(
     websocket: WebSocket,
-    since_quote_id: int | None = Query(default=None),
+    since_quote_id: int | None = Query(default=None, ge=0),
     include_existing_outbox: bool = Query(default=False),
-    poll_interval_ms: int = Query(default=750),
+    poll_interval_ms: int = Query(default=750, ge=100, le=10000),
 ) -> None:
     """WebSocket endpoint streaming real-time price ticks, Distance-from-Target metrics,
     and `notification_outbox` alert events to the React dashboard.
     """
+    from urllib.parse import urlparse
     from .models import User, UserSession
     from .security import SESSION_COOKIE, _digest, _now
 
@@ -2110,23 +2273,41 @@ async def websocket_live_events(
 
     await websocket.accept()
     if override_auth is None:
+        origin = websocket.headers.get("origin")
+        if origin:
+            origin_host = (urlparse(origin).hostname or "").lower()
+            req_host = (websocket.headers.get("host") or "").split(":")[0].lower()
+            allowed_hosts = {req_host, "localhost", "127.0.0.1"}
+            extra_origins = os.environ.get("CORS_ORIGINS", "")
+            for item in extra_origins.split(","):
+                h = (urlparse(item.strip()).hostname or "").lower()
+                if h:
+                    allowed_hosts.add(h)
+            if origin_host and origin_host not in allowed_hosts:
+                await websocket.close(code=4403)
+                return
+
         raw_token = websocket.cookies.get(SESSION_COOKIE)
         if not raw_token:
             await websocket.close(code=4401)
             return
 
-        def _verify_ws_session(sess: Session) -> bool:
+        def _verify_ws_session(sess: Session) -> User | None:
             s_row = sess.scalar(
                 select(UserSession).where(UserSession.token_hash == _digest(raw_token))
             )
-            if s_row is None or s_row.expires_at.replace(tzinfo=timezone.utc) <= _now():
-                return False
+            if s_row is None or normalize_utc(s_row.expires_at) <= _now():
+                return None
             u = sess.get(User, s_row.user_id)
-            return bool(u is not None and u.is_active)
+            return u if (u is not None and u.is_active) else None
 
-        if not _run_with_session(_verify_ws_session):
+        ws_user = _run_with_session(_verify_ws_session)
+        if ws_user is None:
             await websocket.close(code=4401)
             return
+        ws_allow_angel = is_angel_owner_user(ws_user)
+    else:
+        ws_allow_angel = False
 
     cursor = _run_with_session(
         lambda s: _init_stream_cursor(
@@ -2135,6 +2316,7 @@ async def websocket_live_events(
             include_existing_outbox=include_existing_outbox,
         ),
     )
+    cursor["allow_angel"] = ws_allow_angel
     await websocket.send_json(
         {
             "type": "connected",
@@ -2145,9 +2327,15 @@ async def websocket_live_events(
 
     try:
         while True:
-            delta_events = _run_with_session(
-                lambda s: _poll_stream_delta(s, cursor),
-            )
+            if override_db is None:
+                delta_events = await asyncio.to_thread(
+                    _run_with_session,
+                    lambda s: _poll_stream_delta(s, cursor),
+                )
+            else:
+                delta_events = _run_with_session(
+                    lambda s: _poll_stream_delta(s, cursor),
+                )
             for ev in delta_events:
                 await websocket.send_json(json.loads(json.dumps(ev, default=str)))
             await asyncio.sleep(max(0.1, poll_interval_ms / 1000.0))

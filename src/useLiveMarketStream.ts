@@ -211,10 +211,8 @@ export function useLiveMarketStream({
       }
 
       webSocket.onopen = () => {
-        if (!cancelled) {
-          setState("connected");
-          retryAttempt = 0;
-        }
+        // Wait for the server's "connected" frame before marking connected or resetting retryAttempt,
+        // so immediate auth rejections (close code 4401) do not trigger a tight 1s reconnect storm.
       };
 
       webSocket.onmessage = (evt: MessageEvent) => {
@@ -230,12 +228,18 @@ export function useLiveMarketStream({
         webSocket?.close();
       };
 
-      webSocket.onclose = () => {
+      webSocket.onclose = (evt: CloseEvent) => {
         webSocket = null;
-        if (!cancelled) {
-          // Alternate back to SSE if WebSocket drops repeatedly
-          scheduleReconnect(retryAttempt >= 2 ? "sse" : "websocket");
+        if (cancelled) return;
+        if (evt.code === 4401 || evt.code === 4403) {
+          setState("disconnected");
+          if (typeof window !== "undefined") {
+            window.dispatchEvent(new CustomEvent("portfolio:auth-expired"));
+          }
+          return;
         }
+        // Alternate back to SSE if WebSocket drops repeatedly
+        scheduleReconnect(retryAttempt >= 2 ? "sse" : "websocket");
       };
     };
 

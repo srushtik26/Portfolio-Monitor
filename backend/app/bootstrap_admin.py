@@ -3,6 +3,7 @@ from getpass import getpass
 import os
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from .database import SessionLocal, ensure_sqlite_schema
 from .models import ActivityLog, User
@@ -31,16 +32,20 @@ def bootstrap_admin_from_env() -> bool:
             updated_at=now,
         )
         session.add(user)
-        session.flush()
-        session.add(
-            ActivityLog(
-                user_id=user.id,
-                action="admin_bootstrapped",
-                details={"name": name, "source": "env"},
-                timestamp=now,
+        try:
+            session.flush()
+            session.add(
+                ActivityLog(
+                    user_id=user.id,
+                    action="admin_bootstrapped",
+                    details={"name": name, "source": "env"},
+                    timestamp=now,
+                )
             )
-        )
-        session.commit()
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            return False
     return True
 
 

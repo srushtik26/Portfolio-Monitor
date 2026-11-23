@@ -109,7 +109,8 @@ export async function previewTestAlertEmail(params?: {
   symbol?: string;
   targetKind?: "base" | "bull";
 }): Promise<AlertEmailPreviewResponse> {
-  const url = new URL(`${apiBaseUrl}/api/notifications/test-preview`);
+  const base = apiBaseUrl || window.location.origin;
+  const url = new URL(`${base}/api/notifications/test-preview`);
   if (params?.symbol) url.searchParams.set("symbol", params.symbol);
   if (params?.targetKind) url.searchParams.set("target_kind", params.targetKind);
   const response = await fetch(url.toString(), { method: "POST" });
@@ -126,7 +127,8 @@ export async function sendSampleAlertEmail(params?: {
   subject: string;
   provider_message_id: string;
 }> {
-  const url = new URL(`${apiBaseUrl}/api/notifications/send-sample`);
+  const base = apiBaseUrl || window.location.origin;
+  const url = new URL(`${base}/api/notifications/send-sample`);
   if (params?.symbol) url.searchParams.set("symbol", params.symbol);
   if (params?.targetKind) url.searchParams.set("target_kind", params.targetKind);
   if (params?.recipient) url.searchParams.set("recipient", params.recipient);
@@ -153,6 +155,11 @@ export interface SystemHealthWorker {
   status: "healthy" | "degraded" | "disconnected" | "stale" | "unavailable";
   worker_running: boolean;
   provider: string | null;
+  primary_provider?: string | null;
+  primary_label?: string | null;
+  data_delay_label?: string | null;
+  backup_provider?: string | null;
+  backup_status?: string | null;
   exchange_calendar: string | null;
   connection_status: string;
   last_poll_at: string | null;
@@ -160,8 +167,9 @@ export interface SystemHealthWorker {
   subscribed_symbols: number;
   failed_requests_count: number;
   stale_symbols_count: number;
-  queue_overflow_drops: number;
-  reconnect_attempts: number;
+  queued_requests_total?: number;
+  queue_overflow_drops?: number;
+  reconnect_attempts?: number;
   failed_notifications_count: number;
   timestamp: string;
 }

@@ -12,6 +12,7 @@ from sqlalchemy import (
     JSON,
     Numeric,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -286,7 +287,7 @@ class NotificationOutbox(Base):
         ForeignKey("target_alerts.id"), nullable=False
     )
     channel: Mapped[str] = mapped_column(String(20), nullable=False)
-    destination: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    destination: Mapped[str | None] = mapped_column(Text, nullable=True)
     delivery_mode: Mapped[str] = mapped_column(String(12), nullable=False)
     status: Mapped[str] = mapped_column(String(12), nullable=False, default="queued")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

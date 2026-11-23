@@ -145,7 +145,11 @@ def _allow_login_attempt(session: Session, request: Request, normalized_name: st
         )
         session.add(row)
         session.flush()
-    elif now - row.window_started_at.replace(tzinfo=timezone.utc) >= LOGIN_WINDOW:
+    elif now - (
+        row.window_started_at.replace(tzinfo=timezone.utc)
+        if row.window_started_at.tzinfo is None
+        else row.window_started_at.astimezone(timezone.utc)
+    ) >= LOGIN_WINDOW:
         row.window_started_at = now
         row.attempts = 0
     if row.attempts >= LOGIN_MAX_ATTEMPTS:
@@ -165,7 +169,16 @@ def get_current_user(request: Request, session: DbSession) -> User:
         select(UserSession).where(UserSession.token_hash == _digest(raw_token))
     )
     now = _now()
-    if session_row is None or session_row.expires_at.replace(tzinfo=timezone.utc) <= now:
+    expires_utc = (
+        None
+        if session_row is None
+        else (
+            session_row.expires_at.replace(tzinfo=timezone.utc)
+            if session_row.expires_at.tzinfo is None
+            else session_row.expires_at.astimezone(timezone.utc)
+        )
+    )
+    if session_row is None or expires_utc is None or expires_utc <= now:
         if session_row is not None:
             session.delete(session_row)
             session.commit()

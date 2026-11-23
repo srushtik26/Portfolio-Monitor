@@ -43,10 +43,18 @@ from .prices import (
     normalize_utc,
     record_quote,
     register_verified_ticker,
+    reset_symbol_cross_baselines,
+)
+from .provider_coordinator import (
+    SharedQuoteCoordinator,
+    configured_backup_provider,
+    configured_primary_provider,
+    get_shared_coordinator,
+    is_angel_provider_name,
+    is_worker_angel_backup_enabled,
+    is_yfinance_provider_name,
 )
 from .shoonya_feed import (
-    ShoonyaConfig,
-    ShoonyaPriceProvider,
     ShoonyaTokenResolver,
     ShoonyaWebSocketService,
     parse_shoonya_tick,
@@ -54,6 +62,10 @@ from .shoonya_feed import (
 
 logger = logging.getLogger("portfolio.price_worker")
 LOCK_PATH = Path(__file__).resolve().parents[1] / ".price-worker.lock"
+
+
+class WorkerLockError(RuntimeError):
+    """Raised when another worker process already holds the single-instance lock."""
 
 
 @dataclass(frozen=True)
@@ -98,14 +110,14 @@ def single_worker_lock(path: Path = LOCK_PATH) -> Iterator[None]:
             try:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError as error:
-                raise RuntimeError("Another price worker already holds the lock.") from error
+                raise WorkerLockError("Another price worker already holds the lock.") from error
         else:
             import fcntl
 
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as error:
-                raise RuntimeError("Another price worker already holds the lock.") from error
+                raise WorkerLockError("Another price worker already holds the lock.") from error
         try:
             yield
         finally:
@@ -287,12 +299,35 @@ async def consume_tick_stream(
     last_provider_name = "shoonya"
     last_tick_time: datetime | None = None
     pending_heartbeat_quotes = 0
+    idle_heartbeat_timeout = max(float(heartbeat_interval_seconds), 15.0)
+    stream_iter = aiter(tick_stream)
 
-    async for raw_tick in tick_stream:
+    while True:
+        try:
+            raw_tick = await asyncio.wait_for(anext(stream_iter), timeout=idle_heartbeat_timeout)
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError:
+            # Keep WorkerHeartbeat fresh during quiet or closed-market periods
+            await asyncio.to_thread(
+                _update_stream_heartbeat,
+                provider_name=last_provider_name,
+                calendar_name=active_calendar.name,
+                started_at=started_at,
+                last_tick_at=None,
+                last_error=None,
+                recorded_quotes=0,
+                failed_quotes=0,
+                session_factory=session_factory,
+            )
+            last_heartbeat_mono = time_module.monotonic()
+            continue
+
         received += 1
         tick_time = datetime.now(timezone.utc)
         try:
-            stored = process_incoming_tick(
+            stored = await asyncio.to_thread(
+                process_incoming_tick,
                 raw_tick,
                 active_calendar,
                 resolver=active_resolver,
@@ -315,7 +350,8 @@ async def consume_tick_stream(
                     or heartbeat_interval_seconds <= 0
                     or (now_mono - last_heartbeat_mono) >= heartbeat_interval_seconds
                 ):
-                    _update_stream_heartbeat(
+                    await asyncio.to_thread(
+                        _update_stream_heartbeat,
                         provider_name=last_provider_name,
                         calendar_name=active_calendar.name,
                         started_at=started_at,
@@ -331,7 +367,8 @@ async def consume_tick_stream(
             failed += 1
             err_msg = str(exc)[:1000]
             logger.exception("Failed to process incoming WebSocket CMP tick.")
-            _update_stream_heartbeat(
+            await asyncio.to_thread(
+                _update_stream_heartbeat,
                 provider_name=last_provider_name,
                 calendar_name=active_calendar.name,
                 started_at=started_at,
@@ -347,7 +384,8 @@ async def consume_tick_stream(
             break
 
     if pending_heartbeat_quotes > 0 and last_tick_time is not None:
-        _update_stream_heartbeat(
+        await asyncio.to_thread(
+            _update_stream_heartbeat,
             provider_name=last_provider_name,
             calendar_name=active_calendar.name,
             started_at=started_at,
@@ -406,10 +444,9 @@ def _update_stream_heartbeat(
             heartbeat.provider = provider_name
             heartbeat.exchange_calendar = calendar_name
             heartbeat.started_at = started_at
-            if last_tick_at is not None:
-                heartbeat.last_poll_at = last_tick_at
-                if recorded_quotes > 0:
-                    heartbeat.last_successful_quote_at = last_tick_at
+            heartbeat.last_poll_at = last_tick_at or now
+            if last_tick_at is not None and recorded_quotes > 0:
+                heartbeat.last_successful_quote_at = last_tick_at
             heartbeat.last_error = last_error
             heartbeat.connection_status = conn_status
             heartbeat.websocket_status = ws_status
@@ -500,39 +537,77 @@ def poll_once(
             if not _session_open(calendar, company.exchange, current_time):
                 continue
             attempted += 1
-            if provider.name in {"yfinance", "shoonya"}:
+            if provider.name == "yfinance" or isinstance(provider, SharedQuoteCoordinator):
                 register_verified_ticker(company.exchange, company.symbol)
+            source_changed = False
+            source_change_reason = "source_change"
             try:
-                quote = provider.fetch_quote(company.exchange, company.symbol)
-            except RateLimitError:
-                raise
-            except (ProviderError, RuntimeError, ValueError) as primary_err:
-                if provider.name == "shoonya":
-                    logger.warning(
-                        "Shoonya quote failed for %s:%s (%s); falling back to YFinanceProvider backup.",
+                if isinstance(provider, SharedQuoteCoordinator):
+                    coord_res = provider.fetch_coordinated_quote(
                         company.exchange,
                         company.symbol,
-                        primary_err,
+                        allow_backup=is_worker_angel_backup_enabled(),
+                        now=current_time,
                     )
-                    try:
-                        yf_backup = YFinanceProvider()
-                        quote = yf_backup.fetch_quote(company.exchange, company.symbol)
-                    except (ProviderError, RuntimeError, ValueError):
-                        failed += 1
-                        logger.exception("Backup YFinanceProvider could not quote %s:%s.", company.exchange, company.symbol)
-                        continue
+                    quote = coord_res.quote
+                    source_changed = coord_res.source_changed
+                    if source_changed:
+                        source_change_reason = f"source_change:{coord_res.previous_source}->{coord_res.source}"
                 else:
-                    failed += 1
-                    logger.exception("Provider could not quote %s:%s.", company.exchange, company.symbol)
-                    continue
+                    quote = provider.fetch_quote(company.exchange, company.symbol)
+            except RateLimitError:
+                raise
+            except (ProviderError, RuntimeError, ValueError):
+                failed += 1
+                logger.exception("Provider could not quote %s:%s.", company.exchange, company.symbol)
+                continue
             received_at = now if now is not None else datetime.now(timezone.utc)
             try:
-                if quote.provider != provider.name and not (
-                    provider.name in {"yfinance", "shoonya"} and "Yahoo Finance" in quote.provider
-                ):
+                allowed_provider = (
+                    quote.provider == provider.name
+                    or (provider.name == "yfinance" and is_yfinance_provider_name(quote.provider))
+                    or (
+                        isinstance(provider, SharedQuoteCoordinator)
+                        and (is_yfinance_provider_name(quote.provider) or is_angel_provider_name(quote.provider))
+                    )
+                )
+                if not allowed_provider:
                     raise ValueError("Provider quote names do not match the selected adapter.")
                 if quote.is_simulated != provider.is_simulated:
                     raise ValueError("Provider quote simulation status does not match the adapter.")
+                # Reset crossing baselines on source change or quote gap
+                prev_quote = session.scalar(
+                    select(PriceQuote)
+                    .where(
+                        PriceQuote.exchange == company.exchange,
+                        PriceQuote.symbol == company.symbol,
+                        PriceQuote.is_simulated == quote.is_simulated,
+                    )
+                    .order_by(PriceQuote.id.desc())
+                    .limit(1)
+                )
+                if not source_changed and prev_quote is not None:
+                    prev_is_angel = is_angel_provider_name(prev_quote.provider)
+                    next_is_angel = is_angel_provider_name(quote.provider)
+                    if prev_is_angel != next_is_angel:
+                        source_changed = True
+                        source_change_reason = "source_change:db_provider_switch"
+                    elif (
+                        prev_quote.quoted_at is not None
+                        and quote.quoted_at is not None
+                        and (
+                            normalize_utc(quote.quoted_at) - normalize_utc(prev_quote.quoted_at)
+                        ) > timedelta(seconds=max(60, quote.freshness_seconds * 2))
+                    ):
+                        source_changed = True
+                        source_change_reason = "quote_gap"
+                if source_changed:
+                    reset_symbol_cross_baselines(
+                        session,
+                        [(company.exchange, company.symbol)],
+                        reason=source_change_reason,
+                        now=received_at,
+                    )
                 stored = record_quote(
                     session,
                     quote,
@@ -719,20 +794,36 @@ def run_worker(
 
 
 def main() -> None:
-    default_provider = os.environ.get(
-        "PRICE_PROVIDER",
-        "shoonya_ws" if os.environ.get("SHOONYA_USER_ID") else "yfinance",
-    )
+    default_primary = os.environ.get(
+        "PRICE_PROVIDER_PRIMARY",
+        os.environ.get("PRICE_PROVIDER", configured_primary_provider()),
+    ).strip().lower()
+    if default_primary not in {"yfinance", "fixture"}:
+        default_primary = "yfinance"
+    default_backup = configured_backup_provider()
+
     parser = argparse.ArgumentParser(
-        description="Run the asynchronous Shoonya WebSocket price-monitoring worker (or polling fallback)."
+        description="Run the price-monitoring worker (yfinance primary with optional Angel One REST backup)."
     )
     parser.add_argument(
         "--provider",
-        choices=("shoonya_ws", "shoonya", "yfinance", "fixture"),
-        default=default_provider,
+        choices=("yfinance", "fixture"),
+        default=default_primary,
     )
-    parser.add_argument("--calendar", choices=("nse_bse", "fixture"), default="nse_bse")
-    parser.add_argument("--interval-seconds", type=int, default=60)
+    parser.add_argument(
+        "--backup-provider",
+        choices=("angel_rest", "none"),
+        default=default_backup if default_backup in {"angel_rest", "none"} else "angel_rest",
+    )
+    default_calendar = os.environ.get("EXCHANGE_CALENDAR", "nse_bse").strip().lower()
+    if default_calendar not in {"nse_bse", "fixture"}:
+        default_calendar = "nse_bse"
+    try:
+        default_interval = max(5, int(os.environ.get("WORKER_INTERVAL_SECONDS", "60")))
+    except ValueError:
+        default_interval = 60
+    parser.add_argument("--calendar", choices=("nse_bse", "fixture"), default=default_calendar)
+    parser.add_argument("--interval-seconds", type=int, default=default_interval)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--enforce-market-hours", action="store_true")
     args = parser.parse_args()
@@ -746,43 +837,11 @@ def main() -> None:
             if args.calendar == "fixture"
             else NseBseExchangeCalendar()
         )
-        if args.provider == "shoonya_ws":
-            try:
-                with single_worker_lock():
-                    asyncio.run(
-                        run_async_worker(
-                            calendar=calendar,
-                            enforce_market_hours=args.enforce_market_hours,
-                        )
-                    )
-                return
-            except (RuntimeError, ValueError, ProviderError) as ws_err:
-                logger.warning(
-                    "Shoonya WebSocket unavailable (%s); falling back to YFinanceProvider backup.",
-                    ws_err,
-                )
-                provider = YFinanceProvider()
-                run_worker(
-                    provider,
-                    calendar,
-                    interval_seconds=args.interval_seconds,
-                    once=args.once,
-                )
-                return
 
         if args.provider == "fixture":
-            provider = FixturePriceProvider()
-        elif args.provider == "shoonya":
-            try:
-                provider = ShoonyaPriceProvider(ShoonyaConfig.from_env())
-            except (RuntimeError, ValueError, ProviderError) as shoonya_err:
-                logger.warning(
-                    "Shoonya provider unavailable (%s); falling back to YFinanceProvider backup.",
-                    shoonya_err,
-                )
-                provider = YFinanceProvider()
+            provider: PriceProvider = FixturePriceProvider()
         else:
-            provider = YFinanceProvider()
+            provider = get_shared_coordinator()
 
         run_worker(
             provider,

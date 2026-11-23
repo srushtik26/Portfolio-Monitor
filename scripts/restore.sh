@@ -17,13 +17,21 @@ if [[ ! -f "${BACKUP_DIR}/database.sql.gz" ]]; then
 fi
 
 cd "${APP_DIR}"
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+# Read POSTGRES_USER / POSTGRES_DB literally without executing .env as shell code
+read_env_var() {
+  local key="$1"
+  local default_val="$2"
+  local val
+  val="$(grep -E "^${key}=" .env | tail -n 1 | cut -d'=' -f2- | tr -d '\r')"
+  val="${val#\"}"
+  val="${val%\"}"
+  val="${val#\'}"
+  val="${val%\'}"
+  printf '%s' "${val:-$default_val}"
+}
 
-PG_USER="${POSTGRES_USER:-portfolio_app}"
-PG_DB="${POSTGRES_DB:-portfolio_monitor}"
+PG_USER="$(read_env_var POSTGRES_USER portfolio_app)"
+PG_DB="$(read_env_var POSTGRES_DB portfolio_monitor)"
 
 if [[ -f "${BACKUP_DIR}/SHA256SUMS" ]]; then
   echo "Verifying backup checksums..."
@@ -34,16 +42,17 @@ echo "Stopping api and worker before restore..."
 docker compose stop api worker
 
 echo "Restoring PostgreSQL database (${PG_DB})..."
-gunzip -c "${BACKUP_DIR}/database.sql.gz" | docker compose exec -T db psql -U "${PG_USER}" -d "${PG_DB}"
+gunzip -c "${BACKUP_DIR}/database.sql.gz" | docker compose exec -T db psql -v ON_ERROR_STOP=1 -U "${PG_USER}" -d "${PG_DB}"
+
+echo "Running Alembic migrations before starting services..."
+docker compose run --rm api alembic upgrade head
 
 if [[ -f "${BACKUP_DIR}/private_uploads.tar.gz" ]]; then
   echo "Restoring private uploaded Excel files..."
-  docker compose up -d api
-  docker compose exec -T api tar -xzf - -C /app/var < "${BACKUP_DIR}/private_uploads.tar.gz"
+  docker compose run --rm -T api sh -c 'rm -rf /app/var/private_uploads/* && tar -xzf - -C /app/var' < "${BACKUP_DIR}/private_uploads.tar.gz"
 fi
 
-echo "Running Alembic migrations and restarting services..."
-docker compose run --rm api alembic upgrade head
+echo "Starting application services..."
 docker compose up -d
 
 echo "Verifying API readiness..."

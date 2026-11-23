@@ -296,10 +296,89 @@ def test_price_worker_refuses_yfinance_without_authoritative_calendar() -> None:
         )
 
 
-def test_yfinance_acts_as_backup_when_shoonya_fails(
+def _make_angel_mock_provider(
+    *,
+    ltp: float = 435.50,
+    quote_time_str: str = "03-Nov-2026 10:00:00",
+    clock_now: datetime | None = None,
+    call_log: list[str] | None = None,
+):
+    from app.angel_rest import AngelRestConfig, AngelRestQuoteProvider
+
+    cfg = AngelRestConfig(
+        api_key="test-angel-key",
+        client_code="TEST001",
+        pin="1234",
+        totp_secret="JBSWY3DPEHPK3PXP",
+        stale_after_seconds=300,
+    )
+
+    def fake_http_post(url: str, payload: dict, headers: dict, timeout: float) -> dict:
+        if call_log is not None:
+            call_log.append(url)
+        if url.endswith("/loginByPassword"):
+            assert headers["X-PrivateKey"] == "test-angel-key"
+            return {"status": True, "data": {"jwtToken": "mock-jwt-token"}}
+        assert url.endswith("/market/v1/quote/")
+        assert headers["Authorization"] == "Bearer mock-jwt-token"
+        return {
+            "status": True,
+            "data": {
+                "fetched": [
+                    {
+                        "exchange": "NSE",
+                        "tradingSymbol": "BHEL-EQ",
+                        "ltp": ltp,
+                        "exchFeedTime": quote_time_str,
+                    }
+                ]
+            },
+        }
+
+    return AngelRestQuoteProvider(
+        cfg,
+        http_post=fake_http_post,
+        totp_generator=lambda _s: "123456",
+        clock=(lambda: clock_now) if clock_now is not None else None,
+    )
+
+
+def test_coordinator_uses_yfinance_primary_first_and_labels_delayed_candle_data() -> None:
+    from app.provider_coordinator import SharedQuoteCoordinator, YFINANCE_DELAYED_LABEL
+
+    now = datetime(2026, 11, 3, 4, 30, tzinfo=timezone.utc)
+    angel_calls: list[str] = []
+    primary = YFinanceProvider(
+        history_fetcher=lambda _ticker: FakeHistory(432.50, now - timedelta(seconds=30)),
+        clock=lambda: now,
+        cache_ttl_seconds=10,
+        stale_after_seconds=300,
+    )
+    backup = _make_angel_mock_provider(ltp=440.00, clock_now=now, call_log=angel_calls)
+    coord = SharedQuoteCoordinator(
+        primary=primary,
+        backup=backup,
+        clock=lambda: now,
+        cache_ttl_seconds=0,
+        stale_after_seconds=300,
+        min_request_interval_seconds=0.0,
+    )
+
+    res = coord.fetch_coordinated_quote("NSE", "BHEL", allow_backup=True, now=now)
+    assert res.source == "yfinance"
+    assert res.source_label == YFINANCE_DELAYED_LABEL
+    assert "delayed candle data" in res.source_label.lower()
+    assert res.fallback_active is False
+    assert res.quote.price == Decimal("432.5")
+    assert angel_calls == []  # Angel backup must NOT be called when yfinance succeeds
+
+
+def test_coordinator_falls_back_to_angel_on_failure_and_staleness_recovers_after_two_good_fetches_and_resets_baselines(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from app.models import TargetAlertState, TargetRevision
     from app.prices import NseBseExchangeCalendar
+    from app.provider_coordinator import SharedQuoteCoordinator
 
     engine = create_engine(
         "sqlite://",
@@ -309,7 +388,7 @@ def test_yfinance_acts_as_backup_when_shoonya_fails(
     Base.metadata.create_all(bind=engine)
     SessionFactory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
-    market_open_utc = datetime(2026, 11, 3, 4, 30, tzinfo=timezone.utc)
+    now = datetime(2026, 11, 3, 4, 30, tzinfo=timezone.utc)
     with SessionFactory() as session:
         session.add(
             Company(
@@ -318,52 +397,316 @@ def test_yfinance_acts_as_backup_when_shoonya_fails(
                 name="Bharat Heavy Electricals Ltd",
                 base_target=Decimal("400.00"),
                 bull_target=Decimal("500.00"),
+                base_direction="below",
+                bull_direction="above",
+                base_trigger_mode="crosses",
+                bull_trigger_mode="crosses",
+                is_approved=True,
+                monitoring_active=True,
+            )
+        )
+        session.flush()
+        rev = TargetRevision(
+            exchange="NSE",
+            symbol="BHEL",
+            version=1,
+            base_target=Decimal("400.00"),
+            bull_target=Decimal("500.00"),
+            base_direction="below",
+            bull_direction="above",
+            source="import",
+            changed_at=now,
+        )
+        session.add(rev)
+        session.flush()
+        session.add(
+            TargetAlertState(
+                exchange="NSE",
+                symbol="BHEL",
+                target_kind="base",
+                is_simulated=False,
+                state="armed",
+                target_revision_id=rev.id,
+                last_evaluated_price=Decimal("410.00"),
+                last_evaluated_at=now - timedelta(minutes=1),
+                last_condition_met=False,
+                trigger_cycle=0,
+            )
+        )
+        session.commit()
+
+    # Step 1: yfinance returns stale bar -> falls back to Angel REST + resets cross baseline
+    # Step 2: yfinance returns 1st good bar -> stays on Angel (needs 2 consecutive good fetches)
+    # Step 3: yfinance returns 2nd good bar -> returns to yfinance + resets cross baseline
+    yf_sequence = iter(
+        [
+            FakeHistory(415.00, now - timedelta(minutes=10)),  # stale (>300s)
+            FakeHistory(420.00, now - timedelta(seconds=20)),  # 1st good
+            FakeHistory(421.00, now - timedelta(seconds=10)),  # 2nd good -> recover
+        ]
+    )
+    primary = YFinanceProvider(
+        history_fetcher=lambda _ticker: next(yf_sequence),
+        clock=lambda: now,
+        cache_ttl_seconds=10,
+        stale_after_seconds=300,
+        sleeper=lambda _d: None,
+    )
+    backup = _make_angel_mock_provider(ltp=395.00, clock_now=now)
+    coord = SharedQuoteCoordinator(
+        primary=primary,
+        backup=backup,
+        clock=lambda: now,
+        cache_ttl_seconds=0,
+        stale_after_seconds=300,
+        min_request_interval_seconds=0.0,
+    )
+
+    monkeypatch.setenv("ANGEL_OWNER_ENABLED", "true")
+    monkeypatch.setenv("ALERT_RULES_ENABLED", "true")
+
+    # Cycle 1: yfinance stale -> falls back to Angel (395.00 <= 400.00, but cross baseline was reset!)
+    r1 = poll_once(coord, NseBseExchangeCalendar(), now=now, session_factory=SessionFactory)
+    assert r1.recorded == 1
+    with SessionFactory() as session:
+        q1 = session.scalars(select(PriceQuote).order_by(PriceQuote.id.desc())).first()
+        assert q1 is not None
+        assert "Angel One REST" in q1.provider
+        assert q1.price == Decimal("395.000000")
+        # Crossing baseline reset means no inferred crossing alert across the source change
+        assert session.scalar(select(func.count(TargetAlert.id))) == 0
+
+    # Cycle 2: 1st good primary fetch -> still on Angel (1 < 2)
+    r2 = poll_once(
+        coord,
+        NseBseExchangeCalendar(),
+        now=now + timedelta(seconds=15),
+        session_factory=SessionFactory,
+    )
+    assert r2.recorded == 1
+    with SessionFactory() as session:
+        q2 = session.scalars(select(PriceQuote).order_by(PriceQuote.id.desc())).first()
+        assert q2 is not None
+        assert "Angel One REST" in q2.provider
+
+    # Cycle 3: 2nd consecutive good primary fetch -> returns to yfinance!
+    r3 = poll_once(
+        coord,
+        NseBseExchangeCalendar(),
+        now=now + timedelta(seconds=30),
+        session_factory=SessionFactory,
+    )
+    assert r3.recorded == 1
+    with SessionFactory() as session:
+        q3 = session.scalars(select(PriceQuote).order_by(PriceQuote.id.desc())).first()
+        assert q3 is not None
+        assert "Yahoo Finance" in q3.provider
+        assert q3.price == Decimal("421.000000")
+
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()
+
+
+def test_missing_angel_config_keeps_yfinance_working_and_never_uses_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.provider_coordinator import SharedQuoteCoordinator
+
+    for key in ("ANGEL_API_KEY", "ANGEL_CLIENT_CODE", "ANGEL_PIN", "ANGEL_TOTP_SECRET", "SHOONYA_USER_ID"):
+        monkeypatch.delenv(key, raising=False)
+    # Even if SHOONYA_USER_ID is set, it must NOT activate Shoonya or Angel
+    monkeypatch.setenv("SHOONYA_USER_ID", "legacy-shoonya-id")
+
+    now = datetime(2026, 11, 3, 4, 30, tzinfo=timezone.utc)
+    primary = YFinanceProvider(
+        history_fetcher=lambda _ticker: FakeHistory(430.00, now - timedelta(seconds=20)),
+        clock=lambda: now,
+        cache_ttl_seconds=10,
+    )
+    coord = SharedQuoteCoordinator(
+        primary=primary,
+        clock=lambda: now,
+        cache_ttl_seconds=0,
+        min_request_interval_seconds=0.0,
+    )
+    assert coord.backup_status(allow_backup=True) == "not_configured"
+    res = coord.fetch_coordinated_quote("NSE", "BHEL", allow_backup=True, now=now)
+    assert res.source == "yfinance"
+    assert res.quote.is_simulated is False
+
+    # When yfinance fails and Angel is unconfigured, it must raise ProviderError (never fixture fallback!)
+    failing_primary = YFinanceProvider(
+        history_fetcher=lambda _ticker: (_ for _ in ()).throw(ProviderError("Yahoo down")),
+        clock=lambda: now,
+        cache_ttl_seconds=10,
+        sleeper=lambda _d: None,
+    )
+    failing_coord = SharedQuoteCoordinator(
+        primary=failing_primary,
+        clock=lambda: now,
+        cache_ttl_seconds=0,
+        min_request_interval_seconds=0.0,
+    )
+    with pytest.raises(ProviderError, match="Quote unavailable"):
+        failing_coord.fetch_coordinated_quote("NSE", "BHEL", allow_backup=True, now=now)
+
+
+def test_shared_queue_and_cache_and_manual_poll_safety_gates_and_non_owner_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+    from app.database import get_db
+    from app.main import app
+    from app.models import User
+    from app.provider_coordinator import (
+        SharedQuoteCoordinator,
+        reset_shared_coordinator,
+    )
+    from app.security import get_current_user
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionFactory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+    now = datetime(2026, 11, 3, 4, 30, tzinfo=timezone.utc)
+    with SessionFactory() as session:
+        owner = User(
+            name="Owner Admin",
+            normalized_name="owner admin",
+            role="ADMIN",
+            password_hash="x",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        employee = User(
+            name="Team Employee",
+            normalized_name="team employee",
+            role="EMPLOYEE",
+            password_hash="x",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add_all([owner, employee])
+        session.add(
+            Company(
+                exchange="NSE",
+                symbol="BHEL",
+                name="Bharat Heavy Electricals Ltd",
+                base_target=Decimal("450.00"),
+                bull_target=Decimal("500.00"),
+                base_direction="below",
+                bull_direction="above",
                 is_approved=True,
                 monitoring_active=True,
             )
         )
         session.commit()
+        owner_id, emp_id = owner.id, employee.id
 
-    class FailingShoonyaProvider:
-        name = "shoonya"
-        is_simulated = False
+    yf_fetch_count = 0
 
-        def fetch_quote(self, exchange: str, symbol: str):
-            raise ProviderError("Shoonya connection failed")
+    def stale_yf(_ticker: str) -> FakeHistory:
+        nonlocal yf_fetch_count
+        yf_fetch_count += 1
+        # 10 minutes old -> exceeds configured 300s staleness (proves no 86400s override)
+        return FakeHistory(410.00, now - timedelta(minutes=10))
 
-    monkeypatch.setattr(
-        YFinanceProvider,
-        "_default_history_fetcher",
-        staticmethod(lambda _ticker: FakeHistory(435.50, market_open_utc - timedelta(seconds=30))),
+    primary = YFinanceProvider(
+        history_fetcher=stale_yf,
+        clock=lambda: now,
+        cache_ttl_seconds=60,
+        stale_after_seconds=300,
+        sleeper=lambda _d: None,
     )
-    monkeypatch.setattr(
-        YFinanceProvider,
-        "__init__",
-        lambda self, **kwargs: (
-            setattr(self, "_history_fetcher", YFinanceProvider._default_history_fetcher),
-            setattr(self, "_clock", lambda: market_open_utc),
-            setattr(self, "_sleep", lambda _d: None),
-            setattr(self, "cache_ttl_seconds", 60),
-            setattr(self, "stale_after_seconds", 300),
-            setattr(self, "_cache", {}),
-            setattr(self, "_cache_lock", __import__("threading").RLock()),
-        )
-        and None,
+    backup = _make_angel_mock_provider(ltp=438.25, clock_now=now)
+    coord = SharedQuoteCoordinator(
+        primary=primary,
+        backup=backup,
+        clock=lambda: now,
+        cache_ttl_seconds=60,
+        stale_after_seconds=300,
+        min_request_interval_seconds=0.0,
     )
+    reset_shared_coordinator(coord)
 
-    result = poll_once(
-        FailingShoonyaProvider(),
-        NseBseExchangeCalendar(),
-        now=market_open_utc,
-        session_factory=SessionFactory,
-    )
-    assert result.attempted == 1
-    assert result.recorded == 1
-    assert result.failed == 0
-    with SessionFactory() as session:
-        saved = session.scalar(select(PriceQuote))
-        assert saved is not None
-        assert saved.price == Decimal("435.500000")
-        assert "Yahoo Finance" in saved.provider
-    Base.metadata.drop_all(bind=engine)
-    engine.dispose()
+    # Alert safety gate: ALERT_RULES_ENABLED=false must prevent target alerts on manual poll
+    monkeypatch.setenv("ALERT_RULES_ENABLED", "false")
+    monkeypatch.setenv("NOTIFICATION_MODE", "dry_run")
+
+    active_user_id = {"id": owner_id}
+
+    def override_get_db():
+        with SessionFactory() as s:
+            yield s
+
+    def override_user():
+        with SessionFactory() as s:
+            return s.get(User, active_user_id["id"])
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = override_user
+
+    try:
+        client = TestClient(app)
+        # 1. Owner calls manual poll -> yfinance is stale (>300s), so Angel backup activates
+        r_owner_poll = client.post("/api/price-feed/poll?force_refresh=true")
+        assert r_owner_poll.status_code == 200
+        body = r_owner_poll.json()
+        assert body["recorded"] == 1
+        assert body["fallback_used"] is True
+        assert body["backup_status"] == "configured"
+        assert body["alerts_enabled"] is False
+        assert body["symbols"][0]["source"] == "angel_rest"
+        assert body["symbols"][0]["fallback_reason"] == "primary_stale"
+
+        # Safety gate held: no target alerts fired while ALERT_RULES_ENABLED=false
+        with SessionFactory() as s:
+            assert s.scalar(select(func.count(TargetAlert.id))) == 0
+
+        # 2. Cached read via shared coordinator does not re-hit upstream when force_refresh=false
+        prev_yf_count = yf_fetch_count
+        r_cached = client.post("/api/price-feed/poll?force_refresh=false")
+        assert r_cached.status_code == 200
+        assert r_cached.json()["symbols"][0]["from_cache"] is True
+        assert yf_fetch_count == prev_yf_count
+
+        # 3. Owner sees Angel quote in companies, history, and worker status
+        owner_companies = client.get("/api/companies").json()
+        assert owner_companies[0]["latest_quote"]["provider"] == "Angel One REST (backup)"
+        owner_history = client.get("/api/companies/NSE/BHEL/history").json()
+        assert len(owner_history["items"]) >= 1
+        owner_status = client.get("/api/worker/status").json()
+        assert owner_status["backup_status"] == "configured"
+        assert owner_status["fallback_active_count"] == 1
+
+        # 4. Switch to non-owner EMPLOYEE: Angel quotes, history, health, and cache MUST be isolated!
+        active_user_id["id"] = emp_id
+        emp_companies = client.get("/api/companies").json()
+        assert emp_companies[0]["latest_quote"] is None
+        emp_history = client.get("/api/companies/NSE/BHEL/history").json()
+        assert emp_history["items"] == []
+        emp_details = client.get("/api/companies/NSE/BHEL/details").json()
+        assert emp_details["quote_history"] == []
+        emp_status = client.get("/api/worker/status").json()
+        assert emp_status["backup_status"] == "restricted"
+        assert emp_status["fallback_active_count"] == 0
+        assert all(s["source"] != "angel_rest" for s in emp_status["symbols"])
+
+        # Non-owner calling manual poll MUST NOT receive Angel's cached quote or activate Angel
+        r_emp_poll = client.post("/api/price-feed/poll?force_refresh=false")
+        assert r_emp_poll.status_code == 200
+        emp_body = r_emp_poll.json()
+        assert emp_body["backup_status"] == "restricted"
+        assert emp_body["fallback_used"] is False
+        assert emp_body["symbols"][0]["source"] == "yfinance"
+    finally:
+        app.dependency_overrides.clear()
+        reset_shared_coordinator(None)
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()

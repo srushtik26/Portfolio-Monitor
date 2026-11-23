@@ -18,13 +18,21 @@ if [[ ! -f ".env" ]]; then
   exit 1
 fi
 
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+# Read POSTGRES_USER / POSTGRES_DB literally without executing .env as shell code
+read_env_var() {
+  local key="$1"
+  local default_val="$2"
+  local val
+  val="$(grep -E "^${key}=" .env | tail -n 1 | cut -d'=' -f2- | tr -d '\r')"
+  val="${val#\"}"
+  val="${val%\"}"
+  val="${val#\'}"
+  val="${val%\'}"
+  printf '%s' "${val:-$default_val}"
+}
 
-PG_USER="${POSTGRES_USER:-portfolio_app}"
-PG_DB="${POSTGRES_DB:-portfolio_monitor}"
+PG_USER="$(read_env_var POSTGRES_USER portfolio_app)"
+PG_DB="$(read_env_var POSTGRES_DB portfolio_monitor)"
 
 echo "[${TIMESTAMP}] Starting PostgreSQL backup (${PG_DB})..."
 docker compose exec -T db pg_dump -U "${PG_USER}" -d "${PG_DB}" --clean --if-exists \
@@ -37,7 +45,7 @@ echo "[${TIMESTAMP}] Archiving private uploaded Excel workbooks..."
 docker compose exec -T api tar -czf - -C /app/var private_uploads > "${DEST_DIR}/private_uploads.tar.gz"
 gzip -t "${DEST_DIR}/private_uploads.tar.gz"
 
-sha256sum "${DEST_DIR}/database.sql.gz" "${DEST_DIR}/private_uploads.tar.gz" > "${DEST_DIR}/SHA256SUMS"
+(cd "${DEST_DIR}" && sha256sum "database.sql.gz" "private_uploads.tar.gz" > "SHA256SUMS")
 
 # Rotate local backups older than RETENTION_DAYS
 find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d -mtime +"${RETENTION_DAYS}" -exec rm -rf {} +

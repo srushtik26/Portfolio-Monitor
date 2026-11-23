@@ -61,7 +61,7 @@ export default function UserProfileMenu({
             <b>{user.name}</b>
             <small>{user.role === "ADMIN" ? "Administrator" : "Team Member"}</small>
           </div>
-          <button onClick={() => { setPasswordOpen(false); setOpen(false); setNotice(`Signed in as ${user.name}`); }}>
+          <button onClick={() => { setPasswordOpen(false); setOpen(false); setNotice(`Signed in as ${user.name}`); window.setTimeout(() => setNotice(""), 4000); }}>
             <UserRound size={15} /> My Account
           </button>
           {user.role === "ADMIN" && onManageUsers && (
@@ -73,9 +73,10 @@ export default function UserProfileMenu({
             <KeyRound size={15} /> Change Password
           </button>
           <button
-            onClick={() => void logout().catch((requestError: unknown) => setError(
-              requestError instanceof Error ? requestError.message : "Could not sign out.",
-            ))}
+            onClick={() => {
+              setOpen(false);
+              void logout();
+            }}
           >
             <LogOut size={15} /> Log Out
           </button>

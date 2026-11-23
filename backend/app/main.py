@@ -80,6 +80,7 @@ def health_readiness_check(session: Session = Depends(get_db)) -> dict[str, obje
     db_dialect = "unknown"
     monitored_count = 0
     failed_emails = 0
+    heartbeat: WorkerHeartbeat | None = None
     try:
         session.execute(text("SELECT 1"))
         db_ok = True
@@ -98,9 +99,10 @@ def health_readiness_check(session: Session = Depends(get_db)) -> dict[str, obje
             )
             or 0
         )
+        heartbeat = session.get(WorkerHeartbeat, "price")
     except Exception:
         db_ok = False
-    heartbeat = session.get(WorkerHeartbeat, "price")
+        heartbeat = None
     smtp_ok, _ = is_smtp_complete()
     live_ready, gate_reason = check_live_notification_gate()
     return {
@@ -121,30 +123,43 @@ def health_readiness_check(session: Session = Depends(get_db)) -> dict[str, obje
 
 @app.get("/api/health/worker")
 def health_worker_check(session: Session = Depends(get_db)) -> dict[str, object]:
-    """Public secret-free worker & market-feed health summary distinguishing healthy/degraded/disconnected/stale/unavailable."""
+    """Public secret-free worker & market-feed health summary distinguishing healthy/degraded/disconnected/stale/unavailable.
+
+    Public health endpoints never expose Angel-backed symbol quotes, fallback details, or credentials.
+    """
     from datetime import timedelta
     from .models import NotificationOutbox
     from .prices import normalize_utc
-    from .shoonya_feed import get_latest_feed_health
+    from .provider_coordinator import (
+        YFINANCE_DELAYED_LABEL,
+        configured_backup_provider,
+        configured_primary_provider,
+        get_shared_coordinator,
+    )
     from sqlalchemy import func, select
 
     now = datetime.now(timezone.utc)
-    heartbeat = session.get(WorkerHeartbeat, "price")
-    feed_health = get_latest_feed_health()
-    failed_emails = int(
-        session.scalar(
-            select(func.count())
-            .select_from(NotificationOutbox)
-            .where(NotificationOutbox.status == "failed")
+    coord_health = get_shared_coordinator().get_health_snapshot(include_angel_details=False)
+    try:
+        heartbeat = session.get(WorkerHeartbeat, "price")
+        failed_emails = int(
+            session.scalar(
+                select(func.count())
+                .select_from(NotificationOutbox)
+                .where(NotificationOutbox.status == "failed")
+            )
+            or 0
         )
-        or 0
-    )
-
-    if heartbeat is None:
+    except Exception:
         return {
             "status": "unavailable",
             "worker_running": False,
             "provider": None,
+            "primary_provider": configured_primary_provider(),
+            "primary_label": YFINANCE_DELAYED_LABEL,
+            "data_delay_label": "delayed_candle_data",
+            "backup_provider": configured_backup_provider(),
+            "backup_status": "restricted",
             "exchange_calendar": None,
             "connection_status": "disconnected",
             "last_poll_at": None,
@@ -152,8 +167,29 @@ def health_worker_check(session: Session = Depends(get_db)) -> dict[str, object]
             "subscribed_symbols": 0,
             "failed_requests_count": 0,
             "stale_symbols_count": 0,
-            "queue_overflow_drops": int(feed_health.get("queue_overflow_drops", 0)),
-            "reconnect_attempts": int(feed_health.get("reconnect_count", 0)),
+            "queued_requests_total": int(coord_health.get("queued_requests_total", 0)),
+            "failed_notifications_count": 0,
+            "timestamp": now.isoformat(),
+        }
+
+    if heartbeat is None:
+        return {
+            "status": "unavailable",
+            "worker_running": False,
+            "provider": None,
+            "primary_provider": configured_primary_provider(),
+            "primary_label": YFINANCE_DELAYED_LABEL,
+            "data_delay_label": "delayed_candle_data",
+            "backup_provider": configured_backup_provider(),
+            "backup_status": "restricted",
+            "exchange_calendar": None,
+            "connection_status": "disconnected",
+            "last_poll_at": None,
+            "last_valid_tick_at": None,
+            "subscribed_symbols": 0,
+            "failed_requests_count": 0,
+            "stale_symbols_count": 0,
+            "queued_requests_total": int(coord_health.get("queued_requests_total", 0)),
             "failed_notifications_count": failed_emails,
             "timestamp": now.isoformat(),
         }
@@ -172,7 +208,7 @@ def health_worker_check(session: Session = Depends(get_db)) -> dict[str, object]
         status = "degraded"
     elif (heartbeat.stale_symbols_count or 0) > 0 and (heartbeat.monitored_symbols_count or 0) > 0:
         status = "stale"
-    elif int(feed_health.get("queue_overflow_drops", 0)) > 0 or failed_emails > 0:
+    elif failed_emails > 0:
         status = "degraded"
     else:
         status = "healthy"
@@ -181,6 +217,11 @@ def health_worker_check(session: Session = Depends(get_db)) -> dict[str, object]
         "status": status,
         "worker_running": heartbeat_fresh,
         "provider": heartbeat.provider,
+        "primary_provider": configured_primary_provider(),
+        "primary_label": YFINANCE_DELAYED_LABEL,
+        "data_delay_label": "delayed_candle_data",
+        "backup_provider": configured_backup_provider(),
+        "backup_status": "restricted",
         "exchange_calendar": heartbeat.exchange_calendar,
         "connection_status": heartbeat.connection_status if heartbeat_fresh else "disconnected",
         "last_poll_at": last_poll.isoformat() if last_poll else None,
@@ -188,8 +229,7 @@ def health_worker_check(session: Session = Depends(get_db)) -> dict[str, object]
         "subscribed_symbols": int(heartbeat.monitored_symbols_count or 0),
         "failed_requests_count": int(heartbeat.failed_requests_count or 0),
         "stale_symbols_count": int(heartbeat.stale_symbols_count or 0),
-        "queue_overflow_drops": int(feed_health.get("queue_overflow_drops", 0)),
-        "reconnect_attempts": int(heartbeat.reconnect_count or feed_health.get("reconnect_count", 0)),
+        "queued_requests_total": int(coord_health.get("queued_requests_total", 0)),
         "failed_notifications_count": failed_emails,
         "timestamp": now.isoformat(),
     }

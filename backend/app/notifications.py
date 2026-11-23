@@ -1,4 +1,5 @@
 from email.message import EmailMessage
+import html
 import logging
 import os
 from pathlib import Path
@@ -158,7 +159,9 @@ def format_alert_email(message: NotificationMessage) -> tuple[str, str]:
 
 def format_alert_email_html(message: NotificationMessage) -> str:
     """Render a clean, institutional HTML email body for price target alerts."""
-    company_label = message.company_name or message.symbol
+    company_label = html.escape(message.company_name or message.symbol, quote=True)
+    exchange_safe = html.escape(message.exchange, quote=True)
+    symbol_safe = html.escape(message.symbol, quote=True)
     is_base = message.target_kind == "base"
     target_type = "Base" if is_base else "Bull"
     direction_label = "Downward" if message.comparison_direction == "below" else "Upward"
@@ -237,7 +240,7 @@ def format_alert_email_html(message: NotificationMessage) -> str:
         NORTHSTAR PORTFOLIO MONITOR · TARGET ALERT
       </div>
       <h2 style="margin:8px 0 4px;font-size:20px;color:#f8fafc;">
-        {company_label} <span style="color:#64748b;font-weight:500;">({message.exchange}:{message.symbol})</span>
+        {company_label} <span style="color:#64748b;font-weight:500;">({exchange_safe}:{symbol_safe})</span>
       </h2>
       <span style="display:inline-block;margin-top:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;background:{badge_bg};color:{badge_fg};border:1px solid {badge_border};">
         {alert_badge}
@@ -390,12 +393,18 @@ class SmtpEmailNotifier:
             )
 
         try:
-            with smtplib.SMTP(self.host, self.port, timeout=15) as smtp:
-                if self.use_tls:
-                    smtp.starttls()
-                if self.username and self.password:
-                    smtp.login(self.username, self.password)
-                smtp.send_message(email_msg)
+            if self.port == 465:
+                with smtplib.SMTP_SSL(self.host, self.port, timeout=15) as smtp:
+                    if self.username and self.password:
+                        smtp.login(self.username, self.password)
+                    smtp.send_message(email_msg)
+            else:
+                with smtplib.SMTP(self.host, self.port, timeout=15) as smtp:
+                    if self.use_tls:
+                        smtp.starttls()
+                    if self.username and self.password:
+                        smtp.login(self.username, self.password)
+                    smtp.send_message(email_msg)
             return SendReceipt(provider_message_id=f"smtp:{idempotency_key}")
         except smtplib.SMTPRecipientsRefused as error:
             raise PermanentSendError(f"SMTP recipients refused: {error}") from error

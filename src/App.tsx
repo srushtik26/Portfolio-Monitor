@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -173,11 +173,19 @@ function alertStatusBadge(company: PortfolioCompany) {
   return <span className="status-badge badge-neutral"><i />Monitoring</span>;
 }
 
+let sharedAudioCtx: AudioContext | null = null;
+
 function playAlertChime(isBull: boolean) {
   try {
     const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!AudioCtx) return;
-    const ctx = new AudioCtx();
+    if (!sharedAudioCtx || sharedAudioCtx.state === "closed") {
+      sharedAudioCtx = new AudioCtx();
+    }
+    const ctx = sharedAudioCtx;
+    if (ctx.state === "suspended") {
+      void ctx.resume().catch(() => undefined);
+    }
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.type = "sine";
@@ -221,14 +229,36 @@ export default function App() {
   const [compactTables, setCompactTables] = useState(true);
   const [isPollingNow, setIsPollingNow] = useState(false);
 
+  const toastTimerRef = useRef<number | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+
   const notify = (message: string) => {
     setToast(message);
-    window.setTimeout(() => setToast(""), 3500);
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast("");
+      toastTimerRef.current = null;
+    }, 3500);
   };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const liveStream = useLiveMarketStream({
     setPortfolioCompanies,
     setApiAlerts,
+    enabled: Boolean(user),
     onOutboxAlert: (outboxNotif) => {
       const targetLabel = outboxNotif.alert.target_kind === "base" ? "Base Target" : "Bull Target";
       if (soundEnabled) {
@@ -282,14 +312,12 @@ export default function App() {
     return () => controller.abort();
   }, [portfolioRequest]);
 
-  // Periodic background refresh of dashboard view (and automatic yfinance backup poll when companies are present)
+  // Periodic background refresh reads cached backend state only (never triggers upstream polls from the browser)
   useEffect(() => {
+    if (!user) return;
     const timer = window.setInterval(() => {
       void (async () => {
         try {
-          if (portfolioCompanies.length > 0 && workerStatus?.provider !== "shoonya") {
-            await triggerOnDemandPoll().catch(() => null);
-          }
           const [c, a, w] = await Promise.all([
             fetchCompanies(),
             fetchAlerts(),
@@ -304,7 +332,7 @@ export default function App() {
       })();
     }, 30000);
     return () => window.clearInterval(timer);
-  }, [portfolioCompanies.length, workerStatus?.provider, isAdmin]);
+  }, [user]);
 
   useEffect(() => {
     if (selectedCompany) {
@@ -319,10 +347,10 @@ export default function App() {
     setIsPollingNow(true);
     try {
       const res = await triggerOnDemandPoll();
-      notify(`Fetched ${res.recorded}/${res.attempted} live quotes`);
+      notify(`Queued refresh recorded ${res.recorded}/${res.attempted} quotes`);
       reloadAll();
     } catch (err) {
-      notify(err instanceof Error ? err.message : "Quote poll failed");
+      notify(err instanceof Error ? err.message : "Quote refresh failed");
     } finally {
       setIsPollingNow(false);
     }
@@ -397,8 +425,12 @@ export default function App() {
         ? liveStream.transport
         : "polling";
 
-  // (b) Broker/provider feed health (connected, last quote time, freshness, gaps)
-  const brokerProviderName = workerStatus?.provider || "unknown";
+  // (b) Primary/backup feed health (yfinance delayed candle data primary, Angel REST backup)
+  const brokerProviderName =
+    workerStatus?.provider_label ||
+    (workerStatus?.provider === "yfinance"
+      ? "Yahoo Finance (delayed candle data)"
+      : workerStatus?.provider || "Yahoo Finance (delayed candle data)");
   const providerConnected =
     workerStatus?.state === "running" &&
     (workerStatus?.connection_status === "connected" ||
@@ -520,6 +552,7 @@ export default function App() {
             <label className="global-search">
               <Search size={15} />
               <input
+                ref={searchInputRef}
                 placeholder="Search companies or symbols..."
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
@@ -551,7 +584,7 @@ export default function App() {
                   : marketClosed
                     ? `Market Closed · Last quote ${workerStatus?.last_poll_at ? new Date(workerStatus.last_poll_at).toLocaleTimeString("en-IN") : "unavailable"} · UI ${browserTransportStatus.toUpperCase()}`
                     : brokerFeedLive
-                      ? `Live · Provider ${brokerProviderName} (${freshCompaniesCount} fresh) · UI ${browserTransportStatus.toUpperCase()}`
+                      ? `${brokerProviderName} (${freshCompaniesCount} fresh) · UI ${browserTransportStatus.toUpperCase()}`
                       : freshnessUnknownCompanies.length > 0
                         ? `Provider ${brokerProviderName} · ${freshnessUnknownCompanies.length} Freshness Unknown · UI ${browserTransportStatus.toUpperCase()}`
                         : staleCompanies.length > 0
@@ -612,15 +645,27 @@ export default function App() {
               onPollNow={handlePollNow}
               isPollingNow={isPollingNow}
               onRestoreVersion={async (id) => {
-                await restoreImportVersion(id);
-                notify("Restored earlier approved target version");
-                reloadAll();
+                try {
+                  await restoreImportVersion(id);
+                  notify("Restored earlier approved target version");
+                  reloadAll();
+                } catch (err) {
+                  notify(err instanceof Error ? err.message : "Could not restore version");
+                }
               }}
               onResetWorkspace={async () => {
-                await resetWorkspaceData();
-                setSelectedCompany(null);
-                notify("All workspace data cleared");
-                reloadAll();
+                const confirmed = window.confirm(
+                  "Clear ALL workspace data? This permanently deletes all tracked companies, import history, price snapshots, alerts, and target revisions.",
+                );
+                if (!confirmed) return;
+                try {
+                  await resetWorkspaceData();
+                  setSelectedCompany(null);
+                  notify("All workspace data cleared");
+                  reloadAll();
+                } catch (err) {
+                  notify(err instanceof Error ? err.message : "Could not clear workspace data");
+                }
               }}
               search={query}
             />
@@ -1907,7 +1952,9 @@ function AlertsPage({
               <button
                 className="button secondary"
                 onClick={() => {
-                  activeAlerts.forEach((a) => void onAction(a.id, "acknowledge"));
+                  void Promise.allSettled(
+                    activeAlerts.map((a) => performAlertAction(a.id, "acknowledge")),
+                  ).then(() => onRefresh());
                 }}
               >
                 <CheckCheck size={14} /> Acknowledge All ({activeAlerts.length})
@@ -2546,25 +2593,38 @@ function MarketActivityPage({
           </small>
         </div>
         <div className="card market-stat">
-          <small>Last Valid Tick</small>
+          <small>Last Valid Quote</small>
           <b>
             {workerHealth?.last_valid_tick_at
               ? new Date(workerHealth.last_valid_tick_at).toLocaleTimeString("en-IN")
               : "None yet"}
           </b>
           <small className="market-uptime">
-            Reconnects: {workerHealth?.reconnect_attempts ?? 0} · Failed polls: {workerHealth?.failed_requests_count ?? 0}
+            Queued refreshes: {workerStatus?.queued_requests_total ?? workerHealth?.queued_requests_total ?? 0} · Failed polls: {workerHealth?.failed_requests_count ?? 0}
           </small>
         </div>
       </div>
 
       <div className="market-stat-grid">
         <div className="card market-stat">
-          <small>Feed Provider</small>
-          <b>{workerStatus?.provider ?? "unknown"}</b>
+          <small>Primary Feed (Delayed Candle Data)</small>
+          <b>{workerStatus?.primary_label ?? "Yahoo Finance (delayed candle data)"}</b>
           <small className="market-uptime">
             <i className="status-dot" /> Exchange Calendar:{" "}
-            {workerStatus?.exchange_calendar ?? "unknown"}
+            {workerStatus?.exchange_calendar ?? "nse_bse"}
+          </small>
+        </div>
+        <div className="card market-stat">
+          <small>Backup Provider ({workerStatus?.backup_provider ?? "angel_rest"})</small>
+          <b>
+            {workerStatus?.backup_status === "configured"
+              ? "Configured (owner-only)"
+              : workerStatus?.backup_status === "restricted"
+                ? "Owner-only (restricted)"
+                : "Not configured"}
+          </b>
+          <small className="market-uptime">
+            Active fallbacks: {workerStatus?.fallback_active_count ?? 0} symbol(s)
           </small>
         </div>
         <div className="card market-stat">
@@ -2577,19 +2637,7 @@ function MarketActivityPage({
             )
           </b>
           <small className="market-uptime">
-            Backlog: {workerStatus?.backlog_state ?? "normal"} (
-            {workerStatus?.queue_overflow_drops ?? 0} overflow drops)
-          </small>
-        </div>
-        <div className="card market-stat">
-          <small>Protocol & Reconnect Gaps</small>
-          <b>
-            {workerStatus?.reconnect_gaps_count ?? 0}{" "}
-            <span className="market-stat-sub">reconnect gap(s)</span>
-          </b>
-          <small className="market-uptime">
-            Seq gap check: {workerStatus?.protocol_gap_detection ?? "disabled"} (
-            {workerStatus?.protocol_sequence_gaps ?? 0} gaps)
+            Data delay: {workerStatus?.data_delay_label === "delayed_candle_data" ? "Delayed candle data (not exchange-live)" : "Standard"}
           </small>
         </div>
         <div className="card market-stat">
@@ -2605,6 +2653,39 @@ function MarketActivityPage({
           </small>
         </div>
       </div>
+
+      {workerStatus?.symbols && workerStatus.symbols.length > 0 && (
+        <section className="card" style={{ marginBottom: 14 }}>
+          <div className="section-head">
+            <div>
+              <h2>Per-Symbol Quote Sources &amp; Fallback Status</h2>
+              <p>Active quote source, source timestamp, and fallback reason per tracked symbol</p>
+            </div>
+          </div>
+          <div className="table-scroll">
+            <table className="portfolio-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Source</th>
+                  <th>Source Time</th>
+                  <th>Fallback Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {workerStatus.symbols.map((sym) => (
+                  <tr key={`${sym.exchange}:${sym.symbol}`}>
+                    <td><b>{sym.exchange}:{sym.symbol}</b></td>
+                    <td>{sym.source_label}</td>
+                    <td>{sym.source_time ? new Date(sym.source_time).toLocaleTimeString("en-IN") : "—"}</td>
+                    <td>{sym.fallback_reason ?? (sym.fallback_active ? "Fallback active" : "Primary active")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       <div className="market-content-grid">
         <section className="card market-movers">
@@ -3065,9 +3146,13 @@ function NotificationDrawer({
           </button>
           <button
             className="mark-all"
-            onClick={() =>
-              unreadAlerts.forEach((a) => void onAction(a.id, "acknowledge"))
-            }
+            onClick={() => {
+              if (!unreadAlerts.length) return;
+              const [last, ...rest] = unreadAlerts;
+              void Promise.allSettled(
+                rest.map((a) => performAlertAction(a.id, "acknowledge")),
+              ).then(() => onAction(last.id, "acknowledge"));
+            }}
           >
             <CheckCheck size={13} /> Acknowledge all
           </button>
@@ -3320,8 +3405,8 @@ function EmailPreviewModal({
                 <small>DIRECTION RULE</small>
                 <b>
                   {item.comparison_direction === "below"
-                    ? "Downward (CMP ≤ Base)"
-                    : "Upward (CMP ≥ Bull)"}
+                    ? `Downward (CMP ≤ ${isBase ? "Base" : "Bull"})`
+                    : `Upward (CMP ≥ ${isBase ? "Base" : "Bull"})`}
                 </b>
               </div>
             </div>
@@ -3392,10 +3477,14 @@ function DetailPanel({
     setLoading(true);
     fetchCompanyDetails(company.exchange, company.symbol, controller.signal)
       .then((res) => {
+        if (controller.signal.aborted) return;
         setDetails(res);
         setLoading(false);
       })
-      .catch(() => setLoading(false));
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setLoading(false);
+      });
     return () => controller.abort();
   }, [company.exchange, company.symbol, company.version]);
 

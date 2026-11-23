@@ -159,9 +159,31 @@ export interface AlertEmailPreviewResponse {
   delivery_gate_reason: string;
 }
 
+export interface SymbolSourceHealth {
+  exchange: string;
+  symbol: string;
+  source: string;
+  source_label: string;
+  source_time: string | null;
+  fallback_active: boolean;
+  fallback_reason: string | null;
+  consecutive_primary_successes?: number;
+  last_error?: string | null;
+  last_updated_at?: string | null;
+}
+
 export interface WorkerStatus {
   state: "running" | "stopped" | "error";
   provider: string | null;
+  provider_label?: string | null;
+  primary_provider?: string | null;
+  primary_label?: string | null;
+  data_delay_label?: string | null;
+  backup_provider?: string | null;
+  backup_status?: "configured" | "not_configured" | "restricted" | string;
+  fallback_active_count?: number;
+  queued_requests_total?: number;
+  symbols?: SymbolSourceHealth[];
   exchange_calendar: string | null;
   last_started_at: string | null;
   last_poll_at: string | null;

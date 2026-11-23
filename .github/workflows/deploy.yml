@@ -95,4 +95,4 @@ jobs:
             cd "${{ secrets.VM_APP_DIR || '/opt/portfolio-monitor' }}"
             chmod +x scripts/deploy.sh scripts/backup.sh scripts/restore.sh
             ./scripts/deploy.sh
-            curl -fsS "http://127.0.0.1/healthz" || docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready').read().decode())"
+            docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=5).read().decode())"

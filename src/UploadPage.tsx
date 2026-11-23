@@ -932,7 +932,7 @@ export default function UploadPage({
                             ))}
                           </td>
                           <td>
-                            {preview.status === "preview" && (
+                            {(preview.status === "preview" || (isAdmin && preview.status === "pending_approval")) && (
                               <div className="row-actions">
                                 {isEditing ? (
                                   <>

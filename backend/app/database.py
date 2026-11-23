@@ -85,12 +85,17 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def ensure_sqlite_schema(db_engine: Engine = engine) -> None:
-    """Ensure all tables exist and migrate legacy SQLite `price_quotes` constraint if needed."""
+    """Ensure SQLite dev/test tables exist and migrate legacy SQLite constraints if needed.
+
+    PostgreSQL schemas are managed exclusively by Alembic migrations (`alembic upgrade head`)
+    to prevent `create_all()` from conflicting with Alembic version tracking.
+    """
+    if not str(db_engine.url).startswith("sqlite"):
+        return
+
     from . import models  # noqa: F401
 
     Base.metadata.create_all(bind=db_engine)
-    if not str(db_engine.url).startswith("sqlite"):
-        return
     with db_engine.begin() as conn:
         for table_name, col_defs in (
             (
